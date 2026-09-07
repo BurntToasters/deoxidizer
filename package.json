@@ -1,0 +1,38 @@
+{
+  "name": "deoxidizer-release-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Build and release orchestration for deoxidizer",
+  "packageManager": "npm@12.0.2",
+  "engines": {
+    "node": ">=22.22.2 <27",
+    "npm": ">=12.0.1"
+  },
+  "scripts": {
+    "vi": "node scripts/vi.cjs",
+    "gitprune:force": "node scripts/git-prune.cjs",
+    "r": "node scripts/branch-sync.cjs main",
+    "b": "node scripts/branch-sync.cjs beta",
+    "quality": "npm run check:license && npm run check:version && npm run quality:rust && npm run quality:node",
+    "check:license": "node scripts/check-license.cjs",
+    "check:version": "node scripts/check-version.cjs",
+    "quality:rust": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test",
+    "quality:node": "node --test tests/node/release-tools.test.cjs",
+    "release:prepare": "npm run quality && node scripts/release-session.cjs quality && node scripts/release-session.cjs start",
+    "release:linux": "node scripts/release.cjs linux x86_64",
+    "release:linux:x64": "node scripts/release.cjs linux x86_64",
+    "release:linux:arm64": "node scripts/release.cjs linux aarch64",
+    "release:macos": "node scripts/release.cjs darwin host",
+    "release:macos:x64": "node scripts/release.cjs darwin x86_64",
+    "release:macos:arm64": "node scripts/release.cjs darwin aarch64",
+    "release:windows": "node scripts/release.cjs windows host",
+    "release:windows:x64": "node scripts/release.cjs windows x86_64",
+    "release:windows:arm64": "node scripts/release.cjs windows aarch64",
+    "release:verify": "node scripts/verify-release.cjs",
+    "release:verify:remote": "node scripts/verify-release.cjs --remote",
+    "release:verify:draft": "node scripts/verify-release-draft.cjs",
+    "release:publish": "node scripts/publish-release.cjs",
+    "release:sign": "bash scripts/gpg-sign.sh release",
+    "test:release": "node --test tests/node/release-tools.test.cjs"
+  }
+}

@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Release operating system
+        required: true
+        type: choice
+        options: [linux, darwin, windows]
+        default: linux
+      arch:
+        description: Target architecture
+        required: true
+        type: choice
+        options: [x86_64, aarch64]
+        default: x86_64
+      runner:
+        description: Runner label with target toolchain installed
+        required: true
+        default: ubuntu-latest
+      upload:
+        description: Upload verified artifacts to a draft GitHub release
+        required: true
+        type: boolean
+        default: false
+      draft_mode:
+        description: Create draft on first builder or wait for another builder
+        required: true
+        type: choice
+        options: [create, wait]
+        default: create
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.20.0
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Install release dependencies
+        run: npm ci
+      - name: Authenticate GitHub CLI credential store
+        if: ${{ inputs.upload }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s\n' "$GH_TOKEN" | gh auth login --hostname github.com --with-token
+          gh auth status --hostname github.com
+      - name: Build and stage release
+        shell: bash
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          DEOX_RELEASE_CONFIRM: YES
+          DEOX_RELEASE_DRAFT_MODE: ${{ inputs.draft_mode }}
+        run: |
+          set -euo pipefail
+          COMMAND="release:${{ inputs.os }}"
+          if [ "${{ inputs.arch }}" != "x86_64" ]; then
+            COMMAND="${COMMAND}:arm64"
+          fi
+          if [ "${{ inputs.upload }}" = "true" ]; then
+            if [ "${{ inputs.draft_mode }}" = "wait" ]; then
+              npm run "$COMMAND" -- --upload --wait
+            else
+              npm run "$COMMAND" -- --upload
+            fi
+          else
+            npm run "$COMMAND"
+          fi

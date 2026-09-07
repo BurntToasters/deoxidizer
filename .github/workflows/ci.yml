@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main, beta]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Verify both binaries
+        shell: bash
+        run: |
+          if [ -f target/release/deoxidizer.exe ]; then
+            ./target/release/deoxidizer.exe --version
+            ./target/release/deox.exe --version
+          else
+            ./target/release/deoxidizer --version
+            ./target/release/deox --version
+          fi
+
+  release-tools:
+    name: Node release tooling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.20.0
+          cache: npm
+      - run: npm ci
+      - run: npm run check:license
+      - run: npm run quality:node
+      - run: bash -n install.sh scripts/*.sh
