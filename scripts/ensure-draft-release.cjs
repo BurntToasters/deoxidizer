@@ -20,13 +20,13 @@ const waitTimeoutMs = Number(process.env.RELEASE_DRAFT_WAIT_TIMEOUT_MS || 30 * 6
 const waitPollMs = Number(process.env.RELEASE_DRAFT_WAIT_POLL_MS || 15_000);
 
 function releaseNotes() {
-  if (process.env.RELEASE_NOTES?.trim()) return process.env.RELEASE_NOTES.trim();
   const changelog = path.join(root, 'CHANGELOG.md');
-  if (fs.existsSync(changelog)) {
-    const body = fs.readFileSync(changelog, 'utf8').trim();
-    if (body) return body;
+  if (!fs.existsSync(changelog)) {
+    throw new Error('CHANGELOG.md is required for release notes');
   }
-  return `deoxidizer ${version}`;
+  const body = fs.readFileSync(changelog, 'utf8').trim();
+  if (!body) throw new Error('CHANGELOG.md is empty');
+  return body;
 }
 
 function findRelease() {
@@ -80,4 +80,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { tag, version, prerelease };
+module.exports = { tag, version, prerelease, releaseNotes };

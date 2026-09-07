@@ -1,86 +1,105 @@
 # deoxidizer
 
-Fast, safe disk space cleaner for Rust and Tauri build artifacts.
+Free disk space from Rust and Tauri build artifacts without touching source
+files. `deoxidizer` and `deox` are identical command names.
 
-`deoxidizer` and `deox` are equivalent command invokers. Both use the same
-library, configuration, scanner, cleaner, and updater.
+## Install
 
-## Installation
+### macOS and Linux
 
-### macOS/Linux
 ```bash
 curl -fsSL https://raw.githubusercontent.com/BurntToasters/deoxidizer/main/install.sh | bash
-# or from a clone after a release build:
+```
+
+Install from a local release build:
+
+```bash
 ./install.sh --from-source
 ```
 
 ### Windows
+
 ```powershell
 irm https://raw.githubusercontent.com/BurntToasters/deoxidizer/main/install.ps1 | iex
 ```
 
-Installers require an exact entry in platform-scoped checksum manifests before
-installing a GitHub release archive.
+Release installers verify platform-specific SHA256 manifests before
+installation. Windows binaries also require valid Authenticode signatures.
 
-## Usage
+## Quick start
 
-Both `deoxidizer` and `deox` can be used interchangeably as command names.
+```bash
+deox setup --default   # create configuration
+deox scan              # inspect reclaimable artifacts
+deox clean --dry-run   # preview cleanup
+deox clean             # confirm and clean
+```
 
-* `deox setup [--default]`: Initialize your configuration.
-* `deox scan [--path <dir>] [--min-size <mb>]`: Scan build artifacts.
-* `deox clean [-y] [--mode <mode>] [--dry-run] [--older-than <days>]`: Clean projects.
-* `deox settings <show|config|reset>`: Manage your `deoxidizer` settings.
-* `deox inspect <path>`: Deep-dive inspection of a specific project's target directory.
-* `deox --update`: Update the `deoxidizer` binary to the latest version.
-* `deox --version`: Show the current version.
+`clean` always shows project count and estimated space before prompting.
+Use `--yes` only for deliberate non-interactive cleanup.
 
-`deox clean` prints project count and estimated reclaimable bytes, then prompts
-for confirmation. Use `--yes` only for explicit non-interactive cleaning.
-`--dry-run`, `scan`, and `inspect` do not mutate files.
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `deox setup [--default]` | Create or reset configuration |
+| `deox scan` | Find Rust/Tauri build artifacts |
+| `deox clean` | Remove selected artifacts |
+| `deox inspect <path>` | Show one project's artifact breakdown |
+| `deox settings show` | Display current configuration |
+| `deox settings config ...` | Change configuration |
+| `deox --update` | Verify and install the latest release |
+
+Useful options:
+
+```text
+--path <dir>             Scan a different projects directory
+--min-size <mb>          Ignore smaller artifacts during scan
+--mode <mode>            full, debug-only, incremental-only, or deps-only
+--older-than <days>      Clean artifacts older than this age
+--dry-run                Preview cleanup without changing files
+--yes                    Skip cleanup confirmation
+```
 
 ## Configuration
 
-Configuration is stored in `~/.deox_config` as JSON.
+Configuration lives at `~/.deox_config`:
 
-Example:
 ```json
 {
   "version": 1,
-  "projects_dir": "/Users/dev/Projects",
+  "projects_dir": "~/Documents/GitHub",
   "scope": "tauri-and-rust",
   "clean_behavior": "trash",
   "default_mode": "full",
   "min_size_mb": 100,
-  "ignored_projects": [
-    "important-project"
-  ]
+  "ignored_projects": ["important-project"]
 }
 ```
 
-Fields:
-- `version`: Config version.
-- `projects_dir`: Base directory to scan for projects.
-- `scope`: What projects to scan (`tauri-only`, `rust-only`, `tauri-and-rust`).
-- `clean_behavior`: Action to take (`delete` permanently, or send to `trash`).
-- `default_mode`: Default cleaning mode.
-- `min_size_mb`: Minimum target folder size to consider.
-- `ignored_projects`: List of folder names to skip.
+Supported values:
 
-## Clean Modes
+- `scope`: `tauri-only`, `tauri-and-rust`, or `rust-only`.
+- `clean_behavior`: `delete` or `trash`.
+- `default_mode`: `full`, `debug-only`, `incremental-only`, or `deps-only`.
+- `min_size_mb`: minimum artifact size; `0` includes everything.
+- `ignored_projects`: project names excluded from scans and cleanup.
 
-| Mode | Description |
-|---|---|
-| `full` | Deletes the entire `target/` directory. |
-| `debug-only` | Deletes `target/debug/` but preserves `release/`. |
-| `incremental-only` | Deletes incremental compilation caches only. |
-| `deps-only` | Deletes dependency compilation units only. |
+Malformed or unsupported-version configuration fails closed. Read-only scans
+may use defaults when no configuration exists; `clean` requires setup.
 
-Symlinked artifact paths are rejected. The cleaner never follows links or
-removes paths outside a validated project `target/` directory.
+## Cleanup modes
 
-## Building from source
+- `full`: remove entire `target/`.
+- `debug-only`: remove debug artifacts while keeping release artifacts.
+- `incremental-only`: remove incremental compiler caches.
+- `deps-only`: remove dependency build artifacts.
 
-Ensure you have Rust and Cargo installed, then run:
+Cleanup supports workspace target directories and cross-compilation triples.
+Symlinks are rejected. Deoxidizer never follows links or removes paths outside
+a validated project `target/` directory.
+
+## Build from source
 
 ```bash
 git clone https://github.com/BurntToasters/deoxidizer.git
@@ -90,31 +109,34 @@ cargo build --release --locked
 ./target/release/deox --version
 ```
 
-## Release tooling
+## Maintainer release tooling
 
-Release automation uses Node.js and npm only when explicitly invoked. It
-mirrors IYERIS release coordination while keeping installed binaries
-network-free except for `deox --update`.
+Release scripts use Node.js, npm, Cargo, GPG, and optionally GitHub CLI.
+Installed binaries remain local-first; only `deox --update` performs runtime
+network access.
 
 ```bash
 npm ci
-npm run r                         # refresh main, verify, prune
-npm run b                         # refresh beta, verify
-npm run release:linux             # Linux x86_64
-npm run release:linux:arm64      # Linux aarch64
-npm run release:macos             # macOS host target
-npm run release:windows           # Windows host target
-npm run release:verify:draft      # verify complete multi-target draft
-npm run release:publish -- --yes  # publish only after draft verification
+
+DEOX_RELEASE_CONFIRM=YES npm run r  # sync main, test, prune
+DEOX_RELEASE_CONFIRM=YES npm run b  # sync beta, test
+
+npm run release:linux
+npm run release:linux:arm64
+npm run release:macos
+npm run release:windows
+
+npm run release:verify:draft
+npm run release:publish -- --yes
 ```
 
-`npm run r` and `npm run b` perform destructive Git synchronization. They
-require `DEOX_RELEASE_CONFIRM=YES`. Release publication additionally requires
-GitHub CLI authentication with `gh auth login`. Each target publishes a
-platform-scoped checksum manifest; draft verification requires all supported
-targets before `release:publish`.
+Release publication requires `gh auth login`. Each target publishes signed
+archives and a platform-specific checksum manifest. Draft verification must
+pass for all supported targets before publishing.
+
+Release notes live in [`CHANGELOG.md`](CHANGELOG.md) and follow the
+[BCLS](https://github.com/BurntToasters/BCLS) standard.
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 or later
-(GPL-3.0-or-later). See `LICENSE`.
+GPL-3.0-or-later. See [`LICENSE`](LICENSE).

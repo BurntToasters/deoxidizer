@@ -105,6 +105,7 @@ deoxidizer/
 ├── .env.example                # Template for GPG, Apple, and Azure signing credentials
 ├── .gitignore                  # Git ignore rules (excludes /target, .env, release/, etc.)
 ├── README.md                   # User-facing documentation and usage guide
+├── CHANGELOG.md                # BCLS-formatted release notes and GitHub body
 ├── AGENTS.md                   # This durable agent context and invariant specification
 ├── install.sh                  # macOS/Linux installer script (local build or GitHub release)
 ├── install.ps1                 # Windows PowerShell installer script
@@ -225,7 +226,6 @@ DEOX_RELEASE_CONFIRM=
 DEOX_RELEASE_DRAFT_MODE=create
 DEOX_ALLOW_UNSIGNED_RELEASE=0
 DEOX_CHECKSUM_NAME=
-RELEASE_NOTES=
 
 # GPG Signing
 GPG_KEY_ID=
@@ -271,6 +271,7 @@ APPLE_TEAM_ID=
    - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state.
    - `npm run release:<os>[:arch]` builds one target, signs it, verifies it, and stages it.
    - Add `--upload` only after `gh auth login`; publication uses draft releases and remote digest checks.
+  - `CHANGELOG.md` is the BCLS-formatted release body; draft creation fails if it is missing or empty.
 
 ---
 

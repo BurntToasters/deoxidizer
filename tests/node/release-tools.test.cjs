@@ -21,6 +21,7 @@ const {
   tag,
   prerelease,
 } = require('../../scripts/verify-release-draft.cjs');
+const { releaseNotes } = require('../../scripts/ensure-draft-release.cjs');
 
 test('normalizes release aliases to supported target triples', () => {
   assert.equal(normalizeOs('macos'), 'darwin');
@@ -100,4 +101,9 @@ test('draft validator requires every supported target manifest and archive', () 
     validateDraft({ draft: true, prerelease, tag_name: tag }, assets.slice(1)).join('\n'),
     /missing asset/,
   );
+});
+
+test('GitHub draft notes come from BCLS changelog', () => {
+  assert.match(releaseNotes(), /## Changes in `v0\.1\.0:`/);
+  assert.match(releaseNotes(), /BCLS standard/);
 });
