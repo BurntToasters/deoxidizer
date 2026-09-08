@@ -132,6 +132,7 @@ deoxidizer/
 │   ├── branch-sync.cjs         # Explicitly confirmed main/beta Git synchronization
 │   ├── vi.cjs                  # Explicitly confirmed checkout bootstrap
 │   ├── git-prune.cjs           # Explicitly confirmed local-only branch deletion
+│   ├── sync-version.cjs        # Version synchronization across manifests and changelog
 │   ├── release.cjs             # Target build, signing, and optional publication
 │   ├── release-session.cjs     # Quality proof and release identity binding
 │   ├── github-cli.cjs          # Token-scrubbed gh wrapper
@@ -269,6 +270,7 @@ APPLE_TEAM_ID=
    - Passphrases enter through stdin, never command-line arguments.
 4. **Node release orchestration:**
    - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state.
+  - `npm run u -- <version>` synchronizes `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and BCLS download metadata.
    - `npm run release:<os>[:arch]` builds one target, signs it, verifies it, and stages it.
    - Add `--upload` only after `gh auth login`; publication uses draft releases and remote digest checks.
   - `CHANGELOG.md` is the BCLS-formatted release body; draft creation fails if it is missing or empty.

@@ -118,6 +118,7 @@ network access.
 ```bash
 npm ci
 
+npm run u -- 0.1.1                 # sync version across manifests and changelog
 DEOX_RELEASE_CONFIRM=YES npm run r  # sync main, test, prune
 DEOX_RELEASE_CONFIRM=YES npm run b  # sync beta, test
 

@@ -13,11 +13,13 @@
     "gitprune:force": "node scripts/git-prune.cjs",
     "r": "node scripts/branch-sync.cjs main",
     "b": "node scripts/branch-sync.cjs beta",
+    "sync-version": "node scripts/sync-version.cjs",
+    "u": "node scripts/sync-version.cjs",
     "quality": "npm run check:license && npm run check:version && npm run quality:rust && npm run quality:node",
     "check:license": "node scripts/check-license.cjs",
     "check:version": "node scripts/check-version.cjs",
     "quality:rust": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test",
-    "quality:node": "node --test tests/node/release-tools.test.cjs",
+    "quality:node": "node --test tests/node/release-tools.test.cjs tests/node/sync-version.test.cjs",
     "release:prepare": "npm run quality && node scripts/release-session.cjs quality && node scripts/release-session.cjs start",
     "release:linux": "node scripts/release.cjs linux x86_64",
     "release:linux:x64": "node scripts/release.cjs linux x86_64",
@@ -33,6 +35,6 @@
     "release:verify:draft": "node scripts/verify-release-draft.cjs",
     "release:publish": "node scripts/publish-release.cjs",
     "release:sign": "bash scripts/gpg-sign.sh release",
-    "test:release": "node --test tests/node/release-tools.test.cjs"
+    "test:release": "node --test tests/node/release-tools.test.cjs tests/node/sync-version.test.cjs"
   }
 }
