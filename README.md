@@ -24,7 +24,10 @@ irm https://raw.githubusercontent.com/BurntToasters/deoxidizer/main/install.ps1 
 ```
 
 Release installers verify platform-specific SHA256 manifests before
-installation. Windows binaries also require valid Authenticode signatures.
+installation and authenticate manifests with the pinned release key
+(`CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F`). Windows binaries also require
+valid Authenticode signatures from `BurntToasters`. Release update/install
+flows require `gpg` for manifest signature verification.
 
 ## Quick start
 
@@ -99,6 +102,9 @@ Cleanup supports workspace target directories and cross-compilation triples.
 Symlinks are rejected. Deoxidizer never follows links or removes paths outside
 a validated project `target/` directory.
 
+Reported sizes are logical file bytes. Filesystem allocation, compression,
+sparse-file holes, and clone sharing can make reclaimable disk space differ.
+
 ## Build from source
 
 ```bash
@@ -126,6 +132,9 @@ npm run release:linux
 npm run release:linux:arm64
 npm run release:macos
 npm run release:windows
+
+# CI stages, signs, and verifies before authenticating GitHub, then uploads:
+npm run release:upload
 
 npm run release:verify:draft
 npm run release:publish -- --yes

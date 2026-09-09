@@ -1,8 +1,10 @@
 use colored::Colorize;
+use semver::Version;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 const REPO_OWNER: &str = "BurntToasters";
@@ -10,6 +12,7 @@ const REPO_NAME: &str = "deoxidizer";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_RELEASE_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SIGNATURE_BYTES: usize = 1024 * 1024;
 const MAX_ASSET_BYTES: usize = 256 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -63,6 +66,17 @@ pub fn run_update() {
         .or_else(|| release.assets.iter().find(|a| a.name == "SHA256SUMS.txt"))
         .map(|a| a.browser_download_url.clone());
 
+    let checksum_signature_name = checksums_url
+        .as_ref()
+        .and_then(|url| url.rsplit('/').next().map(|name| format!("{name}.asc")));
+    let checksum_signature_url = checksum_signature_name.as_ref().and_then(|name| {
+        release
+            .assets
+            .iter()
+            .find(|asset| &asset.name == name)
+            .map(|asset| asset.browser_download_url.clone())
+    });
+
     let asset_url = match asset_url {
         Some(url) => url,
         None => {
@@ -91,8 +105,21 @@ pub fn run_update() {
             std::process::exit(1);
         }
     };
+    let checksum_signature_url = match checksum_signature_url {
+        Some(url) => url,
+        None => {
+            eprintln!(
+                "  {} No detached signature found for checksum manifest. Aborting update.",
+                "✗".red().bold()
+            );
+            std::process::exit(1);
+        }
+    };
 
-    if !is_allowed_download_url(&asset_url) || !is_allowed_download_url(&checksums_url) {
+    if !is_allowed_download_url(&asset_url)
+        || !is_allowed_download_url(&checksums_url)
+        || !is_allowed_download_url(&checksum_signature_url)
+    {
         eprintln!(
             "  {} Release contains an untrusted download URL. Aborting update.",
             "✗".red().bold()
@@ -121,6 +148,24 @@ pub fn run_update() {
             std::process::exit(1);
         }
     };
+    let signature_bytes = match download_bytes(&checksum_signature_url, MAX_SIGNATURE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "  {} Could not download checksum signature: {error}",
+                "✗".red().bold()
+            );
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = verify_signed_manifest(&checksums_bytes, &signature_bytes) {
+        eprintln!(
+            "  {} Checksum signature verification FAILED: {error}",
+            "✗".red().bold()
+        );
+        std::process::exit(1);
+    }
+    println!("  {} Checksum manifest signature verified.", "✓".green());
     let checksums_str = match std::str::from_utf8(&checksums_bytes) {
         Ok(value) => value,
         Err(error) => {
@@ -242,27 +287,17 @@ fn read_limited<R: Read>(mut reader: R, max_bytes: usize) -> Result<Vec<u8>, Str
 }
 
 fn is_allowed_download_url(url: &str) -> bool {
-    url.starts_with("https://api.github.com/")
-        || url.starts_with("https://github.com/")
+    url.starts_with("https://api.github.com/repos/BurntToasters/deoxidizer/")
+        || url.starts_with("https://github.com/BurntToasters/deoxidizer/releases/download/")
         || url.starts_with("https://objects.githubusercontent.com/")
 }
 
 /// Compare semver strings: returns true if `latest` > `current`.
 fn is_newer(latest: &str, current: &str) -> bool {
-    let parse = |s: &str| -> (u32, u32, u32) {
-        let parts: Vec<&str> = s.split('.').collect();
-        let major = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let minor = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
-        let patch_str = parts.get(2).unwrap_or(&"0");
-        // Strip pre-release suffixes for comparison
-        let patch_num = patch_str
-            .split('-')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(0);
-        (major, minor, patch_num)
-    };
-    parse(latest) > parse(current)
+    match (Version::parse(latest), Version::parse(current)) {
+        (Ok(latest), Ok(current)) => latest > current,
+        _ => false,
+    }
 }
 
 /// Determine the expected release asset name for the current platform.
@@ -325,6 +360,51 @@ fn verify_sha256(data: &[u8], asset_name: &str, checksums: &str) -> bool {
     expected.is_some_and(|value| value.eq_ignore_ascii_case(&computed))
 }
 
+/// Verify checksum manifest using the repository's pinned release key.
+fn verify_signed_manifest(manifest: &[u8], signature: &[u8]) -> Result<(), String> {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("deoxidizer-signature-")
+        .tempdir()
+        .map_err(|error| format!("cannot create signature workspace: {error}"))?;
+    let manifest_path = temp_dir.path().join("SHA256SUMS.txt");
+    let signature_path = temp_dir.path().join("SHA256SUMS.txt.asc");
+    let key_path = temp_dir.path().join("release-key.asc");
+    let keyring_path = temp_dir.path().join("release-keyring.gpg");
+    fs::write(&manifest_path, manifest)
+        .map_err(|error| format!("cannot write manifest: {error}"))?;
+    fs::write(&signature_path, signature)
+        .map_err(|error| format!("cannot write signature: {error}"))?;
+    fs::write(&key_path, include_bytes!("../release-signing-key.asc"))
+        .map_err(|error| format!("cannot write pinned key: {error}"))?;
+
+    let dearmor = Command::new("gpg")
+        .args(["--batch", "--yes", "--dearmor", "--output"])
+        .arg(&keyring_path)
+        .arg(&key_path)
+        .output()
+        .map_err(|error| format!("gpg unavailable: {error}"))?;
+    if !dearmor.status.success() {
+        return Err("cannot load pinned release key".to_string());
+    }
+    let verify = Command::new("gpg")
+        .args([
+            "--batch",
+            "--no-options",
+            "--no-default-keyring",
+            "--keyring",
+        ])
+        .arg(&keyring_path)
+        .args(["--verify"])
+        .arg(&signature_path)
+        .arg(&manifest_path)
+        .output()
+        .map_err(|error| format!("gpg unavailable: {error}"))?;
+    if !verify.status.success() {
+        return Err("signature does not match pinned release key".to_string());
+    }
+    Ok(())
+}
+
 /// Extract the update and replace the current binary.
 fn install_update(archive_bytes: &[u8], asset_name: &str) -> Result<(), String> {
     let temp_dir = tempfile::Builder::new()
@@ -359,21 +439,28 @@ fn install_update(archive_bytes: &[u8], asset_name: &str) -> Result<(), String> 
     let new_binary = find_binary_in_dir(temp_dir.path(), binary_name)
         .ok_or_else(|| format!("Could not find '{binary_name}' in extracted archive"))?;
 
-    // On Windows, also update sibling binary (deox.exe <-> deoxidizer.exe)
-    if cfg!(target_os = "windows") {
+    // Keep separately-installed sibling binary in sync. Symlink aliases already
+    // resolve to the replaced file and must not be overwritten through a link.
+    if cfg!(target_os = "windows") || cfg!(unix) {
         if let Some(current_exe) = current_exe {
             if let Some(parent) = current_exe.parent() {
-                let sibling_name = if current_exe.file_name() == Some("deox.exe".as_ref()) {
-                    "deoxidizer.exe"
-                } else {
-                    "deox.exe"
-                };
-                let sibling_dest = parent.join(sibling_name);
-                if fs::symlink_metadata(&sibling_dest).is_ok() {
-                    let new_sibling = find_binary_in_dir(temp_dir.path(), sibling_name)
-                        .ok_or_else(|| format!("Could not find '{sibling_name}' in update"))?;
-                    fs::copy(&new_sibling, &sibling_dest)
-                        .map_err(|e| format!("Failed to replace {sibling_name}: {e}"))?;
+                if let Some(current_name) = current_exe.file_name().and_then(|name| name.to_str()) {
+                    if let Some(sibling_name) = sibling_binary_name(current_name) {
+                        let sibling_dest = parent.join(sibling_name);
+                        if fs::symlink_metadata(&sibling_dest)
+                            .map(|metadata| {
+                                !metadata.file_type().is_symlink() && metadata.is_file()
+                            })
+                            .unwrap_or(false)
+                        {
+                            let new_sibling = find_binary_in_dir(temp_dir.path(), sibling_name)
+                                .ok_or_else(|| {
+                                    format!("Could not find '{sibling_name}' in update")
+                                })?;
+                            fs::copy(&new_sibling, &sibling_dest)
+                                .map_err(|e| format!("Failed to replace {sibling_name}: {e}"))?;
+                        }
+                    }
                 }
             }
         }
@@ -400,6 +487,16 @@ fn find_binary_in_dir(dir: &std::path::Path, name: &str) -> Option<std::path::Pa
         }
     }
     None
+}
+
+fn sibling_binary_name(current_name: &str) -> Option<&'static str> {
+    match current_name {
+        "deoxidizer" => Some("deox"),
+        "deox" => Some("deoxidizer"),
+        "deoxidizer.exe" => Some("deox.exe"),
+        "deox.exe" => Some("deoxidizer.exe"),
+        _ => None,
+    }
 }
 
 fn validate_archive_path(path: &Path) -> Result<PathBuf, String> {
@@ -568,6 +665,9 @@ mod tests {
             "https://github.com/BurntToasters/deoxidizer/releases/download/v1/a.tar.gz"
         ));
         assert!(!is_allowed_download_url(
+            "https://github.com/another-owner/deoxidizer/releases/download/v1/a.tar.gz"
+        ));
+        assert!(!is_allowed_download_url(
             "http://github.com/BurntToasters/deoxidizer/releases/latest"
         ));
         assert!(!is_allowed_download_url("https://evil.example/a.tar.gz"));
@@ -578,5 +678,22 @@ mod tests {
         assert!(validate_archive_path(Path::new("deoxidizer")).is_ok());
         assert!(validate_archive_path(Path::new("../outside")).is_err());
         assert!(validate_archive_path(Path::new("/absolute")).is_err());
+    }
+
+    #[test]
+    fn semver_prerelease_orders_before_stable() {
+        assert!(is_newer("0.2.0", "0.2.0-beta.1"));
+        assert!(!is_newer("0.2.0-beta.1", "0.2.0"));
+        assert!(is_newer("0.2.0-beta.2", "0.2.0-beta.1"));
+        assert!(!is_newer("garbage", "0.1.0"));
+    }
+
+    #[test]
+    fn sibling_binary_names_match_each_platform() {
+        assert_eq!(sibling_binary_name("deoxidizer"), Some("deox"));
+        assert_eq!(sibling_binary_name("deox"), Some("deoxidizer"));
+        assert_eq!(sibling_binary_name("deoxidizer.exe"), Some("deox.exe"));
+        assert_eq!(sibling_binary_name("deox.exe"), Some("deoxidizer.exe"));
+        assert_eq!(sibling_binary_name("unexpected"), None);
     }
 }

@@ -64,15 +64,24 @@ SectionEnd
 Section "Uninstall"
   Delete "$INSTDIR\deoxidizer.exe"
   Delete "$INSTDIR\deox.exe"
+  Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 
   ; Remove from PATH
   ReadRegStr $0 HKCU "Environment" "Path"
-  ${WordReplace} $0 "$INSTDIR;" "" "+" $1
-  ${WordReplace} $1 ";$INSTDIR" "" "+" $2
-  ${WordReplace} $2 "$INSTDIR" "" "+" $3
-  WriteRegExpandStr HKCU "Environment" "Path" $3
+  ; Add delimiters so only a complete semicolon-separated entry is removed.
+  StrCpy $1 ";$0;"
+  ${WordReplace} $1 ";$INSTDIR;" ";" "+" $1
+  StrCpy $2 $1 "" 1
+  StrLen $3 $2
+  IntOp $3 $3 - 1
+  ${If} $3 > 0
+    StrCpy $2 $2 $3
+  ${Else}
+    StrCpy $2 ""
+  ${EndIf}
+  WriteRegExpandStr HKCU "Environment" "Path" $2
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
   ; Remove registry keys

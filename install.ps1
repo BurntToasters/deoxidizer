@@ -17,6 +17,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $Repo = 'BurntToasters/deoxidizer'
+$ReleaseKeyFingerprint = 'CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F'
+$ExpectedWindowsPublisher = 'BurntToasters'
 $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\deoxidizer'
 
 Write-Host '🔧 deoxidizer installer for Windows' -ForegroundColor Cyan
@@ -82,6 +84,21 @@ try {
             $checksumPath = Join-Path $stagingRoot $checksumName
             Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$($release.tag_name)/$checksumName" -OutFile $checksumPath
         }
+        $gpg = Get-Command gpg.exe -ErrorAction SilentlyContinue
+        if (-not $gpg) { throw 'gpg.exe is required to authenticate release manifests' }
+        $keyPath = Join-Path $stagingRoot 'release-signing-key.asc'
+        $keyringPath = Join-Path $stagingRoot 'release-keyring.gpg'
+        $signaturePath = "$checksumPath.asc"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$Repo/main/release-signing-key.asc" -OutFile $keyPath
+        $fingerprint = (& $gpg.Source --batch --show-keys --with-colons $keyPath |
+            Where-Object { $_ -like 'fpr:*' } |
+            Select-Object -First 1).Split(':')[9].ToUpperInvariant()
+        if ($fingerprint -ne $ReleaseKeyFingerprint) { throw 'release signing key fingerprint mismatch' }
+        & $gpg.Source --batch --yes --dearmor --output $keyringPath $keyPath
+        if ($LASTEXITCODE -ne 0) { throw 'cannot load release signing key' }
+        Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$($release.tag_name)/$checksumName.asc" -OutFile $signaturePath
+        & $gpg.Source --batch --no-options --no-default-keyring --keyring $keyringPath --verify $signaturePath $checksumPath *> $null
+        if ($LASTEXITCODE -ne 0) { throw 'checksum manifest signature verification failed' }
         $escapedAsset = [Regex]::Escape($assetName)
         $checksumLines = @(Get-Content -LiteralPath $checksumPath |
             Where-Object { $_ -match "^\s*([0-9A-Fa-f]{64})\s+\*?$escapedAsset\s*$" } |
@@ -116,8 +133,23 @@ try {
             if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
                 throw "Invalid or missing Authenticode signature: $binary"
             }
+            if (-not $signature.SignerCertificate) { throw "Missing Authenticode signer certificate: $binary" }
+            $publisher = $signature.SignerCertificate.GetNameInfo(
+                [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+                $false
+            )
+            if ($publisher -ne $ExpectedWindowsPublisher) {
+                throw "Unexpected Authenticode publisher for $binary: $publisher"
+            }
         }
-        Move-Item -LiteralPath $staged -Destination (Join-Path $InstallDir $binary) -Force
+        $destination = Join-Path $InstallDir $binary
+        if (Test-Path -LiteralPath $destination) {
+            $destinationItem = Get-Item -LiteralPath $destination -Force
+            if (($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Install destination is a reparse point: $binary"
+            }
+        }
+        Move-Item -LiteralPath $staged -Destination $destination -Force
     }
 } finally {
     if (Test-Path $stagingRoot) {
@@ -129,8 +161,10 @@ Write-Host "✓ Installed to $InstallDir" -ForegroundColor Green
 
 # Add to PATH if not already there
 $currentPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
-if ($currentPath -notlike "*$InstallDir*") {
-    [Environment]::SetEnvironmentVariable('PATH', "$InstallDir;$currentPath", 'User')
+$pathEntries = @($currentPath -split ';' | Where-Object { $_ })
+if (-not ($pathEntries | Where-Object { $_.TrimEnd('\\') -ieq $InstallDir.TrimEnd('\\') })) {
+    $newPath = (@($InstallDir) + $pathEntries) -join ';'
+    [Environment]::SetEnvironmentVariable('PATH', $newPath, 'User')
     # Broadcast WM_SETTINGCHANGE so active shells pick up the change
     if (-not ([Management.Automation.PSTypeName]'Win32.NativeMethods').Type) {
         Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition @'

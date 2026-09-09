@@ -7,7 +7,7 @@ on:
         description: Release operating system
         required: true
         type: choice
-        options: [linux, darwin, windows]
+        options: [linux, macos, windows]
         default: linux
       arch:
         description: Target architecture
@@ -37,20 +37,52 @@ permissions:
 jobs:
   release:
     runs-on: ${{ inputs.runner }}
+    environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24.20.0
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      - run: npm install --global npm@12.0.2
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
         with:
           toolchain: 1.98.0
           components: rustfmt, clippy
       - name: Install release dependencies
         run: npm ci
+      - name: Build and stage release
+        shell: bash
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          AZURE_CLIENT_ID: ${{ inputs.os == 'windows' && secrets.AZURE_CLIENT_ID || '' }}
+          AZURE_TENANT_ID: ${{ inputs.os == 'windows' && secrets.AZURE_TENANT_ID || '' }}
+          AZURE_SUBSCRIPTION_ID: ${{ inputs.os == 'windows' && secrets.AZURE_SUBSCRIPTION_ID || '' }}
+          AZURE_CLIENT_SECRET: ${{ inputs.os == 'windows' && secrets.AZURE_CLIENT_SECRET || '' }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ inputs.os == 'windows' && secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT || '' }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ inputs.os == 'windows' && secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT || '' }}
+          AZURE_ARTIFACT_SIGNING_PROFILE: ${{ inputs.os == 'windows' && secrets.AZURE_ARTIFACT_SIGNING_PROFILE || '' }}
+          AZURE_ARTIFACT_SIGNING_PUBLISHER: ${{ inputs.os == 'windows' && secrets.AZURE_ARTIFACT_SIGNING_PUBLISHER || '' }}
+          AZURE_ARTIFACT_SIGNING_PUBLISHER_DN: ${{ inputs.os == 'windows' && secrets.AZURE_ARTIFACT_SIGNING_PUBLISHER_DN || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ inputs.os == 'macos' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_KEYCHAIN_PROFILE: ${{ inputs.os == 'macos' && secrets.APPLE_KEYCHAIN_PROFILE || '' }}
+          DEOX_RELEASE_CONFIRM: YES
+        run: |
+          set -euo pipefail
+          case "${{ inputs.os }}-${{ inputs.arch }}" in
+            linux-x86_64) COMMAND="release:linux:x64" ;;
+            linux-aarch64) COMMAND="release:linux:arm64" ;;
+            macos-x86_64) COMMAND="release:macos:x64" ;;
+            macos-aarch64) COMMAND="release:macos:arm64" ;;
+            windows-x86_64) COMMAND="release:windows:x64" ;;
+            windows-aarch64) COMMAND="release:windows:arm64" ;;
+            *) echo "Unsupported release target: ${{ inputs.os }}-${{ inputs.arch }}" >&2; exit 2 ;;
+          esac
+          npm run "$COMMAND"
       - name: Authenticate GitHub CLI credential store
         if: ${{ inputs.upload }}
         shell: bash
@@ -59,25 +91,15 @@ jobs:
         run: |
           printf '%s\n' "$GH_TOKEN" | gh auth login --hostname github.com --with-token
           gh auth status --hostname github.com
-      - name: Build and stage release
+      - name: Upload staged release
+        if: ${{ inputs.upload }}
         shell: bash
         env:
-          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-          DEOX_RELEASE_CONFIRM: YES
           DEOX_RELEASE_DRAFT_MODE: ${{ inputs.draft_mode }}
         run: |
           set -euo pipefail
-          COMMAND="release:${{ inputs.os }}"
-          if [ "${{ inputs.arch }}" != "x86_64" ]; then
-            COMMAND="${COMMAND}:arm64"
-          fi
-          if [ "${{ inputs.upload }}" = "true" ]; then
-            if [ "${{ inputs.draft_mode }}" = "wait" ]; then
-              npm run "$COMMAND" -- --upload --wait
-            else
-              npm run "$COMMAND" -- --upload
-            fi
+          if [ "${{ inputs.draft_mode }}" = "wait" ]; then
+            npm run release:upload -- --wait
           else
-            npm run "$COMMAND"
+            npm run release:upload
           fi

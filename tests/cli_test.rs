@@ -47,12 +47,28 @@ fn scan_path_is_read_only_and_aliases_share_dispatch() {
 }
 
 #[test]
+fn scan_invalid_root_exits_nonzero() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing");
+    let output = Command::new(env!("CARGO_BIN_EXE_deox"))
+        .args(["scan", "--path", missing.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Scan failed"));
+}
+
+#[test]
 fn malformed_config_does_not_fall_back_to_destructive_defaults() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(home.path().join(".deox_config"), "{not-json").unwrap();
     let projects = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_deox"))
-        .env("HOME", home.path())
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deox"));
+    #[cfg(windows)]
+    command.env("USERPROFILE", home.path()).env_remove("HOME");
+    #[cfg(not(windows))]
+    command.env("HOME", home.path());
+    let output = command
         .args(["scan", "--path", projects.path().to_str().unwrap()])
         .output()
         .unwrap();

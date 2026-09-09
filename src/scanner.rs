@@ -1,21 +1,40 @@
 use crate::config::{Config, Scope};
 use crate::project::{DiscoveredProject, ProjectKind, TargetBreakdown};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use toml::Value;
 use walkdir::WalkDir;
 
-/// Scan the given directory for Rust/Tauri projects with build artifacts.
-pub fn scan(config: &Config) -> Vec<DiscoveredProject> {
+/// Errors encountered while scanning configured project roots.
+#[derive(Debug)]
+pub enum ScanError {
+    Root { path: PathBuf, message: String },
+    Traversal(String),
+}
+
+impl fmt::Display for ScanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Root { path, message } => write!(f, "cannot scan {}: {message}", path.display()),
+            Self::Traversal(message) => write!(f, "scan traversal failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ScanError {}
+
+/// Scan the configured directory for Rust/Tauri projects with build artifacts.
+pub fn scan(config: &Config) -> Result<Vec<DiscoveredProject>, ScanError> {
     let root = config.projects_path();
-    let mut projects = scan_dir(&root, &config.scope);
+    let mut projects = scan_dir(&root, &config.scope)?;
 
     // Apply config-level min size filter
     if config.min_size_mb > 0 {
         let Some(min_bytes) = config.min_size_mb.checked_mul(1024 * 1024) else {
             eprintln!("Warning: min_size_mb is too large; no projects included.");
-            return Vec::new();
+            return Ok(Vec::new());
         };
         projects.retain(|p| p.artifact_size >= min_bytes);
     }
@@ -30,18 +49,12 @@ pub fn scan(config: &Config) -> Vec<DiscoveredProject> {
         });
     }
 
-    projects
+    Ok(projects)
 }
 
 /// Scan a specific directory for projects.
-pub fn scan_dir(root: &Path, scope: &Scope) -> Vec<DiscoveredProject> {
-    let root = match validate_scan_root(root) {
-        Ok(root) => root,
-        Err(error) => {
-            eprintln!("Warning: cannot scan {}: {}", root.display(), error);
-            return Vec::new();
-        }
-    };
+pub fn scan_dir(root: &Path, scope: &Scope) -> Result<Vec<DiscoveredProject>, ScanError> {
+    let root = validate_scan_root(root)?;
 
     let mut projects = Vec::new();
     let mut seen_targets: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -54,8 +67,7 @@ pub fn scan_dir(root: &Path, scope: &Scope) -> Vec<DiscoveredProject> {
         let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
-                eprintln!("Warning: scan traversal error: {error}");
-                continue;
+                return Err(ScanError::Traversal(error.to_string()));
             }
         };
         if !entry.file_type().is_file() {
@@ -87,7 +99,8 @@ pub fn scan_dir(root: &Path, scope: &Scope) -> Vec<DiscoveredProject> {
             continue;
         };
 
-        let kind = detect_project_kind(&manifest);
+        let workspace_manifest = find_workspace_manifest(project_dir);
+        let kind = detect_project_kind(&manifest, workspace_manifest.as_ref());
 
         // Apply scope filter
         match scope {
@@ -125,7 +138,7 @@ pub fn scan_dir(root: &Path, scope: &Scope) -> Vec<DiscoveredProject> {
         }
 
         let name = extract_project_name(&manifest, project_dir);
-        let (artifact_size, breakdown, last_modified) = analyze_target(&target_dir);
+        let (artifact_size, breakdown, last_modified) = analyze_target(&target_dir)?;
 
         projects.push(DiscoveredProject {
             name,
@@ -140,21 +153,31 @@ pub fn scan_dir(root: &Path, scope: &Scope) -> Vec<DiscoveredProject> {
 
     // Sort by size descending
     projects.sort_by_key(|a| std::cmp::Reverse(a.artifact_size));
-    projects
+    Ok(projects)
 }
 
 /// Reject symlinked configured roots before canonicalizing them.
-fn validate_scan_root(root: &Path) -> Result<PathBuf, String> {
-    let metadata =
-        fs::symlink_metadata(root).map_err(|error| format!("metadata failed: {error}"))?;
+fn validate_scan_root(root: &Path) -> Result<PathBuf, ScanError> {
+    let metadata = fs::symlink_metadata(root).map_err(|error| ScanError::Root {
+        path: root.to_path_buf(),
+        message: format!("metadata failed: {error}"),
+    })?;
     if metadata.file_type().is_symlink() {
-        return Err("configured scan root is a symlink".to_string());
+        return Err(ScanError::Root {
+            path: root.to_path_buf(),
+            message: "configured scan root is a symlink".to_string(),
+        });
     }
     if !metadata.is_dir() {
-        return Err("configured scan root is not a directory".to_string());
+        return Err(ScanError::Root {
+            path: root.to_path_buf(),
+            message: "configured scan root is not a directory".to_string(),
+        });
     }
-    root.canonicalize()
-        .map_err(|error| format!("path resolution failed: {error}"))
+    root.canonicalize().map_err(|error| ScanError::Root {
+        path: root.to_path_buf(),
+        message: format!("path resolution failed: {error}"),
+    })
 }
 
 fn read_manifest(path: &Path) -> Option<Value> {
@@ -220,7 +243,70 @@ fn resolve_target_dir(project_dir: &Path, manifest: &Value) -> Option<(PathBuf, 
 }
 
 /// Detect whether a parsed Cargo manifest indicates a Tauri project.
-fn detect_project_kind(manifest: &Value) -> ProjectKind {
+fn find_workspace_manifest(project_dir: &Path) -> Option<Value> {
+    for ancestor in project_dir.ancestors() {
+        let path = ancestor.join("Cargo.toml");
+        let Some(manifest) = read_manifest(&path) else {
+            continue;
+        };
+        if manifest.get("workspace").is_some() {
+            return Some(manifest);
+        }
+    }
+    None
+}
+
+/// Revalidate that a cleaner-supplied root is a real Cargo project/workspace.
+pub fn validate_project_root(path: &Path, expected_name: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("project root is not a real directory".to_string());
+    }
+    let manifest_path = path.join("Cargo.toml");
+    let manifest = read_manifest(&manifest_path)
+        .ok_or_else(|| "project root has no valid Cargo.toml".to_string())?;
+    if manifest.get("package").is_none() && manifest.get("workspace").is_none() {
+        return Err("project root is not a Cargo package or workspace".to_string());
+    }
+    if manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(|name| name == expected_name)
+    {
+        return Ok(());
+    }
+    if manifest.get("workspace").is_some() {
+        for result in WalkDir::new(path)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0 || (!is_hidden(entry) && !is_artifact_dir(entry))
+            })
+        {
+            let entry = result.map_err(|error| format!("workspace validation failed: {error}"))?;
+            if !entry.file_type().is_file() || entry.file_name() != "Cargo.toml" {
+                continue;
+            }
+            let Some(member) = read_manifest(entry.path()) else {
+                continue;
+            };
+            if member
+                .get("package")
+                .and_then(|package| package.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == expected_name)
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "project identity does not match Cargo project {expected_name}"
+    ))
+}
+
+fn detect_project_kind(manifest: &Value, workspace_manifest: Option<&Value>) -> ProjectKind {
     let mut dependency_tables = Vec::new();
 
     if let Some(table) = manifest.get("dependencies").and_then(Value::as_table) {
@@ -242,6 +328,30 @@ fn detect_project_kind(manifest: &Value) -> ProjectKind {
     if let Some(workspace) = manifest.get("workspace") {
         if let Some(table) = workspace.get("dependencies").and_then(Value::as_table) {
             dependency_tables.push(table);
+        }
+    }
+
+    // Members may inherit renamed dependencies from [workspace.dependencies].
+    if let Some(workspace_manifest) = workspace_manifest {
+        let workspace_dependencies = workspace_manifest
+            .get("workspace")
+            .and_then(|value| value.get("dependencies"))
+            .and_then(Value::as_table);
+        if let (Some(member_dependencies), Some(workspace_dependencies)) = (
+            manifest.get("dependencies").and_then(Value::as_table),
+            workspace_dependencies,
+        ) {
+            if member_dependencies.iter().any(|(name, value)| {
+                value
+                    .get("workspace")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    && workspace_dependencies
+                        .get(name)
+                        .is_some_and(is_tauri_dependency)
+            }) {
+                return ProjectKind::TauriApp;
+            }
         }
     }
 
@@ -282,7 +392,9 @@ fn extract_project_name(manifest: &Value, project_dir: &Path) -> String {
 
 /// Analyze a target/ directory in a single traversal, computing total size,
 /// breakdown (including target triples), and newest modification time.
-pub fn analyze_target(target_dir: &Path) -> (u64, TargetBreakdown, Option<SystemTime>) {
+pub fn analyze_target(
+    target_dir: &Path,
+) -> Result<(u64, TargetBreakdown, Option<SystemTime>), ScanError> {
     let mut total_size = 0u64;
     let mut debug_size = 0u64;
     let mut release_size = 0u64;
@@ -295,63 +407,70 @@ pub fn analyze_target(target_dir: &Path) -> (u64, TargetBreakdown, Option<System
         let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
-                eprintln!("Warning: target traversal error: {error}");
-                continue;
+                return Err(ScanError::Traversal(error.to_string()));
             }
         };
         if !entry.file_type().is_file() {
             continue;
         }
 
-        if let Ok(metadata) = fs::symlink_metadata(entry.path()) {
-            let len = metadata.len();
-            total_size += len;
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(ScanError::Traversal(format!(
+                    "cannot inspect {}: {error}",
+                    entry.path().display()
+                )));
+            }
+        };
+        let len = metadata.len();
+        total_size += len;
 
-            if let Ok(mtime) = metadata.modified() {
-                last_modified = Some(match last_modified {
-                    Some(prev) => prev.max(mtime),
-                    None => mtime,
-                });
+        if let Ok(mtime) = metadata.modified() {
+            last_modified = Some(match last_modified {
+                Some(prev) => prev.max(mtime),
+                None => mtime,
+            });
+        }
+
+        if let Ok(rel) = entry.path().strip_prefix(target_dir) {
+            let mut is_debug = false;
+            let mut is_release = false;
+            let mut is_incremental = false;
+            let mut is_deps = false;
+
+            for comp in rel.components() {
+                let comp_str = comp.as_os_str().to_string_lossy();
+                if comp_str == "debug" {
+                    is_debug = true;
+                } else if comp_str == "release" {
+                    is_release = true;
+                } else if comp_str == "incremental" {
+                    is_incremental = true;
+                } else if comp_str == "deps" {
+                    is_deps = true;
+                }
             }
 
-            if let Ok(rel) = entry.path().strip_prefix(target_dir) {
-                let mut is_debug = false;
-                let mut is_release = false;
-                let mut is_incremental = false;
-                let mut is_deps = false;
+            if is_debug {
+                debug_size += len;
+            } else if is_release {
+                release_size += len;
+            } else {
+                other_size += len;
+            }
 
-                for comp in rel.components() {
-                    let comp_str = comp.as_os_str().to_string_lossy();
-                    if comp_str == "debug" {
-                        is_debug = true;
-                    } else if comp_str == "release" {
-                        is_release = true;
-                    } else if comp_str == "incremental" {
-                        is_incremental = true;
-                    } else if comp_str == "deps" {
-                        is_deps = true;
-                    }
-                }
-
-                if is_debug {
-                    debug_size += len;
-                } else if is_release {
-                    release_size += len;
-                } else {
-                    other_size += len;
-                }
-
-                if is_incremental {
-                    incremental_size += len;
-                }
-                if is_deps {
-                    deps_size += len;
-                }
+            if is_incremental {
+                incremental_size += len;
+            }
+            if is_deps {
+                deps_size += len;
             }
         }
     }
 
-    (
+    Ok((
         total_size,
         TargetBreakdown {
             debug_size,
@@ -361,7 +480,7 @@ pub fn analyze_target(target_dir: &Path) -> (u64, TargetBreakdown, Option<System
             other_size,
         },
         last_modified,
-    )
+    ))
 }
 
 /// Calculate the total size of a directory in bytes.

@@ -7,6 +7,7 @@ const {
   githubApi,
   repository,
 } = require('./github-cli.cjs');
+const { spawnSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
 const manifest = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
@@ -38,13 +39,25 @@ function expectedReleaseAssets() {
   return new Set(names);
 }
 
-function validateDraft(release, assets) {
+function currentCommit() {
+  const result = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' });
+  if (result.error || result.status !== 0) throw new Error('Cannot determine current Git commit');
+  const commit = String(result.stdout || '').trim();
+  if (!/^[0-9a-f]{40}$/i.test(commit)) throw new Error('Git returned invalid current commit');
+  return commit;
+}
+
+function validateDraft(release, assets, expectedCommit) {
   const errors = [];
   if (!release?.draft) errors.push(`${tag} is not a draft release`);
   if (release?.tag_name !== tag) errors.push(`expected tag ${tag}`);
   if (release?.prerelease !== prerelease) {
     errors.push(`prerelease flag does not match ${version}`);
   }
+  if (expectedCommit && release?.target_commitish?.toLowerCase() !== expectedCommit.toLowerCase()) {
+    errors.push(`target commit does not match current HEAD ${expectedCommit}`);
+  }
+  const expected = expectedReleaseAssets();
   const byName = new Map();
   for (const asset of assets) {
     if (!asset?.name) continue;
@@ -54,8 +67,11 @@ function validateDraft(release, assets) {
       errors.push(`empty asset: ${asset.name}`);
     }
   }
-  for (const name of expectedReleaseAssets()) {
+  for (const name of expected) {
     if (!byName.has(name)) errors.push(`missing asset: ${name}`);
+  }
+  for (const name of byName.keys()) {
+    if (!expected.has(name)) errors.push(`unexpected asset: ${name}`);
   }
   return errors;
 }
@@ -82,7 +98,7 @@ function listAssets(releaseId) {
 function verifyDraft() {
   const release = findDraft();
   if (!release) throw new Error(`No release found for ${tag}`);
-  const errors = validateDraft(release, listAssets(release.id));
+  const errors = validateDraft(release, listAssets(release.id), currentCommit());
   if (errors.length > 0) throw new Error(errors.join('\n'));
   return release;
 }
@@ -98,4 +114,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { TARGETS, expectedReleaseAssets, validateDraft, verifyDraft, tag, prerelease };
+module.exports = { TARGETS, expectedReleaseAssets, validateDraft, verifyDraft, tag, prerelease, currentCommit };

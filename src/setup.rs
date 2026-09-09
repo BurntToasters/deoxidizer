@@ -63,7 +63,10 @@ pub fn run_setup(use_defaults: bool) {
         .items(scope_options)
         .default(0)
         .interact()
-        .unwrap_or(0);
+        .unwrap_or_else(|error| {
+            eprintln!("Setup cancelled: {error}");
+            std::process::exit(1);
+        });
 
     let scope = match scope_idx {
         0 => Scope::TauriOnly,
@@ -82,7 +85,10 @@ pub fn run_setup(use_defaults: bool) {
         .items(behavior_options)
         .default(0)
         .interact()
-        .unwrap_or(0);
+        .unwrap_or_else(|error| {
+            eprintln!("Setup cancelled: {error}");
+            std::process::exit(1);
+        });
 
     let clean_behavior = match behavior_idx {
         0 => CleanBehavior::Delete,

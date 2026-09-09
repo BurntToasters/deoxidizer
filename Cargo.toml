@@ -6,6 +6,7 @@ rust-version = "1.98"
 authors = ["BurntToasters <code@rosie.run>"]
 description = "Fast, safe disk space cleaner for Rust & Tauri build artifacts"
 license = "GPL-3.0-or-later"
+publish = false
 repository = "https://github.com/BurntToasters/deoxidizer"
 
 [lib]
@@ -25,9 +26,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 walkdir = "2.5"
 colored = "3.0"
 dialoguer = "0.11"
-indicatif = "0.17"
 humansize = "2.1"
-chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
@@ -41,6 +40,7 @@ flate2 = "1.0"
 tar = "0.4"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 tempfile = "3"
+semver = "1.0"
 
 [profile.release]
 opt-level = "s"

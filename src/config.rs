@@ -135,6 +135,7 @@ impl DefaultMode {
 
 /// The persisted configuration for deoxidizer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Schema version for future migrations.
     pub version: u32,

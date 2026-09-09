@@ -14,11 +14,11 @@ function githubStatusCode(detail) {
   return match ? Number(match[1] || match[2]) : undefined;
 }
 
-function runGitHub(args, { input, allowFailure = false } = {}) {
+function runGitHub(args, { input, allowFailure = false, environment = process.env } = {}) {
   const result = spawnSync('gh', args, {
     cwd: process.cwd(),
     encoding: 'utf8',
-    env: githubCliEnvironment(),
+    env: githubCliEnvironment(environment),
     input,
     stdio: ['pipe', 'pipe', 'pipe'],
     maxBuffer: 16 * 1024 * 1024,
@@ -69,11 +69,11 @@ function githubApi(method, endpoint, body) {
   return githubJson(args, options);
 }
 
-function uploadReleaseAsset(tag, filePath, { clobber = false } = {}) {
+function uploadReleaseAsset(tag, filePath, { clobber = false, environment = process.env } = {}) {
   const args = ['release', 'upload', tag, '--repo', repository()];
   if (clobber) args.push('--clobber');
   args.push(filePath);
-  runGitHub(args);
+  runGitHub(args, { environment });
 }
 
 module.exports = {

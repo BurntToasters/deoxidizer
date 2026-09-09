@@ -6,7 +6,7 @@ use std::time::SystemTime;
 /// The type of project detected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProjectKind {
-    /// A Tauri application (Cargo.toml depends on `tauri`).
+    /// A Tauri application (Cargo.toml has a `tauri` dependency).
     TauriApp,
     /// A plain Rust/Cargo project.
     RustProject,
@@ -40,13 +40,13 @@ impl TargetBreakdown {
 /// A discovered project with its build artifact location.
 #[derive(Debug, Clone)]
 pub struct DiscoveredProject {
-    /// Project name (from Cargo.toml [package].name or directory name).
+    /// Project name (from Cargo.toml `package.name` or directory name).
     pub name: String,
     /// Path to the project root directory.
     pub path: PathBuf,
     /// Type of project detected.
     pub kind: ProjectKind,
-    /// Path to the target/ or node_modules/ directory.
+    /// Path to the validated Cargo `target/` directory.
     pub artifact_dir: PathBuf,
     /// Total size of the artifact directory in bytes.
     pub artifact_size: u64,

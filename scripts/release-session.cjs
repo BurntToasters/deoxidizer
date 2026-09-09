@@ -19,6 +19,12 @@ function command(name, args) {
   }).trim();
 }
 
+function assertCleanCheckout() {
+  if (command('git', ['status', '--porcelain', '--untracked-files=all'])) {
+    throw new Error('Release requires a clean Git checkout; commit or stash changes first');
+  }
+}
+
 function sha256File(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
@@ -31,6 +37,7 @@ function cargoVersion() {
 }
 
 function currentIdentity(target = process.env.DEOX_RELEASE_TARGET || 'host') {
+  assertCleanCheckout();
   return {
     version: cargoVersion(),
     commit: command('git', ['rev-parse', 'HEAD']),

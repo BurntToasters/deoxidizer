@@ -1,6 +1,6 @@
 use crate::config::CleanBehavior;
 use crate::project::DiscoveredProject;
-use crate::scanner::dir_size;
+use crate::scanner::validate_project_root;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -133,6 +133,7 @@ fn validate_target_path(project: &DiscoveredProject) -> Result<PathBuf, String> 
         .path
         .canonicalize()
         .map_err(|error| format!("cannot resolve project root: {error}"))?;
+    validate_project_root(&project_root, &project.name)?;
 
     let target_metadata = fs::symlink_metadata(&project.artifact_dir)
         .map_err(|error| format!("cannot inspect target directory: {error}"))?;
@@ -198,16 +199,28 @@ fn validate_clean_path(project: &DiscoveredProject, path: &Path) -> Result<(), S
         ));
     }
 
-    for entry in walkdir::WalkDir::new(path).follow_links(false) {
-        let entry = entry.map_err(|error| format!("cannot inspect clean path: {error}"))?;
+    Ok(())
+}
+
+/// Validate a clean path and measure it in one symlink-free traversal.
+fn validate_and_size(project: &DiscoveredProject, path: &Path) -> Result<u64, String> {
+    validate_clean_path(project, path)?;
+    let mut size = 0u64;
+    for result in walkdir::WalkDir::new(path).follow_links(false).into_iter() {
+        let entry = result.map_err(|error| format!("cannot inspect clean path: {error}"))?;
         if entry.file_type().is_symlink() {
             return Err(format!(
-                "refusing to clean directory containing symlink {}",
+                "refusing to clean symlink {}",
                 entry.path().display()
             ));
         }
+        if entry.file_type().is_file() {
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+            size = size.saturating_add(metadata.len());
+        }
     }
-    Ok(())
+    Ok(size)
 }
 
 fn is_real_directory(path: &Path) -> bool {
@@ -243,8 +256,7 @@ pub fn estimate_freed(project: &DiscoveredProject, mode: &CleanMode) -> Result<u
         if !is_real_directory(&path) {
             continue;
         }
-        validate_clean_path(project, &path)?;
-        total = total.saturating_add(dir_size(&path));
+        total = total.saturating_add(validate_and_size(project, &path)?);
     }
     Ok(total)
 }
@@ -271,10 +283,10 @@ pub fn clean_project(
     if dry_run {
         let mut total = 0u64;
         for path in existing {
-            if let Err(message) = validate_clean_path(project, path) {
-                return CleanResult::Error { message };
+            match validate_and_size(project, path) {
+                Ok(size) => total = total.saturating_add(size),
+                Err(message) => return CleanResult::Error { message },
             }
-            total = total.saturating_add(dir_size(path));
         }
         return CleanResult::Cleaned { bytes_freed: total };
     }
@@ -282,11 +294,13 @@ pub fn clean_project(
     let mut freed = 0u64;
     let mut errors = Vec::new();
     for path in existing {
-        if let Err(error) = validate_clean_path(project, path) {
-            errors.push(format!("Failed to validate {}: {error}", path.display()));
-            continue;
-        }
-        let size = dir_size(path);
+        let size = match validate_and_size(project, path) {
+            Ok(size) => size,
+            Err(error) => {
+                errors.push(format!("Failed to validate {}: {error}", path.display()));
+                continue;
+            }
+        };
         match remove_path(path, behavior) {
             Ok(()) => freed += size,
             Err(e) => {

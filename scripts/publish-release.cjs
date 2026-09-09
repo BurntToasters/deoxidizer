@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { assertGitHubCliAuthenticated, githubApi, repository } = require('./github-cli.cjs');
 const { tag, verifyDraft } = require('./verify-release-draft.cjs');
+const { verifyRemote, allReleaseFiles } = require('./verify-release.cjs');
 
 const root = path.resolve(__dirname, '..');
 const manifest = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
@@ -16,6 +17,7 @@ function main() {
   }
   assertGitHubCliAuthenticated();
   const release = verifyDraft();
+  verifyRemote(allReleaseFiles());
   githubApi('PATCH', `/repos/${repository()}/releases/${release.id}`, {
     draft: false,
     prerelease: /-(?:alpha|beta|rc)(?:[.-]?\d+)?$/i.test(version),

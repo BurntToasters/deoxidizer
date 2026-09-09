@@ -186,7 +186,13 @@ pub fn run_app() {
                 eprintln!();
                 eprintln!("Running scan with defaults for now...\n");
             }
-            let projects = crate::scanner::scan(&config);
+            let projects = match crate::scanner::scan(&config) {
+                Ok(projects) => projects,
+                Err(error) => {
+                    eprintln!("Scan failed: {error}");
+                    std::process::exit(1);
+                }
+            };
             crate::display::print_scan_results(&projects);
         }
     }
@@ -218,7 +224,13 @@ fn run_clean(args: CleanArgs) {
         .unwrap_or_else(|| config.default_mode.into());
 
     println!("🔍 Scanning {}...", config.projects_dir);
-    let mut projects = scanner::scan(&config);
+    let mut projects = match scanner::scan(&config) {
+        Ok(projects) => projects,
+        Err(error) => {
+            eprintln!("Scan failed: {error}");
+            std::process::exit(1);
+        }
+    };
 
     if let Some(days) = args.older_than {
         let cutoff = std::time::SystemTime::now()
@@ -325,7 +337,13 @@ fn run_scan(args: ScanArgs) {
     }
 
     println!("🔍 Scanning {}...\n", config.projects_dir);
-    let projects = scanner::scan(&config);
+    let projects = match scanner::scan(&config) {
+        Ok(projects) => projects,
+        Err(error) => {
+            eprintln!("Scan failed: {error}");
+            std::process::exit(1);
+        }
+    };
 
     display::print_scan_results(&projects);
 }
@@ -345,22 +363,43 @@ fn run_inspect(args: InspectArgs) {
         .canonicalize()
         .unwrap_or_else(|_| project_path.to_path_buf());
 
-    let projects = scan_dir(project_path, &Scope::TauriAndRust);
+    let projects = match scan_dir(project_path, &Scope::TauriAndRust) {
+        Ok(projects) => projects,
+        Err(error) => {
+            eprintln!("Scan failed: {error}");
+            std::process::exit(1);
+        }
+    };
     if projects.is_empty() {
         let parent = project_path.parent().unwrap_or(project_path);
-        let projects = scan_dir(parent, &Scope::TauriAndRust);
-        if let Some(p) = projects.into_iter().find(|p| {
-            p.path == requested_path
-                || p.artifact_dir.starts_with(&requested_path)
-                || requested_path.starts_with(&p.path)
-        }) {
+        let projects = match scan_dir(parent, &Scope::TauriAndRust) {
+            Ok(projects) => projects,
+            Err(error) => {
+                eprintln!("Scan failed: {error}");
+                std::process::exit(1);
+            }
+        };
+        if let Some(p) = projects.iter().find(|p| p.path == requested_path) {
+            display::print_inspection(p);
+        } else if let Some(p) = projects
+            .into_iter()
+            .find(|p| requested_path.starts_with(&p.path))
+        {
             display::print_inspection(&p);
         } else {
             eprintln!("No Rust/Tauri project found at: {}", args.project);
             std::process::exit(1);
         }
-    } else if let Some(p) = projects.into_iter().next() {
+    } else if let Some(p) = projects.iter().find(|p| p.path == requested_path) {
+        display::print_inspection(p);
+    } else if let Some(p) = projects
+        .into_iter()
+        .find(|p| requested_path.starts_with(&p.path))
+    {
         display::print_inspection(&p);
+    } else {
+        eprintln!("No Rust/Tauri project found at: {}", args.project);
+        std::process::exit(1);
     }
 }
 

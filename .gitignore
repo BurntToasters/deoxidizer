@@ -9,5 +9,6 @@ yarn-error.log*
 .DS_Store
 release/
 *.asc
+!release-signing-key.asc
 SHA256SUMS.txt
 coverage/

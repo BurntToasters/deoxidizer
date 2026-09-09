@@ -28,6 +28,7 @@
   - Scan, inspect, and dry-run operations remain read-only.
   - Clean operations require confirmation unless `--yes` is explicitly provided.
 - **Updater:** Added HTTPS-only release downloads, bounded responses, safe archive extraction, and mandatory platform checksum verification.
+- **Updater:** Authenticates checksum manifests with pinned GPG key `CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F` before replacement.
 - **Codebase:** Added IYERIS-style Node.js release tooling with `npm run r`, `npm run b`, target-specific builds, release sessions, and optional `gh` publication.
 - **Codebase:** Added deterministic target-aware archives for Linux, macOS, and Windows, including both command binaries and GPL license text.
 - **Testing:** Added scanner, cleaner, configuration, CLI parity, updater, checksum, release-session, and release-draft validation coverage.

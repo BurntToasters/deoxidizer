@@ -8,6 +8,15 @@ use std::os::unix::fs::symlink;
 
 /// Create a mock project with a populated target directory.
 fn create_mock_project(root: &std::path::Path) -> DiscoveredProject {
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "test-project"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
     let target = root.join("target");
     let debug = target.join("debug");
     let release = target.join("release");
@@ -203,6 +212,11 @@ fn test_clean_rejects_symlinked_target() {
     fs::write(&sentinel, b"must survive").unwrap();
 
     let target = project_root.path().join("target");
+    fs::write(
+        project_root.path().join("Cargo.toml"),
+        "[package]\nname = \"symlinked\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
     symlink(&outside_target, &target).unwrap();
     let project = DiscoveredProject {
         name: "symlinked".to_string(),
@@ -231,6 +245,11 @@ fn test_clean_rejects_symlink_inside_target() {
     fs::write(&outside_file, b"must survive").unwrap();
 
     let target = project_root.path().join("target/debug");
+    fs::write(
+        project_root.path().join("Cargo.toml"),
+        "[package]\nname = \"nested-symlink\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
     fs::create_dir_all(&target).unwrap();
     symlink(&outside_file, target.join("linked-file")).unwrap();
     let project = DiscoveredProject {
@@ -249,4 +268,31 @@ fn test_clean_rejects_symlink_inside_target() {
         deoxidizer_lib::cleaner::CleanResult::Error { .. }
     ));
     assert!(outside_file.exists());
+}
+
+#[test]
+fn test_clean_rejects_forged_project_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target/debug");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"real-project\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(target.join("artifact"), b"must survive").unwrap();
+    let project = DiscoveredProject {
+        name: "forged-project".to_string(),
+        path: root.path().to_path_buf(),
+        kind: ProjectKind::RustProject,
+        artifact_dir: root.path().join("target"),
+        artifact_size: 1,
+        last_modified: None,
+        breakdown: None,
+    };
+    assert!(matches!(
+        clean_project(&project, &CleanMode::Full, &CleanBehavior::Delete, false),
+        deoxidizer_lib::cleaner::CleanResult::Error { .. }
+    ));
+    assert!(target.join("artifact").exists());
 }

@@ -50,18 +50,23 @@ for bin in "${BINARIES[@]}"; do
     echo "Verified: $bin"
 done
 
-# Notarize if Apple ID credentials are available
-if [[ -n "${APPLE_ID:-}" && -n "${APPLE_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
+# Notarize when a preconfigured notarytool keychain profile is supplied.
+if [[ -n "${APPLE_KEYCHAIN_PROFILE:-}" ]]; then
+    PROFILE="${APPLE_KEYCHAIN_PROFILE:-}"
     for bin in "${BINARIES[@]}"; do
-        ZIP_PATH="$(mktemp -t deoxidizer-notarize-XXXXXX).zip"
+        TEMP_DIR="$(mktemp -d -t deoxidizer-notarize.XXXXXX)"
+        ZIP_PATH="$TEMP_DIR/payload.zip"
+        trap 'rm -rf "$TEMP_DIR"' EXIT
         ditto -c -k --keepParent "$bin" "$ZIP_PATH"
         echo "Submitting $bin for notarization..."
         xcrun notarytool submit "$ZIP_PATH" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
+            --keychain-profile "$PROFILE" \
             --wait
-        rm -f "$ZIP_PATH"
+        rm -rf "$TEMP_DIR"
+        trap - EXIT
         echo "Notarization complete: $bin"
     done
+elif [[ -n "${APPLE_ID:-}" || -n "${APPLE_PASSWORD:-}" || -n "${APPLE_TEAM_ID:-}" ]]; then
+    echo "APPLE_KEYCHAIN_PROFILE is required for notarization; configure it with xcrun notarytool store-credentials." >&2
+    exit 1
 fi

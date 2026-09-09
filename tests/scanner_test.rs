@@ -69,7 +69,7 @@ fn test_scan_finds_tauri_projects() {
     create_mock_tauri_project(tmp.path(), "my-tauri-app");
     create_mock_rust_project(tmp.path(), "my-rust-lib");
 
-    let projects = scan_dir(tmp.path(), &Scope::TauriOnly);
+    let projects = scan_dir(tmp.path(), &Scope::TauriOnly).unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].name, "my-tauri-app");
 }
@@ -80,7 +80,7 @@ fn test_scan_finds_all_rust_projects() {
     create_mock_tauri_project(tmp.path(), "my-tauri-app");
     create_mock_rust_project(tmp.path(), "my-rust-lib");
 
-    let projects = scan_dir(tmp.path(), &Scope::TauriAndRust);
+    let projects = scan_dir(tmp.path(), &Scope::TauriAndRust).unwrap();
     assert_eq!(projects.len(), 2);
 }
 
@@ -90,7 +90,7 @@ fn test_scan_rust_only_excludes_tauri() {
     create_mock_tauri_project(tmp.path(), "my-tauri-app");
     create_mock_rust_project(tmp.path(), "my-rust-lib");
 
-    let projects = scan_dir(tmp.path(), &Scope::RustOnly);
+    let projects = scan_dir(tmp.path(), &Scope::RustOnly).unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].name, "my-rust-lib");
 }
@@ -100,7 +100,7 @@ fn test_scan_calculates_sizes() {
     let tmp = tempfile::tempdir().unwrap();
     create_mock_tauri_project(tmp.path(), "sized-app");
 
-    let projects = scan_dir(tmp.path(), &Scope::TauriOnly);
+    let projects = scan_dir(tmp.path(), &Scope::TauriOnly).unwrap();
     assert_eq!(projects.len(), 1);
     assert!(projects[0].artifact_size > 0);
 
@@ -114,7 +114,7 @@ fn test_scan_calculates_sizes() {
 #[test]
 fn test_scan_empty_directory() {
     let tmp = tempfile::tempdir().unwrap();
-    let projects = scan_dir(tmp.path(), &Scope::TauriAndRust);
+    let projects = scan_dir(tmp.path(), &Scope::TauriAndRust).unwrap();
     assert!(projects.is_empty());
 }
 
@@ -131,7 +131,7 @@ fn test_scan_respects_ignored_projects() {
         ..Default::default()
     };
 
-    let projects = deoxidizer_lib::scanner::scan(&config);
+    let projects = deoxidizer_lib::scanner::scan(&config).unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].name, "my-rust-lib");
 }
@@ -155,7 +155,7 @@ framework = { package = "tauri", version = "2" }
     .unwrap();
     fs::write(project.join("target/debug/app"), b"artifact").unwrap();
 
-    let projects = scan_dir(tmp.path(), &Scope::TauriOnly);
+    let projects = scan_dir(tmp.path(), &Scope::TauriOnly).unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].name, "renamed-tauri");
 }
@@ -191,7 +191,7 @@ tauri.workspace = true
     .unwrap();
     fs::write(workspace.join("target/debug/app"), b"artifact").unwrap();
 
-    let projects = scan_dir(tmp.path(), &Scope::TauriOnly);
+    let projects = scan_dir(tmp.path(), &Scope::TauriOnly).unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].name, "workspace-app");
     assert_eq!(projects[0].path, workspace.canonicalize().unwrap());
@@ -199,6 +199,48 @@ tauri.workspace = true
         projects[0].artifact_dir,
         workspace.join("target").canonicalize().unwrap()
     );
+}
+
+#[test]
+fn test_scan_detects_inherited_renamed_tauri_dependency() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let member = workspace.join("app");
+    fs::create_dir_all(workspace.join("target/debug")).unwrap();
+    fs::create_dir_all(&member).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[workspace]
+members = ["app"]
+
+[workspace.dependencies]
+framework = { package = "tauri", version = "2" }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        r#"[package]
+name = "workspace-renamed"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+framework.workspace = true
+"#,
+    )
+    .unwrap();
+    fs::write(workspace.join("target/debug/app"), b"artifact").unwrap();
+
+    let projects = scan_dir(tmp.path(), &Scope::TauriOnly).unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].name, "workspace-renamed");
+}
+
+#[test]
+fn test_scan_invalid_root_returns_error() {
+    let missing = tempfile::tempdir().unwrap().path().join("missing");
+    assert!(scan_dir(&missing, &Scope::TauriAndRust).is_err());
 }
 
 #[cfg(unix)]
@@ -222,5 +264,7 @@ edition = "2021"
     .unwrap();
     symlink(outside.path().join("target"), project.join("target")).unwrap();
 
-    assert!(scan_dir(tmp.path(), &Scope::TauriAndRust).is_empty());
+    assert!(scan_dir(tmp.path(), &Scope::TauriAndRust)
+        .unwrap()
+        .is_empty());
 }

@@ -64,7 +64,9 @@ These rules are non-negotiable. Do not violate them for convenience.
 7. **Never perform unverified self-updates.** The self-updater must strictly verify
    the SHA256 checksum of any downloaded asset against its platform-scoped
    `SHA256SUMS-<os>-<arch>.txt` manifest (or legacy global `SHA256SUMS.txt`)
-   before invoking `self-replace`.
+   and verify detached manifest signature against checked-in
+   `release-signing-key.asc` before invoking `self-replace`.
+   Runtime updater hosts must provide `gpg`; absence or signature failure aborts update.
 8. **Never use predictable fixed paths in `/tmp` for updates.** Updates must use
    `tempfile::Builder::new().prefix("deoxidizer-update-").tempdir()` to prevent
    symlink and pre-creation attacks on multi-user systems.
@@ -107,11 +109,13 @@ deoxidizer/
 ├── README.md                   # User-facing documentation and usage guide
 ├── CHANGELOG.md                # BCLS-formatted release notes and GitHub body
 ├── AGENTS.md                   # This durable agent context and invariant specification
+├── release-signing-key.asc     # Pinned public key for release manifest verification
 ├── install.sh                  # macOS/Linux installer script (local build or GitHub release)
 ├── install.ps1                 # Windows PowerShell installer script
 ├── installer.nsi               # Windows NSIS GUI installer script
 ├── .github/workflows/ci.yml    # Cross-platform quality gates
 ├── .github/workflows/release.yml # Manual target release workflow
+├── .github/dependabot.yml      # Weekly Cargo/npm/action update checks
 ├── src/
 │   ├── lib.rs                  # Library entrypoint; re-exports all modules
 │   ├── main.rs                 # `deoxidizer` binary entrypoint (delegates to run_app)
@@ -146,6 +150,7 @@ deoxidizer/
 │   ├── setup-windows-artifact-signing.ps1 # VM setup helper for Azure Artifact Signing tools
 │   ├── publish-release.cjs      # Explicit draft-to-published transition
 │   ├── check-license.cjs        # GPL metadata consistency check
+│   ├── check-changelog.cjs      # BCLS release metadata and asset-link check
 │   └── check-version.cjs        # Cargo/package version consistency check
 └── tests/
     ├── cleaner_test.rs         # Unit and integration tests for clean modes and path safety
@@ -249,6 +254,7 @@ APPLE_SIGNING_IDENTITY=
 APPLE_ID=
 APPLE_PASSWORD=
 APPLE_TEAM_ID=
+APPLE_KEYCHAIN_PROFILE=
 ```
 
 ### Platform Signing Rules
@@ -260,9 +266,11 @@ APPLE_TEAM_ID=
      verified using `scripts/verify-windows-authenticode.ps1`.
 2. **macOS Codesigning:**
    - Run via `scripts/macos-codesign.sh`.
-   - Requires `--options runtime --timestamp`.
-   - If `APPLE_SIGNING_IDENTITY` is unset or `-`, falls back to ad-hoc signing (`-s -`).
-   - Automatically submits `.zip` payload to `xcrun notarytool` if Apple ID credentials exist.
+   - Developer ID signing requires `--options runtime --timestamp`.
+   - Ad-hoc signing (`-s -`) requires explicit `--allow-adhoc` and is for local
+     staging only; release workflows fail when identity is missing.
+   - Submits `.zip` payload to `xcrun notarytool` when `APPLE_KEYCHAIN_PROFILE` is set.
+   - Notarization uses preconfigured `APPLE_KEYCHAIN_PROFILE`; passwords never enter process arguments.
 3. **Artifact Integrity & GPG:**
    - Run via `scripts/gpg-sign.sh release`.
    - Generates `SHA256SUMS-<os>-<arch>.txt` for target archives and setup assets.
@@ -272,7 +280,20 @@ APPLE_TEAM_ID=
    - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state.
   - `npm run u -- <version>` synchronizes `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and BCLS download metadata.
    - `npm run release:<os>[:arch]` builds one target, signs it, verifies it, and stages it.
+    Release sessions require a clean Git checkout so artifacts match bound `HEAD`.
    - Add `--upload` only after `gh auth login`; publication uses draft releases and remote digest checks.
+      In CI, build/sign/verify runs before `gh` authentication; `npm run release:upload`
+      uploads already-verified staged files afterward so GitHub credentials are not
+      present during compilation.
+   - Target builders may upload incrementally to the same draft; remote verification
+      permits only known release asset names and matches each local upload by digest.
+      Final publication re-verifies every remote platform checksum manifest against
+      the pinned signing key and GitHub asset digests.
+  - Draft releases bind `target_commitish` to current Git `HEAD`; existing drafts with
+    a different binding are rejected. Release archive verification lists ZIP entries
+    in Node without requiring an external `unzip` command.
+  - Manual release workflow OS choices use `linux`, `macos`, and `windows`; `macos`
+    maps to the package scripts while Rust target triples use `darwin`.
   - `CHANGELOG.md` is the BCLS-formatted release body; draft creation fails if it is missing or empty.
 
 ---
@@ -292,9 +313,12 @@ cargo clippy --all-targets -- -D warnings
 # 3. Unit and integration tests
 cargo test
 
-# 4. Node release-tool tests and license check
+# 4. Node release-tool tests, license, version, and changelog checks
 npm ci
+npm install --global npm@12.0.2  # CI pins npm major required by package.json
 npm run check:license
+npm run check:version
+npm run check:changelog
 npm run quality:node
 
 # 5. Release build verification

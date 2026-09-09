@@ -10,6 +10,7 @@ set -euo pipefail
 BINARY_NAME="deoxidizer"
 ALIAS_NAME="deox"
 REPO="BurntToasters/deoxidizer"
+RELEASE_KEY_FINGERPRINT="CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F"
 FROM_SOURCE=0
 
 while [[ $# -gt 0 ]]; do
@@ -105,6 +106,7 @@ PY
     }
     CHECKSUM_NAME="SHA256SUMS-${OS}-${ARCH}.txt"
     CHECKSUM_URL="https://github.com/$REPO/releases/download/${LATEST}/${CHECKSUM_NAME}"
+    CHECKSUM_SIGNATURE_URL="${CHECKSUM_URL}.asc"
 
     echo "  Version: $LATEST"
     echo "  Asset:   $ASSET"
@@ -113,7 +115,30 @@ PY
         CHECKSUM_NAME="SHA256SUMS.txt"
         curl -fsSL "https://github.com/$REPO/releases/download/${LATEST}/$CHECKSUM_NAME" \
             -o "$TMPDIR/$CHECKSUM_NAME"
+        CHECKSUM_URL="https://github.com/$REPO/releases/download/${LATEST}/${CHECKSUM_NAME}"
+        CHECKSUM_SIGNATURE_URL="${CHECKSUM_URL}.asc"
     fi
+
+    command -v gpg >/dev/null 2>&1 || {
+        echo "Error: gpg is required to authenticate release manifests." >&2
+        exit 1
+    }
+    curl -fsSL "https://raw.githubusercontent.com/$REPO/main/release-signing-key.asc" \
+        -o "$TMPDIR/release-signing-key.asc"
+    KEY_FINGERPRINT=$(gpg --batch --show-keys --with-colons "$TMPDIR/release-signing-key.asc" |
+        awk -F: '$1 == "fpr" { print toupper($10); exit }')
+    [[ "$KEY_FINGERPRINT" == "$RELEASE_KEY_FINGERPRINT" ]] || {
+        echo "Error: release signing key fingerprint mismatch." >&2
+        exit 1
+    }
+    gpg --batch --yes --dearmor --output "$TMPDIR/release-keyring.gpg" \
+        "$TMPDIR/release-signing-key.asc"
+    curl -fsSL "$CHECKSUM_SIGNATURE_URL" -o "$TMPDIR/$CHECKSUM_NAME.asc"
+    gpg --batch --no-options --no-default-keyring --keyring "$TMPDIR/release-keyring.gpg" \
+        --verify "$TMPDIR/$CHECKSUM_NAME.asc" "$TMPDIR/$CHECKSUM_NAME" >/dev/null 2>&1 || {
+        echo "Error: checksum manifest signature verification failed." >&2
+        exit 1
+    }
 
     echo "  Verifying SHA256..."
     CHECKSUM_LINE=$(awk -v asset="$ASSET" '{ name = $2; sub(/^\*/, "", name); if (name == asset) { print; count++ } } END { exit(count == 1 ? 0 : 1) }' \
@@ -143,6 +168,14 @@ for binary in "$BINARY_NAME" "$ALIAS_NAME"; do
         echo "Error: staged binary missing or symlinked: $binary" >&2
         exit 1
     }
+    if [[ -L "$INSTALL_DIR/$binary" ]]; then
+        DEST_TARGET=$(readlink "$INSTALL_DIR/$binary")
+        [[ "$binary" == "$ALIAS_NAME" && "$DEST_TARGET" == "$INSTALL_DIR/$BINARY_NAME" ]] || {
+            echo "Error: install destination is an unexpected symlink: $INSTALL_DIR/$binary" >&2
+            exit 1
+        }
+        rm -f "$INSTALL_DIR/$binary"
+    fi
     chmod 0755 "$TMPDIR/$binary"
     install -m 0755 "$TMPDIR/$binary" "$INSTALL_DIR/$binary"
 done

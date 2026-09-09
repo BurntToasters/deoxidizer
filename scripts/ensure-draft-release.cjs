@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const {
   assertGitHubCliAuthenticated,
   githubApi,
@@ -35,16 +36,38 @@ function findRelease() {
   return releases.find((release) => release?.tag_name === tag) || null;
 }
 
+function currentCommit() {
+  const result = spawnSync('git', ['rev-parse', 'HEAD'], {
+    cwd: root,
+    encoding: 'utf8',
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error('Cannot determine current Git commit for release binding');
+  }
+  const commit = String(result.stdout || '').trim();
+  if (!/^[0-9a-f]{40}$/i.test(commit)) {
+    throw new Error('Git returned invalid current commit for release binding');
+  }
+  return commit;
+}
+
 function ensureDraft() {
   const existing = findRelease();
   if (existing) {
     if (!existing.draft) {
       throw new Error(`Release ${tag} is already published; refusing to mutate it`);
     }
+    const commit = currentCommit();
+    if (existing.target_commitish?.toLowerCase() !== commit.toLowerCase()) {
+      throw new Error(
+        `Release ${tag} is bound to ${existing.target_commitish}, not current HEAD ${commit}`,
+      );
+    }
     return existing;
   }
   return githubApi('POST', `/repos/${repository()}/releases`, {
     tag_name: tag,
+    target_commitish: currentCommit(),
     name: `deoxidizer ${version}`,
     body: releaseNotes(),
     draft: true,
@@ -54,10 +77,16 @@ function ensureDraft() {
 
 async function waitForDraft() {
   const deadline = Date.now() + waitTimeoutMs;
+  const commit = currentCommit();
   while (Date.now() < deadline) {
     const release = findRelease();
     if (release) {
       if (!release.draft) throw new Error(`Release ${tag} is already published`);
+      if (release.target_commitish?.toLowerCase() !== commit.toLowerCase()) {
+        throw new Error(
+          `Release ${tag} is bound to ${release.target_commitish || '<missing>'}, not current HEAD ${commit}`,
+        );
+      }
       return release;
     }
     await new Promise((resolve) => setTimeout(resolve, waitPollMs));
