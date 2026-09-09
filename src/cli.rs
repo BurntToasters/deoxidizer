@@ -370,37 +370,35 @@ fn run_inspect(args: InspectArgs) {
             std::process::exit(1);
         }
     };
-    if projects.is_empty() {
+    let projects = if projects.is_empty() {
         let parent = project_path.parent().unwrap_or(project_path);
-        let projects = match scan_dir(parent, &Scope::TauriAndRust) {
+        match scan_dir(parent, &Scope::TauriAndRust) {
             Ok(projects) => projects,
             Err(error) => {
                 eprintln!("Scan failed: {error}");
                 std::process::exit(1);
             }
-        };
-        if let Some(p) = projects.iter().find(|p| p.path == requested_path) {
-            display::print_inspection(p);
-        } else if let Some(p) = projects
-            .into_iter()
-            .find(|p| requested_path.starts_with(&p.path))
-        {
-            display::print_inspection(&p);
-        } else {
-            eprintln!("No Rust/Tauri project found at: {}", args.project);
-            std::process::exit(1);
         }
-    } else if let Some(p) = projects.iter().find(|p| p.path == requested_path) {
-        display::print_inspection(p);
-    } else if let Some(p) = projects
-        .into_iter()
-        .find(|p| requested_path.starts_with(&p.path))
-    {
-        display::print_inspection(&p);
+    } else {
+        projects
+    };
+
+    if let Some(project) = find_inspection_project(projects, &requested_path) {
+        display::print_inspection(&project);
     } else {
         eprintln!("No Rust/Tauri project found at: {}", args.project);
         std::process::exit(1);
     }
+}
+
+fn find_inspection_project(
+    projects: Vec<crate::project::DiscoveredProject>,
+    requested_path: &std::path::Path,
+) -> Option<crate::project::DiscoveredProject> {
+    let mut projects = projects.into_iter();
+    projects
+        .find(|project| project.path == requested_path)
+        .or_else(|| projects.find(|project| requested_path.starts_with(&project.path)))
 }
 
 fn exit_with_config_error(error: ConfigError) -> ! {

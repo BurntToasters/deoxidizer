@@ -170,7 +170,7 @@ The configuration file is stored in the user's home directory as JSON:
 ### JSON Schema
 ```json
 {
-  "version": 1,
+   "version": 2,
   "projects_dir": "/Users/dev/Documents/GitHub",
   "scope": "tauri-only",
   "clean_behavior": "delete",
@@ -181,7 +181,7 @@ The configuration file is stored in the user's home directory as JSON:
 ```
 
 ### Fields and Types
-- `version` (`u32`): Schema version for future migrations (currently `1`).
+- `version` (`u32`): Schema version for future migrations (currently `2`). Version `1` files migrate on load.
 - `projects_dir` (`String`): Root directory scanned for projects. Supports `~/` expansion.
 - `scope` (`Scope`):
   - `"tauri-only"` (default): Only scans projects with Tauri dependencies.
@@ -279,12 +279,14 @@ APPLE_KEYCHAIN_PROFILE=
 4. **Node release orchestration:**
    - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state.
   - `npm run u -- <version>` synchronizes `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and BCLS download metadata.
-   - `npm run release:<os>[:arch]` builds one target, signs it, verifies it, and stages it.
-    Release sessions require a clean Git checkout so artifacts match bound `HEAD`.
-   - Add `--upload` only after `gh auth login`; publication uses draft releases and remote digest checks.
-      In CI, build/sign/verify runs before `gh` authentication; `npm run release:upload`
-      uploads already-verified staged files afterward so GitHub credentials are not
-      present during compilation.
+    - `npm run release:windows[:arch]` creates the single draft and uploads Windows artifacts.
+       `npm run release:linux[:arch]` and `npm run release:macos[:arch]` wait for that
+       draft and upload their artifacts. Release sessions require a clean Git checkout
+       so artifacts match bound `HEAD`.
+    - `npm run release:upload` remains an explicit staged-artifact upload path after
+       `gh auth login`; publication uses draft releases and remote digest checks.
+       GitHub Actions runs quality checks only; production release builds run manually
+       on dedicated release VMs.
    - Target builders may upload incrementally to the same draft; remote verification
       permits only known release asset names and matches each local upload by digest.
       Final publication re-verifies every remote platform checksum manifest against
@@ -319,6 +321,8 @@ npm install --global npm@12.0.2  # CI pins npm major required by package.json
 npm run check:license
 npm run check:version
 npm run check:changelog
+npm run check:toolchain
+npm run check:release-key
 npm run quality:node
 
 # 5. Release build verification

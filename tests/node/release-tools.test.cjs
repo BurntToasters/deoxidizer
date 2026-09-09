@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const packageManifest = require('../../package.json');
 
 const {
   normalizeArch,
@@ -74,6 +75,22 @@ test('normalizes release aliases to supported target triples', () => {
   assert.equal(normalizeArch('amd64', 'linux'), 'x86_64');
   assert.equal(normalizeArch('arm64', 'linux'), 'aarch64');
   assert.equal(TARGETS.linux.aarch64, 'aarch64-unknown-linux-gnu');
+});
+
+test('release scripts match the manual VM draft ownership protocol', () => {
+  assert.match(packageManifest.scripts['release:windows'], /--upload/);
+  assert.doesNotMatch(packageManifest.scripts['release:windows'], /--wait/);
+  for (const scriptName of [
+    'release:linux',
+    'release:linux:x64',
+    'release:linux:arm64',
+    'release:macos',
+    'release:macos:x64',
+    'release:macos:arm64',
+  ]) {
+    assert.match(packageManifest.scripts[scriptName], /--upload/);
+    assert.match(packageManifest.scripts[scriptName], /--wait/);
+  }
 });
 
 test('rejects host architecture for a different operating system', () => {

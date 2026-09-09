@@ -1,0 +1,6 @@
+* @BurntToasters
+.github/workflows/ @BurntToasters
+scripts/ @BurntToasters
+src/cleaner.rs @BurntToasters
+src/scanner.rs @BurntToasters
+src/updater.rs @BurntToasters

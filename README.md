@@ -70,7 +70,7 @@ Configuration lives at `~/.deox_config`:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "projects_dir": "~/Documents/GitHub",
   "scope": "tauri-and-rust",
   "clean_behavior": "trash",
@@ -88,8 +88,9 @@ Supported values:
 - `min_size_mb`: minimum artifact size; `0` includes everything.
 - `ignored_projects`: project names excluded from scans and cleanup.
 
-Malformed or unsupported-version configuration fails closed. Read-only scans
-may use defaults when no configuration exists; `clean` requires setup.
+Version-1 configuration files migrate automatically to version 2. Malformed or
+unsupported-version configuration fails closed. Read-only scans may use defaults
+when no configuration exists; `clean` requires setup.
 
 ## Cleanup modes
 
@@ -128,21 +129,27 @@ npm run u -- 0.1.1                 # sync version across manifests and changelog
 DEOX_RELEASE_CONFIRM=YES npm run r  # sync main, test, prune
 DEOX_RELEASE_CONFIRM=YES npm run b  # sync beta, test
 
-npm run release:linux
-npm run release:linux:arm64
-npm run release:macos
+# On the Windows release VM: create the draft and upload Windows artifacts.
+DEOX_RELEASE_CONFIRM=YES npm run r
 npm run release:windows
 
-# CI stages, signs, and verifies before authenticating GitHub, then uploads:
+# On Linux/macOS release VMs: wait for the Windows-created draft and upload.
+DEOX_RELEASE_CONFIRM=YES npm run r
+npm run release:linux
+DEOX_RELEASE_CONFIRM=YES npm run r
+npm run release:macos
+
+# Optional staged-artifact upload path:
 npm run release:upload
 
 npm run release:verify:draft
 npm run release:publish -- --yes
 ```
 
-Release publication requires `gh auth login`. Each target publishes signed
-archives and a platform-specific checksum manifest. Draft verification must
-pass for all supported targets before publishing.
+Release publication requires `gh auth login` on each release VM. The Windows
+VM creates the single draft; Linux and macOS commands wait for that draft before
+uploading their signed archives and platform-specific checksum manifests. Draft
+verification must pass for all supported targets before publishing.
 
 Release notes live in [`CHANGELOG.md`](CHANGELOG.md) and follow the
 [BCLS](https://github.com/BurntToasters/BCLS) standard.

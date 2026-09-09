@@ -39,16 +39,16 @@ jobs:
     runs-on: ${{ inputs.runner }}
     environment: release
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.20.0
           cache: npm
       - run: npm install --global npm@12.0.2
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # master
         with:
           toolchain: 1.98.0
           components: rustfmt, clippy
@@ -74,15 +74,15 @@ jobs:
         run: |
           set -euo pipefail
           case "${{ inputs.os }}-${{ inputs.arch }}" in
-            linux-x86_64) COMMAND="release:linux:x64" ;;
-            linux-aarch64) COMMAND="release:linux:arm64" ;;
-            macos-x86_64) COMMAND="release:macos:x64" ;;
-            macos-aarch64) COMMAND="release:macos:arm64" ;;
-            windows-x86_64) COMMAND="release:windows:x64" ;;
-            windows-aarch64) COMMAND="release:windows:arm64" ;;
+            linux-x86_64) RELEASE_OS=linux; RELEASE_ARCH=x86_64 ;;
+            linux-aarch64) RELEASE_OS=linux; RELEASE_ARCH=aarch64 ;;
+            macos-x86_64) RELEASE_OS=darwin; RELEASE_ARCH=x86_64 ;;
+            macos-aarch64) RELEASE_OS=darwin; RELEASE_ARCH=aarch64 ;;
+            windows-x86_64) RELEASE_OS=windows; RELEASE_ARCH=x86_64 ;;
+            windows-aarch64) RELEASE_OS=windows; RELEASE_ARCH=aarch64 ;;
             *) echo "Unsupported release target: ${{ inputs.os }}-${{ inputs.arch }}" >&2; exit 2 ;;
           esac
-          npm run "$COMMAND"
+          node scripts/release.cjs "$RELEASE_OS" "$RELEASE_ARCH"
       - name: Authenticate GitHub CLI credential store
         if: ${{ inputs.upload }}
         shell: bash

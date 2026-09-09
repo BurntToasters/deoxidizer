@@ -5,7 +5,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 const CONFIG_FILENAME: &str = ".deox_config";
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
+const LEGACY_CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -154,6 +155,34 @@ pub struct Config {
     pub ignored_projects: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigV1 {
+    #[serde(rename = "version")]
+    _version: u32,
+    projects_dir: String,
+    scope: Scope,
+    clean_behavior: CleanBehavior,
+    default_mode: DefaultMode,
+    min_size_mb: u64,
+    #[serde(default)]
+    ignored_projects: Vec<String>,
+}
+
+impl From<ConfigV1> for Config {
+    fn from(config: ConfigV1) -> Self {
+        Self {
+            version: CONFIG_VERSION,
+            projects_dir: config.projects_dir,
+            scope: config.scope,
+            clean_behavior: config.clean_behavior,
+            default_mode: config.default_mode,
+            min_size_mb: config.min_size_mb,
+            ignored_projects: config.ignored_projects,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let projects_dir = detect_default_projects_dir();
@@ -206,7 +235,24 @@ impl Config {
             Err(error) => return Err(ConfigError::Io(error)),
         };
 
-        let config: Self = serde_json::from_str(&content).map_err(ConfigError::Parse)?;
+        let document: serde_json::Value =
+            serde_json::from_str(&content).map_err(ConfigError::Parse)?;
+        let version = document
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .ok_or_else(|| {
+                ConfigError::Invalid("version must be a positive integer".to_string())
+            })?;
+        let config = match version {
+            LEGACY_CONFIG_VERSION => serde_json::from_value::<ConfigV1>(document)
+                .map(Config::from)
+                .map_err(ConfigError::Parse)?,
+            CONFIG_VERSION => {
+                serde_json::from_value::<Self>(document).map_err(ConfigError::Parse)?
+            }
+            version => return Err(ConfigError::UnsupportedVersion(version)),
+        };
         config.validate()?;
         Ok(config)
     }

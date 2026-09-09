@@ -251,6 +251,17 @@ fn collect_subdirs_named(
 /// Calculate how many bytes would be freed for a project + mode (for dry run).
 pub fn estimate_freed(project: &DiscoveredProject, mode: &CleanMode) -> Result<u64, String> {
     let paths = paths_to_clean(project, mode)?;
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    if let Some(breakdown) = project.breakdown.as_ref() {
+        return Ok(match mode {
+            CleanMode::Full => project.artifact_size,
+            CleanMode::DebugOnly => breakdown.debug_size,
+            CleanMode::IncrementalOnly => breakdown.incremental_size,
+            CleanMode::DepsOnly => breakdown.deps_size,
+        });
+    }
     let mut total = 0u64;
     for path in paths {
         if !is_real_directory(&path) {

@@ -3,7 +3,7 @@ use deoxidizer_lib::config::{CleanBehavior, Config, DefaultMode, Scope};
 #[test]
 fn test_default_config() {
     let config = Config::default();
-    assert_eq!(config.version, 1);
+    assert_eq!(config.version, 2);
     assert_eq!(config.scope, Scope::TauriOnly);
     assert_eq!(config.clean_behavior, CleanBehavior::Delete);
     assert_eq!(config.default_mode, DefaultMode::Full);
@@ -17,7 +17,7 @@ fn test_config_roundtrip() {
     let tmp = directory.path().join("deox_test_config.json");
 
     let config = Config {
-        version: 1,
+        version: 2,
         projects_dir: "/tmp/test-projects".to_string(),
         scope: Scope::TauriAndRust,
         clean_behavior: CleanBehavior::Trash,
@@ -40,6 +40,34 @@ fn test_config_roundtrip() {
     replacement.min_size_mb = 200;
     replacement.save_to(&tmp).expect("atomic overwrite failed");
     assert_eq!(Config::load_from(&tmp).unwrap().min_size_mb, 200);
+}
+
+#[test]
+fn test_version_one_config_migrates() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("legacy.json");
+    std::fs::write(
+        &path,
+        r#"{
+  "version": 1,
+  "projects_dir": "/tmp/legacy-projects",
+  "scope": "tauri-and-rust",
+  "clean_behavior": "trash",
+  "default_mode": "debug-only",
+  "min_size_mb": 25,
+  "ignored_projects": ["legacy-project"]
+}"#,
+    )
+    .unwrap();
+
+    let config = Config::load_from(&path).expect("legacy config should migrate");
+    assert_eq!(config.version, 2);
+    assert_eq!(config.projects_dir, "/tmp/legacy-projects");
+    assert_eq!(config.scope, Scope::TauriAndRust);
+    assert_eq!(config.clean_behavior, CleanBehavior::Trash);
+    assert_eq!(config.default_mode, DefaultMode::DebugOnly);
+    assert_eq!(config.min_size_mb, 25);
+    assert_eq!(config.ignored_projects, vec!["legacy-project"]);
 }
 
 #[test]
