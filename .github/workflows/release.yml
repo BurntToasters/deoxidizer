@@ -1,3 +1,7 @@
+# Production releases run manually on dedicated VMs (see AGENTS.md).
+# This workflow is a manual target builder only: it stages/uploads a single
+# target draft and never publishes. Requires a clean checkout so artifacts
+# match the bound HEAD.
 name: Release
 
 on:
@@ -34,10 +38,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.os }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ${{ inputs.runner }}
     environment: release
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,10 +57,12 @@ jobs:
           node-version: 24.20.0
           cache: npm
       - run: npm install --global npm@12.0.2
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # master
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
         with:
-          toolchain: 1.98.0
+          toolchain: 1.98.1
           components: rustfmt, clippy
+      - name: Format (fail-fast)
+        run: cargo fmt --check
       - name: Install release dependencies
         run: npm ci
       - name: Build and stage release
@@ -70,7 +81,6 @@ jobs:
           AZURE_ARTIFACT_SIGNING_PUBLISHER_DN: ${{ inputs.os == 'windows' && secrets.AZURE_ARTIFACT_SIGNING_PUBLISHER_DN || '' }}
           APPLE_SIGNING_IDENTITY: ${{ inputs.os == 'macos' && secrets.APPLE_SIGNING_IDENTITY || '' }}
           APPLE_KEYCHAIN_PROFILE: ${{ inputs.os == 'macos' && secrets.APPLE_KEYCHAIN_PROFILE || '' }}
-          DEOX_RELEASE_CONFIRM: YES
         run: |
           set -euo pipefail
           case "${{ inputs.os }}-${{ inputs.arch }}" in

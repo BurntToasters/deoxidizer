@@ -51,21 +51,32 @@ for bin in "${BINARIES[@]}"; do
 done
 
 # Notarize when a preconfigured notarytool keychain profile is supplied.
+# Per-binary notarization (not the final tar.gz): standalone Mach-O binaries
+# cannot carry a stapled ticket, so each binary is zipped individually for the
+# notarytool submission and verified online via Gatekeeper afterwards. The
+# final tar.gz stays unstapled by design; behavior kept, documented here.
 if [[ -n "${APPLE_KEYCHAIN_PROFILE:-}" ]]; then
     PROFILE="${APPLE_KEYCHAIN_PROFILE:-}"
+    NOTARIZE_TEMPS=()
+    cleanup_notarize_temps() {
+        for temp in ${NOTARIZE_TEMPS[@]:-}; do
+            [[ -n "$temp" ]] && rm -rf "$temp"
+        done
+    }
+    trap cleanup_notarize_temps EXIT
     for bin in "${BINARIES[@]}"; do
         TEMP_DIR="$(mktemp -d -t deoxidizer-notarize.XXXXXX)"
+        NOTARIZE_TEMPS+=("$TEMP_DIR")
         ZIP_PATH="$TEMP_DIR/payload.zip"
-        trap 'rm -rf "$TEMP_DIR"' EXIT
         ditto -c -k --keepParent "$bin" "$ZIP_PATH"
         echo "Submitting $bin for notarization..."
         xcrun notarytool submit "$ZIP_PATH" \
             --keychain-profile "$PROFILE" \
             --wait
         rm -rf "$TEMP_DIR"
-        trap - EXIT
         echo "Notarization complete: $bin"
     done
+    trap - EXIT
 elif [[ -n "${APPLE_ID:-}" || -n "${APPLE_PASSWORD:-}" || -n "${APPLE_TEAM_ID:-}" ]]; then
     echo "APPLE_KEYCHAIN_PROFILE is required for notarization; configure it with xcrun notarytool store-credentials." >&2
     exit 1

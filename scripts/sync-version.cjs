@@ -25,6 +25,13 @@ function validateVersion(version) {
   return version;
 }
 
+// Single shared prerelease predicate. Strict suffix mirrors validateVersion
+// above (lowercase alpha/beta/rc + dot + numeric); all release scripts must
+// reuse this instead of duplicating ad-hoc prerelease regexes.
+function isPrerelease(version) {
+  return /-(?:alpha|beta|rc)\.(?:0|[1-9]\d*)$/.test(String(version));
+}
+
 function cargoVersion(cargo) {
   const match = cargo.match(/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m);
   if (!match) throw new Error('Cargo.toml has no package version');
@@ -74,13 +81,20 @@ function updateChangelog(changelog, fromVersion, toVersion) {
   const oldHeading = `## Changes in \`v${fromVersion}:\``;
   const newHeading = `## Changes in \`v${toVersion}:\``;
   if (!changelog.includes(oldHeading)) {
-    throw new Error(`CHANGELOG.md is missing current release heading ${oldHeading}`);
+    throw new Error(
+      `CHANGELOG.md is missing current release heading ${oldHeading} ` +
+        `(expected BCLS heading '## Changes in \`v<version>:\`'). ` +
+        `CHANGELOG head: ${JSON.stringify(changelog.slice(0, 200))}`,
+    );
   }
 
   const tableStart = changelog.indexOf('# ⬇️ Downloads');
   const tableEnd = changelog.indexOf('\n> [!IMPORTANT]', tableStart);
   if (tableStart < 0 || tableEnd <= tableStart) {
-    throw new Error('CHANGELOG.md download table markers not found');
+    throw new Error(
+      "CHANGELOG.md download table markers not found (expected '# ⬇️ Downloads' " +
+        `followed by '\\n> [!IMPORTANT]'). CHANGELOG head: ${JSON.stringify(changelog.slice(0, 200))}`,
+    );
   }
   const table = changelog.slice(tableStart, tableEnd).replace(
     /\/releases\/download\/v[^/]+\//g,
@@ -141,6 +155,7 @@ if (require.main === module) {
 
 module.exports = {
   cargoVersion,
+  isPrerelease,
   syncVersion,
   updateCargoLock,
   updateCargoToml,

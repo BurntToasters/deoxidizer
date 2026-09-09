@@ -7,7 +7,11 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if ($env:SKIP_WIN_CODESIGN -eq '1') { Write-Host 'SKIP_WIN_CODESIGN=1; skipping Authenticode verification.'; exit 0 }
+if ($env:SKIP_WIN_CODESIGN -eq '1') {
+  if ($env:DEOX_RELEASE_CONFIRM -ne 'YES') { throw 'SKIP_WIN_CODESIGN=1 requires DEOX_RELEASE_CONFIRM=YES explicitly.' }
+  Write-Host 'SKIP_WIN_CODESIGN=1; skipping Authenticode verification.'
+  exit 0
+}
 if ($env:OS -ne 'Windows_NT') { throw 'Authenticode verification must run on Windows.' }
 if ([string]::IsNullOrWhiteSpace($env:AZURE_ARTIFACT_SIGNING_PUBLISHER)) { throw 'AZURE_ARTIFACT_SIGNING_PUBLISHER is required for Authenticode verification.' }
 if ([string]::IsNullOrWhiteSpace($env:AZURE_ARTIFACT_SIGNING_PUBLISHER_DN)) { throw 'AZURE_ARTIFACT_SIGNING_PUBLISHER_DN is required for full Authenticode identity verification.' }

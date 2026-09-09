@@ -32,8 +32,16 @@ pub struct TargetBreakdown {
 }
 
 impl TargetBreakdown {
+    /// Exclusive total of top-level profile sizes.
+    ///
+    /// Sums only `debug_size`, `release_size`, and `other_size`.
+    /// `incremental_size` and `deps_size` are overlapping views into files
+    /// already counted under a profile, so they are excluded to avoid
+    /// double-counting.
     pub fn total(&self) -> u64 {
-        self.debug_size + self.release_size + self.other_size
+        self.debug_size
+            .saturating_add(self.release_size)
+            .saturating_add(self.other_size)
     }
 }
 

@@ -6,12 +6,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ($env:SKIP_WIN_CODESIGN -eq '1') {
+  if ($env:DEOX_RELEASE_CONFIRM -ne 'YES') { throw 'SKIP_WIN_CODESIGN=1 requires DEOX_RELEASE_CONFIRM=YES explicitly.' }
   Write-Host "SKIP_WIN_CODESIGN=1; leaving Windows artifact unsigned: $FilePath"
   exit 0
 }
 if ($env:OS -ne 'Windows_NT') { throw 'Azure Artifact Signing must run on Windows.' }
 
 $required = @('AZURE_CLIENT_ID','AZURE_TENANT_ID','AZURE_CLIENT_SECRET','AZURE_ARTIFACT_SIGNING_ENDPOINT','AZURE_ARTIFACT_SIGNING_ACCOUNT','AZURE_ARTIFACT_SIGNING_PROFILE','AZURE_ARTIFACT_SIGNING_PUBLISHER','AZURE_ARTIFACT_SIGNING_PUBLISHER_DN')
+# NOTE: AZURE_SUBSCRIPTION_ID is intentionally not required here. The signtool
+# /dlib metadata flow authenticates via endpoint + account + profile and never
+# reads the subscription; the subscription stays plumbed through release.cjs /
+# release.yml only for Azure portal scoping on the release VM.
 $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
 if ($missing.Count) { throw "Missing Azure Artifact Signing environment variables: $($missing -join ', ')" }
 

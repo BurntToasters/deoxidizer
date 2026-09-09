@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const { execFileSync, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -25,6 +26,12 @@ const {
 } = require('../../scripts/verify-release.cjs');
 const { validateFresh, validateIdentity } = require('../../scripts/release-session.cjs');
 const { requireConfirmation } = require('../../scripts/branch-sync.cjs');
+const { requireConfirmation: requireViConfirmation } = require('../../scripts/vi.cjs');
+const {
+  requireConfirmation: requirePruneConfirmation,
+} = require('../../scripts/git-prune.cjs');
+const { expectedFingerprint } = require('../../scripts/check-release-key.cjs');
+const { isPrerelease } = require('../../scripts/sync-version.cjs');
 const {
   expectedReleaseAssets,
   validateDraft,
@@ -105,8 +112,9 @@ test('rejects host architecture for a different operating system', () => {
 });
 
 test('parses checksum manifests and rejects duplicates', () => {
+  assert.equal(tag, `v${packageManifest.version}`);
   const manifest = parseChecksumManifest(
-    'a'.repeat(64) + '  deoxidizer-v0.1.0-linux-x86_64.tar.gz\n',
+    `${'a'.repeat(64)}  deoxidizer-v${packageManifest.version}-linux-x86_64.tar.gz\n`,
   );
   assert.equal(manifest.size, 1);
   assert.throws(
@@ -259,6 +267,306 @@ test('remote manifest validator binds signed entries to remote asset digests', (
 });
 
 test('GitHub draft notes come from BCLS changelog', () => {
-  assert.match(releaseNotes(), /## Changes in `v0\.1\.0:`/);
+  assert.equal(tag, `v${packageManifest.version}`);
+  const escaped = packageManifest.version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  assert.match(releaseNotes(), new RegExp(`## Changes in \`v${escaped}:\``));
   assert.match(releaseNotes(), /BCLS standard/);
+});
+
+// Stage a script under a temp repo root so its __dirname-based `root`
+// resolves to a synthetic fixture instead of the real repository. The
+// staged copies are never written back to scripts/.
+function stageScript(scriptName, files) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-script-test-'));
+  const scriptDir = path.join(directory, 'scripts');
+  fs.mkdirSync(scriptDir, { recursive: true });
+  fs.copyFileSync(
+    path.join(__dirname, '../../scripts', scriptName),
+    path.join(scriptDir, scriptName),
+  );
+  for (const [relative, content] of Object.entries(files)) {
+    const target = path.join(directory, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, content);
+    if (relative === 'bin/gpg') fs.chmodSync(target, 0o755);
+  }
+  return directory;
+}
+
+function runStagedScript(directory, scriptName, extraEnv) {
+  try {
+    return spawnSync(process.execPath, [path.join(directory, 'scripts', scriptName)], {
+      encoding: 'utf8',
+      env: extraEnv === undefined ? process.env : { ...process.env, ...extraEnv },
+    });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test('check-license rejects a fixture with the wrong declared license', () => {
+  const licenseHeader = `${' '.repeat(20)}GNU GENERAL PUBLIC LICENSE\n`;
+  const good = {
+    'Cargo.toml': '[package]\nname = "deoxidizer"\nversion = "0.1.0"\nlicense = "GPL-3.0-or-later"\n',
+    'package.json': JSON.stringify({ license: 'GPL-3.0-or-later' }),
+    'README.md': 'licensed under GPL-3.0-or-later\n',
+    'AGENTS.md': 'licensed under GPL-3.0-or-later\n',
+    LICENSE: `${licenseHeader}Version 3 text\n`,
+  };
+  const goodDir = stageScript('check-license.cjs', good);
+  assert.equal(runStagedScript(goodDir, 'check-license.cjs').status, 0);
+
+  const badDir = stageScript('check-license.cjs', {
+    ...good,
+    'Cargo.toml': good['Cargo.toml'].replace('GPL-3.0-or-later', 'MIT'),
+  });
+  const bad = runStagedScript(badDir, 'check-license.cjs');
+  assert.notEqual(bad.status, 0);
+  assert.match(bad.stderr, /Cargo\.toml must declare/);
+});
+
+test('check-version rejects mismatched fixture versions', () => {
+  const directory = stageScript('check-version.cjs', {
+    'Cargo.toml': '[package]\nname = "deoxidizer"\nversion = "9.9.9"\n',
+    'package.json': JSON.stringify({ version: '0.0.0' }),
+  });
+  const result = runStagedScript(directory, 'check-version.cjs');
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /does not match/);
+});
+
+test('check-changelog rejects a fixture missing BCLS markers', () => {
+  const directory = stageScript('check-changelog.cjs', {
+    'Cargo.toml': '[package]\nname = "deoxidizer"\nversion = "0.1.0"\n',
+    'CHANGELOG.md': '# empty changelog\n',
+  });
+  const result = runStagedScript(directory, 'check-changelog.cjs');
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout + result.stderr, /missing changelog marker/);
+});
+
+function consistentToolchainFixture() {
+  const sha = 'a'.repeat(40);
+  const workflow = (extra = '') =>
+    `jobs:\n  build:\n    steps:\n      - uses: dtolnay/rust-toolchain@${sha}\n        with:\n          toolchain: 1.98.1\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 24.20.0\n      - run: npm install --global npm@12.0.2\n${extra}`;
+  return {
+    'rust-toolchain.toml': '[toolchain]\nchannel = "1.98.1"\n',
+    'Cargo.toml': '[package]\nname = "deoxidizer"\nversion = "0.1.0"\nrust-version = "1.98"\n',
+    '.node-version': '24.20.0\n',
+    'package.json': JSON.stringify({
+      packageManager: 'npm@12.0.2',
+      engines: { npm: '>=12.0.1' },
+    }),
+    '.github/workflows/ci.yml': workflow(),
+    '.github/workflows/release.yml': workflow(),
+    'scripts/release.cjs':
+      "run('rustup', ['target', 'add', '--toolchain', '1.98.1', target], buildEnv);\n",
+  };
+}
+
+test('check-toolchain main accepts a consistent fixture, rejects pin drift', () => {
+  const goodDir = stageScript('check-toolchain.cjs', consistentToolchainFixture());
+  const stagedGood = require(path.join(goodDir, 'scripts/check-toolchain.cjs'));
+  assert.doesNotThrow(() => stagedGood.main());
+  fs.rmSync(goodDir, { recursive: true, force: true });
+
+  const badFiles = consistentToolchainFixture();
+  badFiles['.github/workflows/ci.yml'] = badFiles['.github/workflows/ci.yml'].replace(
+    'toolchain: 1.98.1',
+    'toolchain: 0.0.0',
+  );
+  const badDir = stageScript('check-toolchain.cjs', badFiles);
+  try {
+    const stagedBad = require(path.join(badDir, 'scripts/check-toolchain.cjs'));
+    assert.throws(() => stagedBad.main(), /pinned Rust toolchain/);
+  } finally {
+    fs.rmSync(badDir, { recursive: true, force: true });
+  }
+});
+
+test('check-release-key main rejects a fixture missing the pinned fingerprint', () => {
+  const gpgStub = `#!/bin/sh\necho "fpr:::::::::${expectedFingerprint}:"\n`;
+  const goodFiles = {
+    'release-signing-key.asc': 'fixture key\n',
+    'install.sh': `KEY="${expectedFingerprint}"\n`,
+    'install.ps1': `KEY="${expectedFingerprint}"\n`,
+    'bin/gpg': gpgStub,
+  };
+  const goodDir = stageScript('check-release-key.cjs', goodFiles);
+  const stagedGood = require(path.join(goodDir, 'scripts/check-release-key.cjs'));
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${path.join(goodDir, 'bin')}${path.delimiter}${previousPath}`;
+  try {
+    assert.doesNotThrow(() => stagedGood.main());
+  } finally {
+    process.env.PATH = previousPath;
+    fs.rmSync(goodDir, { recursive: true, force: true });
+  }
+
+  const badDir = stageScript('check-release-key.cjs', {
+    ...goodFiles,
+    'install.sh': 'echo no key pinned here\n',
+  });
+  try {
+    const stagedBad = require(path.join(badDir, 'scripts/check-release-key.cjs'));
+    process.env.PATH = `${path.join(badDir, 'bin')}${path.delimiter}${previousPath}`;
+    try {
+      assert.throws(() => stagedBad.main(), /does not pin/);
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  } finally {
+    fs.rmSync(badDir, { recursive: true, force: true });
+  }
+});
+
+test('vi and git-prune refuse without explicit confirmation', () => {
+  const previous = process.env.DEOX_RELEASE_CONFIRM;
+  delete process.env.DEOX_RELEASE_CONFIRM;
+  try {
+    assert.throws(() => requireViConfirmation(), /DEOX_RELEASE_CONFIRM=YES/);
+    assert.throws(() => requirePruneConfirmation(), /DEOX_RELEASE_CONFIRM=YES/);
+  } finally {
+    if (previous === undefined) delete process.env.DEOX_RELEASE_CONFIRM;
+    else process.env.DEOX_RELEASE_CONFIRM = previous;
+  }
+});
+
+test('publish-release requires --yes before touching the network', () => {
+  // No --yes and no confirm env: must fail in the local gate, no gh calls.
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, '../../scripts/publish-release.cjs')],
+    { encoding: 'utf8' },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--yes/);
+});
+
+test('shared prerelease predicate matches only suffixed beta-style versions', () => {
+  assert.equal(isPrerelease('0.2.0-beta.1'), true);
+  assert.equal(isPrerelease('0.2.0-rc.0'), true);
+  assert.equal(isPrerelease('0.2.0-alpha.12'), true);
+  assert.equal(isPrerelease('0.1.0'), false);
+  assert.equal(isPrerelease('0.2.0-beta'), false);
+  assert.equal(isPrerelease('0.2.0-BETA.1'), false);
+  const source = fs.readFileSync(
+    path.join(__dirname, '../../scripts/publish-release.cjs'),
+    'utf8',
+  );
+  assert.match(source, /isPrerelease\(version\)/);
+});
+
+test('release env scoping keeps only OS signing keys', () => {
+  // signingEnvironment/gpgEnvironment are intentionally unexported, so load a
+  // staged copy with the same appended export instead of editing scripts/.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-env-test-'));
+  const scriptDir = path.join(directory, 'scripts');
+  fs.mkdirSync(scriptDir, { recursive: true });
+  for (const scriptName of ['release.cjs', 'github-cli.cjs', 'sync-version.cjs']) {
+    fs.copyFileSync(
+      path.join(__dirname, '../../scripts', scriptName),
+      path.join(scriptDir, scriptName),
+    );
+  }
+  const stagedPath = path.join(scriptDir, 'release.cjs');
+  fs.appendFileSync(
+    stagedPath,
+    '\nmodule.exports.signingEnvironment = signingEnvironment;\nmodule.exports.gpgEnvironment = gpgEnvironment;\n',
+  );
+  let staged;
+  try {
+    staged = require(stagedPath);
+  } catch (error) {
+    fs.rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+  try {
+    const env = {
+      PATH: '/bin',
+      GPG_KEY_ID: 'key',
+      GPG_PASSPHRASE: 'pass',
+      AZURE_CLIENT_SECRET: 'secret',
+      APPLE_PASSWORD: 'apple',
+      APPLE_ID: 'id',
+    };
+    const darwin = staged.signingEnvironment(env, 'darwin');
+    assert.equal(darwin.APPLE_ID, 'id');
+    assert.equal(darwin.AZURE_CLIENT_SECRET, undefined);
+    assert.equal(darwin.GPG_PASSPHRASE, undefined);
+    assert.equal(darwin.PATH, '/bin');
+
+    const windows = staged.signingEnvironment(env, 'windows');
+    assert.equal(windows.AZURE_CLIENT_SECRET, 'secret');
+    assert.equal(windows.APPLE_PASSWORD, undefined);
+    assert.equal(windows.GPG_KEY_ID, undefined);
+
+    const linux = staged.signingEnvironment(env, 'linux');
+    assert.equal(linux.AZURE_CLIENT_SECRET, undefined);
+    assert.equal(linux.APPLE_ID, undefined);
+    assert.equal(linux.GPG_PASSPHRASE, undefined);
+
+    const gpg = staged.gpgEnvironment(env);
+    assert.equal(gpg.GPG_KEY_ID, 'key');
+    assert.equal(gpg.GPG_PASSPHRASE, 'pass');
+    assert.equal(gpg.AZURE_CLIENT_SECRET, undefined);
+    assert.equal(gpg.APPLE_PASSWORD, undefined);
+    assert.equal(gpg.PATH, '/bin');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('release-session rejects expired proofs and dirty checkouts', () => {
+  assert.throws(
+    () => validateFresh({ completedAt: Date.now() - 2 * 24 * 60 * 60 * 1000 }, 'proof'),
+    /expired/,
+  );
+  assert.throws(
+    () => validateFresh({ startedAt: Date.now() - 2 * 24 * 60 * 60 * 1000 }, 'proof'),
+    /expired/,
+  );
+
+  // assertCleanCheckout is intentionally unexported; exercise it through a
+  // staged copy whose root-relative git/reads point at a temp git repo.
+  if (spawnSync('git', ['--version'], { stdio: 'ignore' }).status !== 0) return;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-git-test-'));
+  try {
+    const scriptDir = path.join(directory, 'scripts');
+    fs.mkdirSync(scriptDir, { recursive: true });
+    for (const scriptName of ['release-session.cjs', 'sync-version.cjs']) {
+      fs.copyFileSync(
+        path.join(__dirname, '../../scripts', scriptName),
+        path.join(scriptDir, scriptName),
+      );
+    }
+    const git = (args) =>
+      execFileSync('git', ['-c', 'init.defaultBranch=main', ...args], {
+        cwd: directory,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    fs.writeFileSync(
+      path.join(directory, 'Cargo.toml'),
+      '[package]\nname = "deoxidizer"\nversion = "0.1.0"\n',
+    );
+    fs.writeFileSync(path.join(directory, 'Cargo.lock'), 'fixture\n');
+    git(['init']);
+    const commitEnv = ['-c', 'user.email=test@example.com', '-c', 'user.name=test'];
+    git([...commitEnv, 'add', '-A']);
+    git([...commitEnv, '-c', 'commit.gpgsign=false', 'commit', '-m', 'init']);
+    assert.equal(
+      execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+        cwd: directory,
+        encoding: 'utf8',
+      }).trim(),
+      '',
+    );
+
+    fs.appendFileSync(path.join(directory, 'Cargo.lock'), 'dirty\n');
+    const staged = require(path.join(scriptDir, 'release-session.cjs'));
+    assert.throws(() => staged.currentIdentity(), /clean Git checkout/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });

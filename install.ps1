@@ -29,6 +29,21 @@ New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
 $stagingExtract = Join-Path $stagingRoot 'extracted'
 New-Item -ItemType Directory -Path $stagingExtract -Force | Out-Null
 
+function Invoke-DownloadWithRetry {
+    param([Parameter(Mandatory = $true)][string]$Uri, [Parameter(Mandatory = $true)][string]$OutFile)
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+            return
+        } catch {
+            $lastError = $_
+            if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
+        }
+    }
+    throw $lastError
+}
+
 try {
     if ($FromSource) {
         $targetRoot = if ($env:CARGO_TARGET_DIR) {
@@ -53,6 +68,11 @@ try {
         $ProgressPreference = 'SilentlyContinue'
         $release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
         $version = $release.tag_name -replace '^v',''
+        # Validate semver before interpolating into asset names/URLs so a
+        # malformed tag cannot inject path segments.
+        if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$') {
+            throw "Invalid release version: $version"
+        }
         $processArch = if ($env:PROCESSOR_ARCHITEW6432) {
             $env:PROCESSOR_ARCHITEW6432
         } else {
@@ -76,27 +96,27 @@ try {
         $tmpZip = Join-Path $stagingRoot $assetName
         $checksumName = "SHA256SUMS-windows-$arch.txt"
         $checksumPath = Join-Path $stagingRoot $checksumName
-        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmpZip
+        Invoke-DownloadWithRetry -Uri $asset.browser_download_url -OutFile $tmpZip
         try {
-            Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$($release.tag_name)/$checksumName" -OutFile $checksumPath
+            Invoke-DownloadWithRetry -Uri "https://github.com/$Repo/releases/download/$($release.tag_name)/$checksumName" -OutFile $checksumPath
         } catch {
             $checksumName = 'SHA256SUMS.txt'
             $checksumPath = Join-Path $stagingRoot $checksumName
-            Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$($release.tag_name)/$checksumName" -OutFile $checksumPath
+            Invoke-DownloadWithRetry -Uri "https://github.com/$Repo/releases/download/$($release.tag_name)/$checksumName" -OutFile $checksumPath
         }
         $gpg = Get-Command gpg.exe -ErrorAction SilentlyContinue
         if (-not $gpg) { throw 'gpg.exe is required to authenticate release manifests' }
         $keyPath = Join-Path $stagingRoot 'release-signing-key.asc'
         $keyringPath = Join-Path $stagingRoot 'release-keyring.gpg'
         $signaturePath = "$checksumPath.asc"
-        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$Repo/main/release-signing-key.asc" -OutFile $keyPath
+        Invoke-DownloadWithRetry -Uri "https://raw.githubusercontent.com/$Repo/main/release-signing-key.asc" -OutFile $keyPath
         $fingerprint = (& $gpg.Source --batch --show-keys --with-colons $keyPath |
             Where-Object { $_ -like 'fpr:*' } |
             Select-Object -First 1).Split(':')[9].ToUpperInvariant()
         if ($fingerprint -ne $ReleaseKeyFingerprint) { throw 'release signing key fingerprint mismatch' }
         & $gpg.Source --batch --yes --dearmor --output $keyringPath $keyPath
         if ($LASTEXITCODE -ne 0) { throw 'cannot load release signing key' }
-        Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$($release.tag_name)/$checksumName.asc" -OutFile $signaturePath
+        Invoke-DownloadWithRetry -Uri "https://github.com/$Repo/releases/download/$($release.tag_name)/$checksumName.asc" -OutFile $signaturePath
         & $gpg.Source --batch --no-options --no-default-keyring --keyring $keyringPath --verify $signaturePath $checksumPath *> $null
         if ($LASTEXITCODE -ne 0) { throw 'checksum manifest signature verification failed' }
         $escapedAsset = [Regex]::Escape($assetName)
@@ -149,6 +169,8 @@ try {
                 throw "Install destination is a reparse point: $binary"
             }
         }
+        # Overwrite-in-place with no backup is the installer standard: the
+        # previous release binary is superseded, never preserved alongside.
         Move-Item -LiteralPath $staged -Destination $destination -Force
     }
 } finally {

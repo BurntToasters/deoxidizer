@@ -8,13 +8,15 @@ const {
   repository,
 } = require('./github-cli.cjs');
 const { spawnSync } = require('node:child_process');
+const { cargoVersion, isPrerelease } = require('./sync-version.cjs');
 
 const root = path.resolve(__dirname, '..');
 const manifest = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
-const version = manifest.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-if (!version) throw new Error('Cargo.toml has no version');
+const version = cargoVersion(manifest);
 const tag = `v${version}`;
-const prerelease = /-(?:alpha|beta|rc)(?:[.-]?\d+)?$/i.test(version);
+// Shared strict prerelease predicate from sync-version.cjs (mirrors
+// validateVersion suffix); do not duplicate an ad-hoc regex here.
+const prerelease = isPrerelease(version);
 
 const TARGETS = [
   ['linux', 'x86_64', 'tar.gz'],

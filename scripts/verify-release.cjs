@@ -13,6 +13,7 @@ const {
   runGitHub,
 } = require('./github-cli.cjs');
 const { expectedReleaseAssets } = require('./verify-release-draft.cjs');
+const { cargoVersion } = require('./sync-version.cjs');
 
 const root = path.resolve(__dirname, '..');
 const releaseDir = path.join(root, 'release');
@@ -20,8 +21,7 @@ const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES = 512 * 1024 * 1024;
 const MAX_REMOTE_MANIFEST_BYTES = 4 * 1024 * 1024;
 const manifest = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
-const version = manifest.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-if (!version) throw new Error('Cargo.toml has no version');
+const version = cargoVersion(manifest);
 const tag = `v${version}`;
 
 function sha256(filePath) {
@@ -34,8 +34,10 @@ function parseChecksumManifest(text) {
     if (!line.trim()) continue;
     const match = line.match(/^([0-9a-f]{64})\s+\*?(.+)$/i);
     if (!match) throw new Error(`Invalid checksum line: ${line}`);
-    if (entries.has(match[2])) throw new Error(`Duplicate checksum entry: ${match[2]}`);
-    entries.set(match[2], match[1].toLowerCase());
+    const name = match[2].trim();
+    if (!name) throw new Error(`Invalid checksum line: ${line}`);
+    if (entries.has(name)) throw new Error(`Duplicate checksum entry: ${name}`);
+    entries.set(name, match[1].toLowerCase());
   }
   return entries;
 }
@@ -49,6 +51,8 @@ function verifyDetachedSignature(filePath) {
   const keyWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-release-key-'));
   const keyPath = path.join(keyWorkspace, 'release-signing-key.asc');
   const keyringPath = path.join(keyWorkspace, 'release-keyring.gpg');
+  // Pinned release signing key fingerprint (fail-closed; see check:release-key).
+  const expectedFingerprint = 'CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F';
   fs.copyFileSync(path.join(root, 'release-signing-key.asc'), keyPath);
   const dearmor = spawnSync(
     'gpg',
@@ -58,6 +62,26 @@ function verifyDetachedSignature(filePath) {
   if (dearmor.error || dearmor.status !== 0) {
     fs.rmSync(keyWorkspace, { recursive: true, force: true });
     throw new Error('Cannot load pinned release signing key');
+  }
+  const fingerprintResult = spawnSync(
+    'gpg',
+    ['--batch', '--show-keys', '--with-colons', keyPath],
+    { encoding: 'utf8' },
+  );
+  const fingerprint = String(fingerprintResult.stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.split(':'))
+    .find((fields) => fields[0] === 'fpr')?.[9]
+    ?.toUpperCase();
+  if (
+    fingerprintResult.error ||
+    fingerprintResult.status !== 0 ||
+    fingerprint !== expectedFingerprint
+  ) {
+    fs.rmSync(keyWorkspace, { recursive: true, force: true });
+    throw new Error(
+      `Pinned release signing key fingerprint mismatch: ${fingerprint || '<missing>'}`,
+    );
   }
   const result = spawnSync(
     'gpg',
@@ -311,6 +335,12 @@ function allReleaseFiles() {
 }
 
 function verifyLocal() {
+  if (
+    process.env.DEOX_ALLOW_UNSIGNED_RELEASE === '1' &&
+    process.env.DEOX_RELEASE_CONFIRM !== 'YES'
+  ) {
+    throw new Error('DEOX_ALLOW_UNSIGNED_RELEASE=1 requires DEOX_RELEASE_CONFIRM=YES explicitly');
+  }
   const archives = expectedArchives();
   if (archives.length === 0) throw new Error(`No release archives found in ${releaseDir}`);
   const checksumPaths = allReleaseFiles().filter((filePath) =>

@@ -72,7 +72,7 @@ else
         exit 1
     }
 
-    curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    curl -fsSL --retry 3 --retry-delay 2 "https://api.github.com/repos/$REPO/releases/latest" \
         -o "$TMPDIR/release.json"
     VERSION=$(python3 - "$TMPDIR/release.json" <<'PY'
 import json
@@ -85,6 +85,12 @@ if not isinstance(tag, str) or not tag:
 print(tag[1:] if tag.startswith("v") else tag)
 PY
 )
+    # Validate semver before interpolating into asset names/URLs so a
+    # compromised or malformed tag cannot inject path segments.
+    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]] || {
+        echo "Error: invalid release version: $VERSION" >&2
+        exit 1
+    }
     LATEST="v$VERSION"
     ASSET="deoxidizer-v${VERSION}-${OS}-${ARCH}.tar.gz"
     URL=$(python3 - "$TMPDIR/release.json" "$ASSET" <<'PY'
@@ -110,10 +116,10 @@ PY
 
     echo "  Version: $LATEST"
     echo "  Asset:   $ASSET"
-    curl -fsSL "$URL" -o "$TMPDIR/$ASSET"
-    if ! curl -fsSL "$CHECKSUM_URL" -o "$TMPDIR/$CHECKSUM_NAME"; then
+    curl -fsSL --retry 3 --retry-delay 2 "$URL" -o "$TMPDIR/$ASSET"
+    if ! curl -fsSL --retry 3 --retry-delay 2 "$CHECKSUM_URL" -o "$TMPDIR/$CHECKSUM_NAME"; then
         CHECKSUM_NAME="SHA256SUMS.txt"
-        curl -fsSL "https://github.com/$REPO/releases/download/${LATEST}/$CHECKSUM_NAME" \
+        curl -fsSL --retry 3 --retry-delay 2 "https://github.com/$REPO/releases/download/${LATEST}/$CHECKSUM_NAME" \
             -o "$TMPDIR/$CHECKSUM_NAME"
         CHECKSUM_URL="https://github.com/$REPO/releases/download/${LATEST}/${CHECKSUM_NAME}"
         CHECKSUM_SIGNATURE_URL="${CHECKSUM_URL}.asc"
@@ -123,7 +129,7 @@ PY
         echo "Error: gpg is required to authenticate release manifests." >&2
         exit 1
     }
-    curl -fsSL "https://raw.githubusercontent.com/$REPO/main/release-signing-key.asc" \
+    curl -fsSL --retry 3 --retry-delay 2 "https://raw.githubusercontent.com/$REPO/main/release-signing-key.asc" \
         -o "$TMPDIR/release-signing-key.asc"
     KEY_FINGERPRINT=$(gpg --batch --show-keys --with-colons "$TMPDIR/release-signing-key.asc" |
         awk -F: '$1 == "fpr" { print toupper($10); exit }')
@@ -133,7 +139,7 @@ PY
     }
     gpg --batch --yes --dearmor --output "$TMPDIR/release-keyring.gpg" \
         "$TMPDIR/release-signing-key.asc"
-    curl -fsSL "$CHECKSUM_SIGNATURE_URL" -o "$TMPDIR/$CHECKSUM_NAME.asc"
+    curl -fsSL --retry 3 --retry-delay 2 "$CHECKSUM_SIGNATURE_URL" -o "$TMPDIR/$CHECKSUM_NAME.asc"
     gpg --batch --no-options --no-default-keyring --keyring "$TMPDIR/release-keyring.gpg" \
         --verify "$TMPDIR/$CHECKSUM_NAME.asc" "$TMPDIR/$CHECKSUM_NAME" >/dev/null 2>&1 || {
         echo "Error: checksum manifest signature verification failed." >&2
@@ -177,14 +183,13 @@ for binary in "$BINARY_NAME" "$ALIAS_NAME"; do
         rm -f "$INSTALL_DIR/$binary"
     fi
     chmod 0755 "$TMPDIR/$binary"
+    # Overwrite-in-place with no backup is the installer standard: the
+    # previous release binary is superseded, never preserved alongside.
     install -m 0755 "$TMPDIR/$binary" "$INSTALL_DIR/$binary"
 done
 
-# Create deox symlink
-ln -sf "$INSTALL_DIR/$BINARY_NAME" "$INSTALL_DIR/$ALIAS_NAME"
-
 echo "✓ Installed $BINARY_NAME to $INSTALL_DIR/$BINARY_NAME"
-echo "✓ Created symlink $ALIAS_NAME -> $BINARY_NAME"
+echo "✓ Installed $ALIAS_NAME to $INSTALL_DIR/$ALIAS_NAME"
 
 # Check if install dir is in PATH
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then

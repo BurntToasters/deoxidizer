@@ -27,15 +27,6 @@ impl CleanMode {
             _ => None,
         }
     }
-
-    pub fn label(&self) -> &str {
-        match self {
-            CleanMode::Full => "full (entire target/)",
-            CleanMode::DebugOnly => "debug-only (target/debug/)",
-            CleanMode::IncrementalOnly => "incremental-only (*/incremental/)",
-            CleanMode::DepsOnly => "deps-only (*/deps/)",
-        }
-    }
 }
 
 impl std::fmt::Display for CleanMode {
@@ -83,21 +74,27 @@ fn paths_to_clean(project: &DiscoveredProject, mode: &CleanMode) -> Result<Vec<P
             // Include target triple debug dirs (e.g. target/x86_64-pc-windows-msvc/debug)
             let entries = fs::read_dir(&target).map_err(|error| {
                 format!(
-                    "cannot inspect target directory {}: {error}",
-                    target.display()
+                    "cannot inspect target directory {} of project {}: {error}",
+                    target.display(),
+                    project.path.display()
                 )
             })?;
             for entry in entries {
                 let entry = entry.map_err(|error| {
                     format!(
-                        "cannot inspect target entry in {}: {error}",
-                        target.display()
+                        "cannot inspect target entry in {} of project {}: {error}",
+                        target.display(),
+                        project.path.display()
                     )
                 })?;
                 let path = entry.path();
-                let entry_type = entry
-                    .file_type()
-                    .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+                let entry_type = entry.file_type().map_err(|error| {
+                    format!(
+                        "cannot inspect {} of project {}: {error}",
+                        path.display(),
+                        project.path.display()
+                    )
+                })?;
                 if entry_type.is_dir() {
                     let name = entry.file_name();
                     if name != "debug" && name != "release" {
@@ -124,78 +121,143 @@ fn paths_to_clean(project: &DiscoveredProject, mode: &CleanMode) -> Result<Vec<P
 }
 
 fn validate_target_path(project: &DiscoveredProject) -> Result<PathBuf, String> {
-    let project_metadata = fs::symlink_metadata(&project.path)
-        .map_err(|error| format!("cannot inspect project root: {error}"))?;
+    let project_metadata = fs::symlink_metadata(&project.path).map_err(|error| {
+        format!(
+            "cannot inspect project root {}: {error}",
+            project.path.display()
+        )
+    })?;
     if project_metadata.file_type().is_symlink() || !project_metadata.is_dir() {
-        return Err("project root is not a real directory".to_string());
+        return Err(format!(
+            "project root {} is not a real directory",
+            project.path.display()
+        ));
     }
-    let project_root = project
-        .path
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve project root: {error}"))?;
-    validate_project_root(&project_root, &project.name)?;
+    let project_root = project.path.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve project root {}: {error}",
+            project.path.display()
+        )
+    })?;
+    validate_project_root(&project_root, &project.name).map_err(|error| {
+        format!(
+            "project {} failed validation: {error}",
+            project.path.display()
+        )
+    })?;
 
-    let target_metadata = fs::symlink_metadata(&project.artifact_dir)
-        .map_err(|error| format!("cannot inspect target directory: {error}"))?;
+    let target_metadata = fs::symlink_metadata(&project.artifact_dir).map_err(|error| {
+        format!(
+            "cannot inspect target directory {}: {error}",
+            project.artifact_dir.display()
+        )
+    })?;
     if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
-        return Err("target directory is missing or is a symlink".to_string());
+        return Err(format!(
+            "target directory {} is missing or is a symlink",
+            project.artifact_dir.display()
+        ));
     }
     if project.artifact_dir.file_name() != Some("target".as_ref()) {
-        return Err("artifact path is not named target".to_string());
+        return Err(format!(
+            "artifact path {} is not named target",
+            project.artifact_dir.display()
+        ));
     }
 
     let target_parent = project
         .artifact_dir
         .parent()
-        .ok_or_else(|| "target directory has no parent".to_string())?
+        .ok_or_else(|| {
+            format!(
+                "target directory {} has no parent",
+                project.artifact_dir.display()
+            )
+        })?
         .canonicalize()
-        .map_err(|error| format!("cannot resolve target parent: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "cannot resolve target parent of {}: {error}",
+                project.artifact_dir.display()
+            )
+        })?;
     if target_parent != project_root {
-        return Err("target directory is not directly under project root".to_string());
+        return Err(format!(
+            "target directory {} is not directly under project root {}",
+            project.artifact_dir.display(),
+            project.path.display()
+        ));
     }
 
-    let target = project
-        .artifact_dir
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve target directory: {error}"))?;
+    let target = project.artifact_dir.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve target directory {}: {error}",
+            project.artifact_dir.display()
+        )
+    })?;
     if target.parent() != Some(project_root.as_path()) {
-        return Err("resolved target directory escaped project root".to_string());
+        return Err(format!(
+            "resolved target directory {} escaped project root {}",
+            target.display(),
+            project.path.display()
+        ));
     }
     Ok(target)
 }
 
 fn validate_clean_path(project: &DiscoveredProject, path: &Path) -> Result<(), String> {
     let target = validate_target_path(project)?;
-    let relative = path
-        .strip_prefix(&target)
-        .map_err(|_| "clean path is outside target directory".to_string())?;
+    let relative = path.strip_prefix(&target).map_err(|_| {
+        format!(
+            "clean path {} is outside target directory {} of project {}",
+            path.display(),
+            target.display(),
+            project.path.display()
+        )
+    })?;
     if relative
         .components()
         .any(|component| component == std::path::Component::ParentDir)
     {
-        return Err("clean path contains parent traversal".to_string());
+        return Err(format!(
+            "clean path {} contains parent traversal (project {})",
+            path.display(),
+            project.path.display()
+        ));
     }
 
     let mut current = target.clone();
     for component in relative.components() {
         current.push(component);
-        let metadata = fs::symlink_metadata(&current)
-            .map_err(|error| format!("cannot inspect clean path {}: {error}", current.display()))?;
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "cannot inspect clean path {} of project {}: {error}",
+                current.display(),
+                project.path.display()
+            )
+        })?;
         if metadata.file_type().is_symlink() {
             return Err(format!(
-                "refusing symlinked clean path {}",
-                current.display()
+                "refusing symlinked clean path {} of project {}",
+                current.display(),
+                project.path.display()
             ));
         }
     }
 
-    let canonical = path
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve clean path {}: {error}", path.display()))?;
+    let canonical = path.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve clean path {} of project {}: {error}",
+            path.display(),
+            project.path.display()
+        )
+    })?;
     if !canonical.starts_with(&target) {
         return Err(format!(
-            "clean path {} resolved outside target directory",
-            path.display()
+            "clean path {} of project {} resolved outside target directory {}",
+            path.display(),
+            project.path.display(),
+            target.display()
         ));
     }
 
@@ -206,17 +268,36 @@ fn validate_clean_path(project: &DiscoveredProject, path: &Path) -> Result<(), S
 fn validate_and_size(project: &DiscoveredProject, path: &Path) -> Result<u64, String> {
     validate_clean_path(project, path)?;
     let mut size = 0u64;
-    for result in walkdir::WalkDir::new(path).follow_links(false).into_iter() {
-        let entry = result.map_err(|error| format!("cannot inspect clean path: {error}"))?;
+    // NOTE: same_file_system(true) is deliberately not set; target trees may
+    // span mount points.
+    for result in walkdir::WalkDir::new(path)
+        .follow_links(false)
+        // Root symlinks already rejected by validation; harden explicitly.
+        .follow_root_links(false)
+        .into_iter()
+    {
+        let entry = result.map_err(|error| {
+            format!(
+                "cannot inspect clean path {} of project {}: {error}",
+                path.display(),
+                project.path.display()
+            )
+        })?;
         if entry.file_type().is_symlink() {
             return Err(format!(
-                "refusing to clean symlink {}",
-                entry.path().display()
+                "refusing to clean symlink {} of project {}",
+                entry.path().display(),
+                project.path.display()
             ));
         }
         if entry.file_type().is_file() {
-            let metadata = fs::symlink_metadata(entry.path())
-                .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                format!(
+                    "cannot inspect {} of project {}: {error}",
+                    entry.path().display(),
+                    project.path.display()
+                )
+            })?;
             size = size.saturating_add(metadata.len());
         }
     }
@@ -229,19 +310,35 @@ fn is_real_directory(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Helper to collect subdirectories with a specific name up to depth 3.
+/// Helper to collect subdirectories with a specific name.
+///
+/// No `max_depth` limit is applied: matching relies on the directory name
+/// plus `validate_clean_path` symlink/containment re-checks at clean time,
+/// so deeper triple/profile layouts are fully covered rather than silently
+/// under-cleaned.
 fn collect_subdirs_named(
     root: &Path,
     target_name: &str,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
+    // NOTE: same_file_system(true) is deliberately not set; target trees may
+    // span mount points.
     for result in walkdir::WalkDir::new(root)
-        .max_depth(3)
         .follow_links(false)
+        // Root symlinks already rejected by validation; harden explicitly.
+        .follow_root_links(false)
         .into_iter()
     {
-        let entry = result.map_err(|error| format!("clean traversal failed: {error}"))?;
+        let entry = result
+            .map_err(|error| format!("clean traversal failed in {}: {error}", root.display()))?;
         if entry.file_type().is_dir() && entry.file_name() == target_name {
+            // Pre-filter symlinks fail-closed before push; validate_clean_path
+            // performs the authoritative re-check at clean time.
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
             out.push(entry.path().to_path_buf());
         }
     }
@@ -249,12 +346,20 @@ fn collect_subdirs_named(
 }
 
 /// Calculate how many bytes would be freed for a project + mode (for dry run).
+///
+/// Discovery shares [`paths_to_clean`] with the actual clean path, so dry-run
+/// and clean agree on *which* directories are targeted. When a scan-time
+/// `breakdown` is present the estimate reuses it for speed, but that snapshot
+/// may be stale if the target tree changed after scanning; the `None` path
+/// (and all actual cleans) re-measures via [`validate_and_size`].
 pub fn estimate_freed(project: &DiscoveredProject, mode: &CleanMode) -> Result<u64, String> {
     let paths = paths_to_clean(project, mode)?;
     if paths.is_empty() {
         return Ok(0);
     }
     if let Some(breakdown) = project.breakdown.as_ref() {
+        // NOTE: stale-breakdown risk documented above; fresh measurement
+        // happens at clean time via validate_and_size.
         return Ok(match mode {
             CleanMode::Full => project.artifact_size,
             CleanMode::DebugOnly => breakdown.debug_size,
@@ -262,12 +367,34 @@ pub fn estimate_freed(project: &DiscoveredProject, mode: &CleanMode) -> Result<u
             CleanMode::DepsOnly => breakdown.deps_size,
         });
     }
+    // Warn-and-continue per path: sum successes, fail only if all fail.
     let mut total = 0u64;
-    for path in paths {
-        if !is_real_directory(&path) {
+    let mut failures = 0usize;
+    let mut last_error = String::new();
+    for path in &paths {
+        if !is_real_directory(path) {
             continue;
         }
-        total = total.saturating_add(validate_and_size(project, &path)?);
+        match validate_and_size(project, path) {
+            Ok(size) => total = total.saturating_add(size),
+            Err(error) => {
+                eprintln!(
+                    "Warning: cannot estimate {} of project {}: {error}",
+                    path.display(),
+                    project.path.display()
+                );
+                failures += 1;
+                last_error = error;
+            }
+        }
+    }
+    if failures > 0 && total == 0 {
+        // Distinguish "nothing measurable" from "empty": if every attempted
+        // path failed, propagate an error so callers exit non-zero.
+        let attempted = paths.iter().any(|p| is_real_directory(p));
+        if attempted {
+            return Err(last_error);
+        }
     }
     Ok(total)
 }
@@ -290,21 +417,42 @@ pub fn clean_project(
             reason: "No matching directories found".to_string(),
         };
     }
+    let existing_count = existing.len();
 
     if dry_run {
+        // Warn-and-continue per path: sum successes, fail only if all fail.
         let mut total = 0u64;
-        for path in existing {
+        let mut errors = Vec::new();
+        for path in &existing {
             match validate_and_size(project, path) {
                 Ok(size) => total = total.saturating_add(size),
-                Err(message) => return CleanResult::Error { message },
+                Err(message) => {
+                    eprintln!(
+                        "Warning: cannot estimate {} of project {}: {message}",
+                        path.display(),
+                        project.path.display()
+                    );
+                    errors.push(message);
+                }
             }
+        }
+        if !errors.is_empty() && total == 0 {
+            return CleanResult::Error {
+                message: errors.join("; "),
+            };
+        }
+        if !errors.is_empty() {
+            return CleanResult::Partial {
+                bytes_freed: total,
+                message: errors.join("; "),
+            };
         }
         return CleanResult::Cleaned { bytes_freed: total };
     }
 
     let mut freed = 0u64;
     let mut errors = Vec::new();
-    for path in existing {
+    for path in &existing {
         let size = match validate_and_size(project, path) {
             Ok(size) => size,
             Err(error) => {
@@ -313,7 +461,7 @@ pub fn clean_project(
             }
         };
         match remove_path(path, behavior) {
-            Ok(()) => freed += size,
+            Ok(()) => freed = freed.saturating_add(size),
             Err(e) => {
                 errors.push(format!("Failed to remove {}: {}", path.display(), e));
             }
@@ -333,6 +481,12 @@ pub fn clean_project(
             }
         }
     } else {
+        if matches!(behavior, CleanBehavior::Trash) {
+            eprintln!(
+                "Moved {existing_count} artifact(s) of project {} to Trash (freed ~{freed} bytes; empty Trash to reclaim disk space).",
+                project.path.display(),
+            );
+        }
         CleanResult::Cleaned { bytes_freed: freed }
     }
 }

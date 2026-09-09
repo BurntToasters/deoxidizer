@@ -6,6 +6,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+  isPrerelease,
   updateCargoLock,
   updateCargoToml,
   updateChangelog,
@@ -45,4 +46,31 @@ test('updates BCLS heading and download tag', () => {
   assert.match(updated, /## Changes in `v0\.1\.1:`/);
   assert.match(updated, /releases\/download\/v0\.1\.1\//);
   assert.doesNotMatch(updated, /releases\/download\/v0\.1\.0\//);
+});
+
+test('rejects malformed versions and fixtures', () => {
+  for (const bad of ['', 'v1.2.3', '1.0', '1.0.0-beta', '1.0.0-alpha.0-beta', '01.0.0']) {
+    assert.throws(() => validateVersion(bad), /Invalid release version/);
+  }
+  assert.throws(
+    () => updateCargoToml('[package]\nname = "deoxidizer"\n', '0.1.1'),
+    /exactly once/,
+  );
+  assert.throws(() => updateCargoToml('no sections here', '0.1.1'), /no \[package\]/);
+  assert.throws(() => updateCargoLock('empty lockfile', '0.1.1'), /exactly once/);
+  assert.throws(
+    () => updatePackageLock(JSON.stringify({ version: '0.1.0' }), '0.1.1'),
+    /packages\[""\]/,
+  );
+  assert.throws(
+    () => updateChangelog('# no heading\n', '0.1.0', '0.1.1'),
+    /missing current release heading/,
+  );
+});
+
+test('shared prerelease predicate mirrors the accepted version suffix', () => {
+  assert.equal(isPrerelease(validateVersion('0.2.0-beta.1')), true);
+  assert.equal(isPrerelease(validateVersion('0.1.0')), false);
+  assert.equal(isPrerelease('0.2.0-rc.3'), true);
+  assert.equal(isPrerelease('0.2.0'), false);
 });

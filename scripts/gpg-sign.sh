@@ -32,6 +32,10 @@ if [[ ${#ARTIFACTS[@]} -eq 0 ]]; then
     exit 1
 fi
 CHECKSUM_NAME="${DEOX_CHECKSUM_NAME:-SHA256SUMS.txt}"
+# Canonical manifest names are case-sensitive: uppercase SHA256SUMS prefix
+# with a lowercase `-<os>-<arch>` suffix (e.g. SHA256SUMS-linux-x86_64.txt).
+# Keep the match strict on purpose; verifiers accept legacy SHA256SUMS.txt
+# as a fallback but release.cjs always writes the per-target canonical name.
 [[ "$CHECKSUM_NAME" =~ ^SHA256SUMS(-[a-z0-9_-]+)?\.txt$ ]] || {
     echo "Invalid checksum manifest name: $CHECKSUM_NAME" >&2
     exit 2
@@ -50,6 +54,10 @@ echo "  $(wc -l < "$CHECKSUM_NAME" | tr -d ' ') entries written to $CHECKSUM_NAM
 
 if [[ -z "${GPG_KEY_ID:-}" ]]; then
     if [[ "$ALLOW_UNSIGNED" -eq 1 ]]; then
+        if [[ "${DEOX_RELEASE_CONFIRM:-}" != "YES" ]]; then
+            echo "Unsigned staging requires DEOX_RELEASE_CONFIRM=YES explicitly." >&2
+            exit 1
+        fi
         echo "GPG_KEY_ID not set; unsigned staging explicitly allowed."
         exit 0
     fi

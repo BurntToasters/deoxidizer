@@ -11,6 +11,8 @@ generalities.
 All project code is licensed under the **GNU General Public License v3.0 or
 later (GPL-3.0-or-later)**.
 
+REUSE decision: `LICENSE` plus Cargo/package metadata only; no per-file license headers.
+
 ---
 
 ## Product Overview
@@ -151,13 +153,16 @@ deoxidizer/
 │   ├── publish-release.cjs      # Explicit draft-to-published transition
 │   ├── check-license.cjs        # GPL metadata consistency check
 │   ├── check-changelog.cjs      # BCLS release metadata and asset-link check
+│   ├── check-release-key.cjs    # Pinned GPG release key verification
+│   ├── check-toolchain.cjs      # Rust/Node toolchain pin verification
 │   └── check-version.cjs        # Cargo/package version consistency check
 └── tests/
     ├── cleaner_test.rs         # Unit and integration tests for clean modes and path safety
     ├── cli_test.rs             # Dual-binary parity and CLI rejection tests
     ├── config_test.rs          # Serialization, validation, and safe tilde expansion tests
     ├── scanner_test.rs         # Mock projects, workspaces, Tauri detection, and ignore tests
-    └── node/release-tools.test.cjs # Node release helper tests
+    ├── node/release-tools.test.cjs # Node release helper tests
+    └── node/sync-version.test.cjs  # Node version-sync helper tests
 ```
 
 ---
@@ -170,7 +175,7 @@ The configuration file is stored in the user's home directory as JSON:
 ### JSON Schema
 ```json
 {
-   "version": 2,
+  "version": 2,
   "projects_dir": "/Users/dev/Documents/GitHub",
   "scope": "tauri-only",
   "clean_behavior": "delete",
@@ -204,18 +209,29 @@ The configuration file is stored in the user's home directory as JSON:
 
 Cargo target directories contain distinct artifacts with different recreation costs:
 
+Rough heuristics, not guarantees:
+
 | Clean Mode | Target Paths Removed | Reclaimable Space | Rebuild Cost | Typical Use Case |
 |---|---|---|---|---|
 | `full` | Entire `target/` directory | 100% | High (recompiles all dependencies) | Finished projects, archive, maximum space recovery |
 | `debug-only` | `target/debug/` and `target/<triple>/debug/` | ~80–90% | Moderate (keeps optimized release builds) | Developer machines with precious release binaries |
-| `incremental-only` | `*/incremental/` across all profiles | ~15–25% | Low (keeps compiled `.rlib`/`.o` objects) | Routine maintenance during active daily development |
-| `deps-only` | `*/deps/` across all profiles | ~70–80% | Moderate to High | Clears stale dependencies while keeping target root |
+| `incremental-only` | `*/incremental/` across all profiles (depth ≤ 3) | ~15–25% | Low (keeps compiled `.rlib`/`.o` objects) | Routine maintenance during active daily development |
+| `deps-only` | `*/deps/` across all profiles (depth ≤ 3) | ~70–80% | Moderate to High | Clears stale dependencies while keeping target root |
 
 ### Cross-Compilation Target Triples
 Tauri apps frequently compile for cross-platform targets (e.g. `target/x86_64-pc-windows-msvc/debug`
 or `target/aarch64-apple-darwin/release`).
 `scanner.rs` and `cleaner.rs` must both recognize and process target triple directories in
 addition to top-level `debug/` and `release/`.
+`debug-only` treats any non-`debug`/non-`release` subdirectory of `target/`
+as a triple candidate and cleans its `debug/` child when present; do not narrow
+to a known triple list. `incremental-only`/`deps-only` collect matches up to
+depth 3 and intentionally under-clean deeper layouts fail-closed.
+`trash` behavior uses the OS Trash (Finder Trash, Recycle Bin, freedesktop
+Trash); trashed files still occupy disk until emptied, and `trash failed` does
+not fall back to `delete`. Sizes are logical file bytes and `clean --dry-run`
+is the canonical reclaimable-byte source; breakdown subtotals overlap, so do
+not sum them.
 
 ---
 
@@ -232,6 +248,9 @@ DEOX_RELEASE_CONFIRM=
 DEOX_RELEASE_DRAFT_MODE=create
 DEOX_ALLOW_UNSIGNED_RELEASE=0
 DEOX_CHECKSUM_NAME=
+# Internal/advanced: set by release tooling to bind the release session target
+# (e.g. host); do not set manually.
+DEOX_RELEASE_TARGET=
 
 # GPG Signing
 GPG_KEY_ID=
@@ -324,6 +343,7 @@ npm run check:changelog
 npm run check:toolchain
 npm run check:release-key
 npm run quality:node
+for f in install.sh scripts/*.sh; do bash -n "$f"; done
 
 # 5. Release build verification
 cargo build --release --locked
@@ -333,9 +353,13 @@ cargo build --release --locked
 ./target/release/deox --version
 ```
 
+`cargo run -- --help` fails with two binaries; use
+`cargo run --bin deox -- --help` for ground-truth help output.
+
 ### Test Coverage Highlights
 - `tests/config_test.rs`: Validates default configuration, atomic round-trip serialization, malformed/future-version rejection, enum parsing, and safe tilde expansion.
 - `tests/scanner_test.rs`: Validates Tauri project detection, renamed/inherited dependencies, shared workspaces, size calculation, symlink exclusion, and `ignored_projects` filtering.
 - `tests/cleaner_test.rs`: Validates deletion in all 4 clean modes, target triples, symlink rejection, dry-run safety, and preservation of release builds in `debug-only` mode.
 - `tests/cli_test.rs`: Validates dual-binary version/output parity and invalid-mode rejection.
 - `tests/node/release-tools.test.cjs`: Validates target mapping, checksums, release identity, token scrubbing, and destructive Git confirmation.
+- `tests/node/sync-version.test.cjs`: Validates version parsing, Cargo/npm manifest updates, and BCLS changelog rewrites.

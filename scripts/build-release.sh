@@ -7,7 +7,19 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+# Cargo.toml version is parsed with a section-aware match so a dependency's
+# `version =` line can never shadow the package version. (Shell reuse of
+# sync-version.cjs via node is impractical here because this script must run
+# before node_modules exists; the awk below mirrors cargoVersion().)
+VERSION=$(awk '
+    /^\[package\]/{ in_package=1; next }
+    /^\[/{ in_package=0 }
+    in_package && /^version[[:space:]]*=[[:space:]]*"/ {
+        gsub(/^version[[:space:]]*=[[:space:]]*"/, "");
+        gsub(/".*$/, "");
+        print; exit
+    }
+' Cargo.toml | head -n 1)
 echo "Building deoxidizer v$VERSION..."
 
 TARGET="$(rustc -vV | sed -n 's/^host: //p')"

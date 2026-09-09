@@ -30,10 +30,11 @@ function sha256File(filePath) {
 }
 
 function cargoVersion() {
-  const manifest = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
-  const match = manifest.match(/^version\s*=\s*"([^"]+)"/m);
-  if (!match) throw new Error('Cargo.toml has no package version');
-  return match[1];
+  // Reuse the bounded [package]-section parser so workspace dependency
+  // versions can never shadow the top-level package version.
+  return require('./sync-version.cjs').cargoVersion(
+    fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8'),
+  );
 }
 
 function currentIdentity(target = process.env.DEOX_RELEASE_TARGET || 'host') {

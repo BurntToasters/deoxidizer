@@ -12,6 +12,7 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -20,14 +21,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
         with:
-          toolchain: 1.98.0
+          toolchain: 1.98.1
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test
+        run: cargo test --locked
       - name: Release build
         run: cargo build --release --locked
       - name: Verify both binaries
@@ -44,6 +46,7 @@ jobs:
   release-tools:
     name: Node release tooling
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -59,10 +62,18 @@ jobs:
       - run: npm run check:release-key
       - run: npm run quality:node
       - run: bash -n install.sh scripts/*.sh
+      - name: Lint PowerShell
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+          $results = Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Warning, Error
+          $results | Format-Table -AutoSize
 
   rust-targets:
     name: Rust target (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -75,10 +86,10 @@ jobs:
           - aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # master
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
         with:
-          toolchain: 1.98.0
+          toolchain: 1.98.1
       - name: Install target
-        run: rustup target add --toolchain 1.98.0 ${{ matrix.target }}
+        run: rustup target add --toolchain 1.98.1 ${{ matrix.target }}
       - name: Check target
         run: cargo check --locked --target ${{ matrix.target }}

@@ -4,7 +4,17 @@
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 
+Unicode True
+
 Name "deoxidizer"
+!ifndef VERSION
+!define VERSION "0.0.0"
+!endif
+VIProductVersion "${VERSION}.0"
+VIAddVersionKey "ProductName" "deoxidizer"
+VIAddVersionKey "ProductVersion" "${VERSION}"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "Publisher" "BurntToasters"
 !ifndef OUTPUT_DIR
 !define OUTPUT_DIR "release"
 !endif
@@ -44,17 +54,21 @@ Section "Install"
   ; Registry keys
   WriteRegStr HKCU "Software\deoxidizer" "InstallDir" $INSTDIR
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\deoxidizer" "DisplayName" "deoxidizer"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\deoxidizer" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\deoxidizer" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\deoxidizer" "InstallLocation" $INSTDIR
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\deoxidizer" "Publisher" "BurntToasters"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\deoxidizer" "NoModify" 1
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\deoxidizer" "NoRepair" 1
 
-  ; Add to user PATH
+  ; Add to user PATH (delimited check mirrors the uninstall side so only a
+  ; complete semicolon-separated entry matches; never a substring).
   ReadRegStr $0 HKCU "Environment" "Path"
   StrCmp $0 "" 0 +2
     StrCpy $0 ""
-  ${If} $0 !~ "*$INSTDIR*"
+  StrCpy $1 ";$0;"
+  ${WordReplace} $1 ";$INSTDIR;" ";" "+" $2
+  ${If} $1 == $2
     WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$0"
     ; Broadcast WM_SETTINGCHANGE
     SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000

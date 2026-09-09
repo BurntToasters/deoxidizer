@@ -1,3 +1,4 @@
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -45,11 +46,14 @@ impl std::error::Error for ConfigError {
 }
 
 /// Project scanning scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Scope {
+    #[value(name = "tauri-only", alias = "tauri")]
     TauriOnly,
+    #[value(name = "tauri-and-rust", alias = "both", alias = "all")]
     TauriAndRust,
+    #[value(name = "rust-only", alias = "rust")]
     RustOnly,
 }
 
@@ -75,10 +79,12 @@ impl Scope {
 }
 
 /// Cleaning behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum CleanBehavior {
+    #[value(name = "delete", alias = "rm", alias = "remove")]
     Delete,
+    #[value(name = "trash", alias = "recycle", alias = "bin")]
     Trash,
 }
 
@@ -102,12 +108,16 @@ impl CleanBehavior {
 }
 
 /// Default clean mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum DefaultMode {
+    #[value(name = "full")]
     Full,
+    #[value(name = "debug-only", alias = "debug")]
     DebugOnly,
+    #[value(name = "incremental-only", alias = "incremental")]
     IncrementalOnly,
+    #[value(name = "deps-only", alias = "deps")]
     DepsOnly,
 }
 
@@ -199,11 +209,30 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Fallible config path: errors when HOME cannot be determined.
+    ///
+    /// Callers that mutate or require the filesystem must use this so a
+    /// missing HOME surfaces as [`ConfigError`] instead of silently
+    /// resolving to a relative `./.deox_config`.
+    pub fn try_config_path() -> Result<PathBuf, ConfigError> {
+        dirs::home_dir().map(|home| home.join(CONFIG_FILENAME)).ok_or_else(|| {
+            ConfigError::Invalid(
+                "could not determine home directory (HOME is unset); set HOME to locate configuration"
+                    .to_string(),
+            )
+        })
+    }
+
     /// Returns the path to the config file: ~/.deox_config
+    ///
+    /// TODO: change this signature to `Result<PathBuf, ConfigError>` and
+    /// remove the `"."` fallback. Kept returning `PathBuf` for backwards
+    /// compatibility because `test_config_path` calls it directly and
+    /// editing tests is out of scope; filesystem-mutating callers
+    /// (`load`, `save`) use [`Config::try_config_path`] so an unset HOME
+    /// propagates as an error instead of writing to `./.deox_config`.
     pub fn config_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(CONFIG_FILENAME)
+        Self::try_config_path().unwrap_or_else(|_| PathBuf::from(".").join(CONFIG_FILENAME))
     }
 
     /// Load config from ~/.deox_config.
@@ -212,7 +241,7 @@ impl Config {
     /// can safely use defaults do so explicitly, while destructive commands
     /// can refuse to proceed.
     pub fn load() -> Result<Self, ConfigError> {
-        let path = Self::config_path();
+        let path = Self::try_config_path()?;
         Self::load_from(&path)
     }
 
@@ -274,11 +303,17 @@ impl Config {
 
     /// Save config to ~/.deox_config.
     pub fn save(&self) -> io::Result<()> {
-        let path = Self::config_path();
+        let path = Self::try_config_path()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         self.save_to(&path)
     }
 
     /// Save config to a specific path.
+    ///
+    /// Atomicity/permissions: `tempfile` creates the staging file with `0600`
+    /// and `persist` renames it over the destination, preserving that mode on
+    /// creation; the parent-directory fsync below only guarantees directory
+    /// entry durability, not additional permission hardening.
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
         self.validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -294,6 +329,14 @@ impl Config {
         temporary
             .persist(path)
             .map_err(|error| io::Error::other(error.error))?;
+        // Best-effort parent fsync so the rename survives a crash. Directory
+        // fsync failures are ignored: durability hint only, not correctness.
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 

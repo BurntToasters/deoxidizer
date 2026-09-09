@@ -29,7 +29,7 @@
   - Clean operations require confirmation unless `--yes` is explicitly provided.
 - **Updater:** Added HTTPS-only release downloads, bounded responses, safe archive extraction, and mandatory platform checksum verification.
 - **Updater:** Authenticates checksum manifests with pinned GPG key `CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F` before replacement.
-- **Codebase:** Added IYERIS-style Node.js release tooling with `npm run r`, `npm run b`, target-specific builds, release sessions, and optional `gh` publication.
+- **Codebase:** Added shared Node.js release tooling with `npm run r`, `npm run b`, target-specific builds, release sessions, and optional `gh` publication.
 - **Codebase:** Added deterministic target-aware archives for Linux, macOS, and Windows, including both command binaries and GPL license text.
 - **Testing:** Added scanner, cleaner, configuration, CLI parity, updater, checksum, release-session, and release-draft validation coverage.
 - **Licenses:** Standardized project metadata and distributed documentation on GPL-3.0-or-later.
@@ -38,6 +38,7 @@
 ## ℹ️ Release Info
 
 - **GPG Signed:** Release archives, setup files, and target checksum manifests are signed with detached GPG signatures when published.
+- **GPG Key:** Verify manifests against the pinned release key `CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F` at https://raw.githubusercontent.com/BurntToasters/deoxidizer/main/release-signing-key.asc.
 - **Code Signing:** macOS release binaries require hardened runtime signing. Windows binaries and setup files require Authenticode signing with RFC3161 timestamps.
 - **Updater:** Installed binaries use verified HTTPS release metadata and refuse unverified replacements.
 - **License:** GPL-3.0-or-later. See [`LICENSE`](LICENSE).

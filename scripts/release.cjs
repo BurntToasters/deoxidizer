@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { uploadReleaseAsset } = require('./github-cli.cjs');
+const { cargoVersion } = require('./sync-version.cjs');
 
 const root = path.resolve(__dirname, '..');
 const releaseDir = path.join(root, 'release');
@@ -24,6 +25,10 @@ const SIGNING_ENV_KEYS = [
   'APPLE_PASSWORD',
   'APPLE_TEAM_ID',
   'APPLE_KEYCHAIN_PROFILE',
+  // Bypass flags are signing-adjacent: strip from build/quality env so a
+  // stray SKIP/ALLOW in the caller cannot silently weaken a signed build.
+  'SKIP_WIN_CODESIGN',
+  'DEOX_ALLOW_UNSIGNED_RELEASE',
 ];
 
 const TARGETS = {
@@ -42,11 +47,7 @@ const TARGETS = {
 };
 
 function packageVersion() {
-  const version = fs
-    .readFileSync(path.join(root, 'Cargo.toml'), 'utf8')
-    .match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-  if (!version) throw new Error('Cargo.toml has no version');
-  return version;
+  return cargoVersion(fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8'));
 }
 
 function hostArch() {
@@ -99,11 +100,17 @@ function run(command, args, env = process.env) {
 function buildEnvironment(env) {
   const sanitized = { ...env };
   for (const key of SIGNING_ENV_KEYS) delete sanitized[key];
+  // Never leak GitHub tokens into build/quality/sign child processes; gh
+  // uses its credential store instead (see github-cli.cjs).
+  delete sanitized.GH_TOKEN;
+  delete sanitized.GITHUB_TOKEN;
   return sanitized;
 }
 
 function signingEnvironment(env, os) {
   const scoped = { ...env };
+  delete scoped.GH_TOKEN;
+  delete scoped.GITHUB_TOKEN;
   const keep = new Set();
   if (os === 'darwin') {
     for (const key of ['APPLE_SIGNING_IDENTITY', 'APPLE_ID', 'APPLE_PASSWORD', 'APPLE_TEAM_ID', 'APPLE_KEYCHAIN_PROFILE']) {
@@ -205,6 +212,9 @@ function main() {
   const uploadRequested = process.argv.includes('--upload');
   const waitForDraft = process.argv.includes('--wait') || process.env.DEOX_RELEASE_DRAFT_MODE === 'wait';
   const unsigned = process.argv.includes('--unsigned') || process.env.DEOX_ALLOW_UNSIGNED_RELEASE === '1';
+  if (unsigned && process.env.DEOX_RELEASE_CONFIRM !== 'YES') {
+    throw new Error('Unsigned staging requires DEOX_RELEASE_CONFIRM=YES explicitly');
+  }
   if (uploadRequested && unsigned) {
     throw new Error('Unsigned artifacts may be staged locally but never uploaded');
   }
@@ -214,6 +224,17 @@ function main() {
     DEOX_CHECKSUM_NAME: `SHA256SUMS-${os}-${arch}.txt`,
     ...(unsigned ? { DEOX_ALLOW_UNSIGNED_RELEASE: '1' } : {}),
   };
+  if (
+    process.env.DEOX_CHECKSUM_NAME &&
+    process.env.DEOX_CHECKSUM_NAME !== env.DEOX_CHECKSUM_NAME
+  ) {
+    // Release path always uses the per-target canonical manifest; a legacy
+    // global SHA256SUMS.txt override is ignored here (warn, do not fail, so
+    // local staging stays usable).
+    console.error(
+      `warn: ignoring DEOX_CHECKSUM_NAME=${process.env.DEOX_CHECKSUM_NAME}; using canonical ${env.DEOX_CHECKSUM_NAME}`,
+    );
+  }
   const buildEnv = buildEnvironment(env);
   const signEnv = signingEnvironment(env, os);
   const gpgEnv = gpgEnvironment(env);
@@ -222,7 +243,7 @@ function main() {
   fs.mkdirSync(releaseDir, { recursive: true });
   // Quality checks and compilation never inherit signing credentials.
   run('npm', ['run', 'release:prepare'], buildEnv);
-  run('rustup', ['target', 'add', '--toolchain', '1.98.0', target], buildEnv);
+  run('rustup', ['target', 'add', '--toolchain', '1.98.1', target], buildEnv);
   run('cargo', ['build', '--release', '--locked', '--target', target], buildEnv);
   const binaryExtension = os === 'windows' ? '.exe' : '';
   const targetRoot = process.env.CARGO_TARGET_DIR || path.join(root, 'target');
@@ -256,6 +277,7 @@ function main() {
         `/DBUILD_DIR=${buildDir}`,
         '/DOUTPUT_DIR=release',
         `/DOUTPUT_NAME=${installerName}`,
+        `/DVERSION=${packageVersion()}`,
         'installer.nsi',
       ],
       buildEnv,

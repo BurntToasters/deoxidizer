@@ -82,6 +82,10 @@ function Get-ArtifactSigningTools {
   if ($signToolPath -match '[\\/]x64[\\/]' -and $dlibPath -match '[\\/]x86[\\/]') {
     throw "SignTool and Artifact Signing dlib architectures do not match: $signToolPath ; $dlibPath"
   }
+  $signToolVersion = (Get-Item -LiteralPath $signToolPath).VersionInfo.FileVersion
+  $dlibVersion = (Get-Item -LiteralPath $dlibPath).VersionInfo.FileVersion
+  Write-Host "SignTool: $signToolPath (version $signToolVersion)"
+  Write-Host "Dlib: $dlibPath (version $dlibVersion)"
   return [PSCustomObject]@{
     SignToolPath = $signToolPath
     DlibPath = $dlibPath
