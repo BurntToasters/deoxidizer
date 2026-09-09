@@ -8,7 +8,8 @@ use std::path::PathBuf;
 /// rejected by clap (exit 2); stored configs re-check via `Config::validate`.
 const MAX_MIN_SIZE_MB: u64 = u64::MAX / (1024 * 1024);
 /// Maximum `--older-than` in days (100 years); bounds obvious typos while
-/// `retain_older_than` still guards arithmetic overflow with exit 2.
+/// `retain_older_than` still guards time-underflow (`checked_sub` pre-epoch)
+/// with exit 2 (`u64` day-to-second mul cannot overflow).
 /// `i64` because `value_parser!(u32)` ranges over `i64` in clap 4.6.
 const MAX_OLDER_THAN_DAYS: i64 = 36_500;
 
@@ -57,7 +58,7 @@ pub struct SetupArgs {
 
     /// Skip the overwrite confirmation when `--default` would replace an
     /// existing config file.
-    #[arg(short = 'y', long = "yes")]
+    #[arg(short = 'y', long = "yes", requires = "use_defaults")]
     pub yes: bool,
 }
 
@@ -461,8 +462,9 @@ fn run_inspect(args: InspectArgs) {
     // so it is inspected regardless of scan preferences. The broad
     // TauriAndRust scope below only decides which project kinds are
     // recognizable here, and `--scope` can narrow it. Clap validates
-    // `--scope` (exit 2) via `ValueEnum`; `from_str_loose` remains for
-    // settings-file compat in `config.rs`.
+    // `--scope` (exit 2) via `ValueEnum`; the tool writes kebab-case via
+    // `Display` and the config file requires kebab-case strict serde;
+    // `from_str_loose` in `config.rs` is only for CLI/settings input compat.
     let scope = args.scope.unwrap_or(Scope::TauriAndRust);
 
     let projects = match scan_dir(project_path, &scope) {

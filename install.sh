@@ -72,7 +72,7 @@ else
         exit 1
     }
 
-    curl -fsSL --retry 3 --retry-delay 2 "https://api.github.com/repos/$REPO/releases/latest" \
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 "https://api.github.com/repos/$REPO/releases/latest" \
         -o "$TMPDIR/release.json"
     VERSION=$(python3 - "$TMPDIR/release.json" <<'PY'
 import json
@@ -87,7 +87,8 @@ PY
 )
     # Validate semver before interpolating into asset names/URLs so a
     # compromised or malformed tag cannot inject path segments.
-    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]] || {
+    # Leading-zero classes mirror sync-version.cjs validateVersion.
+    [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]] || {
         echo "Error: invalid release version: $VERSION" >&2
         exit 1
     }
@@ -116,10 +117,10 @@ PY
 
     echo "  Version: $LATEST"
     echo "  Asset:   $ASSET"
-    curl -fsSL --retry 3 --retry-delay 2 "$URL" -o "$TMPDIR/$ASSET"
-    if ! curl -fsSL --retry 3 --retry-delay 2 "$CHECKSUM_URL" -o "$TMPDIR/$CHECKSUM_NAME"; then
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 "$URL" -o "$TMPDIR/$ASSET"
+    if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 "$CHECKSUM_URL" -o "$TMPDIR/$CHECKSUM_NAME"; then
         CHECKSUM_NAME="SHA256SUMS.txt"
-        curl -fsSL --retry 3 --retry-delay 2 "https://github.com/$REPO/releases/download/${LATEST}/$CHECKSUM_NAME" \
+        curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 "https://github.com/$REPO/releases/download/${LATEST}/$CHECKSUM_NAME" \
             -o "$TMPDIR/$CHECKSUM_NAME"
         CHECKSUM_URL="https://github.com/$REPO/releases/download/${LATEST}/${CHECKSUM_NAME}"
         CHECKSUM_SIGNATURE_URL="${CHECKSUM_URL}.asc"
@@ -129,7 +130,7 @@ PY
         echo "Error: gpg is required to authenticate release manifests." >&2
         exit 1
     }
-    curl -fsSL --retry 3 --retry-delay 2 "https://raw.githubusercontent.com/$REPO/main/release-signing-key.asc" \
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 "https://raw.githubusercontent.com/$REPO/main/release-signing-key.asc" \
         -o "$TMPDIR/release-signing-key.asc"
     KEY_FINGERPRINT=$(gpg --batch --show-keys --with-colons "$TMPDIR/release-signing-key.asc" |
         awk -F: '$1 == "fpr" { print toupper($10); exit }')
@@ -139,7 +140,7 @@ PY
     }
     gpg --batch --yes --dearmor --output "$TMPDIR/release-keyring.gpg" \
         "$TMPDIR/release-signing-key.asc"
-    curl -fsSL --retry 3 --retry-delay 2 "$CHECKSUM_SIGNATURE_URL" -o "$TMPDIR/$CHECKSUM_NAME.asc"
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 "$CHECKSUM_SIGNATURE_URL" -o "$TMPDIR/$CHECKSUM_NAME.asc"
     gpg --batch --no-options --no-default-keyring --keyring "$TMPDIR/release-keyring.gpg" \
         --verify "$TMPDIR/$CHECKSUM_NAME.asc" "$TMPDIR/$CHECKSUM_NAME" >/dev/null 2>&1 || {
         echo "Error: checksum manifest signature verification failed." >&2

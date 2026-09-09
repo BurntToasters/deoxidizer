@@ -60,6 +60,11 @@ pub fn scan(config: &Config) -> Result<Vec<DiscoveredProject>, ScanError> {
 }
 
 /// Scan a specific directory for projects.
+///
+/// Top-walk fail-closed intent: a candidate-walk `Err` aborts the whole scan
+/// with `ScanError::Traversal` rather than warn-continuing (as
+/// `analyze_target` does per-project), trading availability for safety so a
+/// partially-visible tree never yields a silently incomplete project list.
 pub fn scan_dir(root: &Path, scope: &Scope) -> Result<Vec<DiscoveredProject>, ScanError> {
     let root = validate_scan_root(root)?;
     // Cache workspace manifest re-parses: ancestor Cargo.toml files are read
@@ -206,8 +211,12 @@ pub fn scan_dir(root: &Path, scope: &Scope) -> Result<Vec<DiscoveredProject>, Sc
         eprintln!("Warning: skipped {analyze_warnings} project(s) due to target analysis errors.");
     }
 
-    // Sort by size descending
-    projects.sort_by_key(|a| std::cmp::Reverse(a.artifact_size));
+    // Sort by size descending, breaking ties by name for determinism.
+    projects.sort_by(|a, b| {
+        b.artifact_size
+            .cmp(&a.artifact_size)
+            .then(a.name.cmp(&b.name))
+    });
     Ok(projects)
 }
 
@@ -262,7 +271,14 @@ fn read_manifest(path: &Path) -> Option<Value> {
 }
 
 fn real_directory(path: &Path) -> Option<PathBuf> {
-    let metadata = fs::symlink_metadata(path).ok()?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            eprintln!("Warning: cannot inspect {}: {}", path.display(), error);
+            return None;
+        }
+    };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return None;
     }

@@ -36,6 +36,9 @@ try {
   [IO.File]::WriteAllText($metadataPath, $metadata, (New-Object Text.UTF8Encoding($false)))
 
   Write-Host "Artifact Signing: $resolved"
+  # TSA uses https (not http as in older iyeris/MS doc snippets). Confirm on
+  # the Windows release VM; fail-closed loud either way — revert to http only
+  # if VM-verified. Verified-on-VM-or-revert.
   & $tools.SignToolPath sign /v /debug /fd SHA256 /tr 'https://timestamp.acs.microsoft.com' /td SHA256 /dlib $tools.DlibPath /dmdf $metadataPath $resolved
   if ($LASTEXITCODE -ne 0) { throw "SignTool failed with exit code $LASTEXITCODE for $resolved" }
 } finally {

@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { uploadReleaseAsset } = require('./github-cli.cjs');
-const { cargoVersion } = require('./sync-version.cjs');
+const { cargoVersion, validateVersion } = require('./sync-version.cjs');
 
 const root = path.resolve(__dirname, '..');
 const releaseDir = path.join(root, 'release');
@@ -165,7 +165,7 @@ function uploadExisting() {
   if (process.env.DEOX_ALLOW_UNSIGNED_RELEASE === '1') {
     throw new Error('Unsigned artifacts may be staged locally but never uploaded');
   }
-  const version = packageVersion();
+  const version = validateVersion(packageVersion());
   const tag = `v${version}`;
   const files = releaseFiles();
   if (files.length === 0) throw new Error(`No staged release files found in ${releaseDir}`);
@@ -204,6 +204,9 @@ function main() {
     uploadExisting();
     return;
   }
+  // Early gate: reject malformed Cargo versions before deriving asset
+  // names, makensis /DVERSION, or tags from them.
+  validateVersion(packageVersion());
   const os = normalizeOs(process.argv[2] || '');
   const arch = normalizeArch(process.argv[3] || 'host', os);
   const target = TARGETS[os]?.[arch];
@@ -320,8 +323,7 @@ function main() {
   run('bash', ['scripts/gpg-sign.sh', 'release', ...(unsigned ? ['--allow-unsigned'] : [])], gpgEnv);
   run('npm', ['run', 'release:verify'], buildEnv);
 
-  const version = packageVersion();
-  if (!version) throw new Error('Cargo.toml has no version');
+  const version = validateVersion(packageVersion());
   const tag = `v${version}`;
   const files = releaseFiles();
 

@@ -5,6 +5,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const {
   assertGitHubCliAuthenticated,
+  findReleaseByTag,
   githubApi,
   repository,
 } = require('./github-cli.cjs');
@@ -39,22 +40,8 @@ function releaseNotes() {
 }
 
 function findRelease() {
-  // Paginate: a single per_page=100 page can miss the tag once history grows.
-  // Fall back to the direct tag endpoint (works once the git tag exists).
-  for (let page = 1; ; page += 1) {
-    const releases = githubApi('GET', `/repos/${repository()}/releases?per_page=100&page=${page}`);
-    if (!Array.isArray(releases)) throw new Error('GitHub returned invalid release list');
-    const found = releases.find((release) => release?.tag_name === tag);
-    if (found) return found;
-    if (releases.length < 100) break;
-  }
-  try {
-    const byTag = githubApi('GET', `/repos/${repository()}/releases/tags/${tag}`);
-    if (byTag?.tag_name === tag) return byTag;
-  } catch {
-    // Drafts have no git tag yet, so 404 here is expected; fall through.
-  }
-  return null;
+  // Shared paginated lookup with tag-endpoint fallback (see github-cli.cjs).
+  return findReleaseByTag(tag);
 }
 
 function currentCommit() {

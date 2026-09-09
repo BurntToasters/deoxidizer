@@ -69,19 +69,104 @@ function githubApi(method, endpoint, body) {
   return githubJson(args, options);
 }
 
+function sleepSync(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    // Atomics.wait unavailable; fall back to blocking sleep.
+    spawnSync('sleep', [String(ms / 1000)], { stdio: 'ignore' });
+  }
+}
+
+function isRetryableGitHubStatus(statusCode) {
+  return (
+    statusCode === 408 ||
+    statusCode === 429 ||
+    (Number.isInteger(statusCode) && statusCode >= 500 && statusCode <= 599)
+  );
+}
+
+function retryAfterMs(detail, attempt) {
+  const match = String(detail || '').match(/retry-after[:\s]+(\d+)/i);
+  if (match) {
+    const seconds = Number(match[1]);
+    if (Number.isFinite(seconds) && seconds >= 0 && seconds <= 300) {
+      return seconds * 1000;
+    }
+  }
+  return [1000, 2000, 4000][Math.min(attempt, 2)] ?? 4000;
+}
+
+// Bounded retry for transient GitHub API failures (408/429/5xx).
+// Retries up to 3 times with exponential backoff 1s/2s/4s, honoring a
+// Retry-After hint when the gh error detail carries one. Non-retryable
+// errors (including 422 create races, handled separately by callers)
+// throw immediately. Single-attempt githubApi/runGitHub remain for
+// non-idempotent or already-guarded paths.
+function withGitHubRetry(fn, { maxRetries = 3 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      return fn();
+    } catch (error) {
+      lastError = error;
+      const status = error?.statusCode ?? githubStatusCode(error?.message);
+      if (attempt >= maxRetries || !isRetryableGitHubStatus(status)) throw error;
+      sleepSync(retryAfterMs(error?.message, attempt));
+    }
+  }
+  throw lastError;
+}
+
+function githubApiWithRetry(method, endpoint, body) {
+  return withGitHubRetry(() => githubApi(method, endpoint, body));
+}
+
+// Shared release lookup: paginate the releases list (a single
+// per_page=100 page can miss the tag once history grows), then fall back
+// to the direct tag endpoint (works once the git tag exists; 404 is
+// expected for tag-less drafts). Callers keep their own draft/binding
+// checks; this helper only finds by tag.
+function findReleaseByTag(tag) {
+  for (let page = 1; ; page += 1) {
+    const releases = githubApiWithRetry(
+      'GET',
+      `/repos/${repository()}/releases?per_page=100&page=${page}`,
+    );
+    if (!Array.isArray(releases)) throw new Error('GitHub returned invalid release list');
+    const found = releases.find((release) => release?.tag_name === tag);
+    if (found) return found;
+    if (releases.length < 100) break;
+  }
+  try {
+    const byTag = githubApiWithRetry('GET', `/repos/${repository()}/releases/tags/${tag}`);
+    if (byTag?.tag_name === tag) return byTag;
+  } catch {
+    // Drafts have no git tag yet, so 404 here is expected; fall through.
+  }
+  return null;
+}
+
 function uploadReleaseAsset(tag, filePath, { clobber = false, environment = process.env } = {}) {
   const args = ['release', 'upload', tag, '--repo', repository()];
   if (clobber) args.push('--clobber');
   args.push(filePath);
-  runGitHub(args, { environment });
+  // Uploads are idempotent with --clobber, so transient 408/429/5xx are
+  // safe to retry with the same bounded backoff as API lookups.
+  return withGitHubRetry(() => runGitHub(args, { environment }));
 }
 
 module.exports = {
   assertGitHubCliAuthenticated,
+  findReleaseByTag,
   githubApi,
+  githubApiWithRetry,
   githubCliEnvironment,
   githubStatusCode,
+  isRetryableGitHubStatus,
   repository,
   runGitHub,
   uploadReleaseAsset,
+  withGitHubRetry,
 };

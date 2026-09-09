@@ -469,6 +469,10 @@ fn test_clean_result_partial_and_skipped_shapes() {
     }
 }
 
+/// Intentionally weak on headless CI where no Trash exists: accepts Cleaned or
+/// a trash-containing Error so the suite stays green without a desktop session.
+/// Set DEOX_STRICT_TRASH=1 for strict local runs with Trash available, which
+/// require Cleaned success.
 #[test]
 fn test_clean_full_trash_moves_target() {
     let tmp = tempfile::tempdir().unwrap();
@@ -480,6 +484,9 @@ fn test_clean_full_trash_moves_target() {
             assert!(!project.artifact_dir.exists());
         }
         deoxidizer_lib::cleaner::CleanResult::Error { message } => {
+            if std::env::var("DEOX_STRICT_TRASH").as_deref() == Ok("1") {
+                panic!("DEOX_STRICT_TRASH=1 requires Trash success, got error: {message}");
+            }
             assert!(
                 message.to_lowercase().contains("trash"),
                 "trash unsupported, expected trash error, got: {message}"
@@ -621,6 +628,10 @@ fn test_dry_run_selective_modes_are_read_only() {
     }
 }
 
+/// Intentionally weak on headless CI where no Trash exists: accepts Cleaned or
+/// a trash-containing Error so the suite stays green without a desktop session.
+/// Set DEOX_STRICT_TRASH=1 for strict local runs with Trash available, which
+/// require Cleaned success.
 #[test]
 fn test_trash_selective_modes_move_or_error() {
     for mode in [
@@ -648,6 +659,11 @@ fn test_trash_selective_modes_move_or_error() {
                 }
             },
             deoxidizer_lib::cleaner::CleanResult::Error { message } => {
+                if std::env::var("DEOX_STRICT_TRASH").as_deref() == Ok("1") {
+                    panic!(
+                        "DEOX_STRICT_TRASH=1 requires Trash success for {mode}, got error: {message}"
+                    );
+                }
                 assert!(
                     message.to_lowercase().contains("trash"),
                     "trash unsupported, expected trash error for {mode}, got: {message}"
@@ -806,6 +822,7 @@ fn test_clean_partial_on_unreadable_subdir() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
     if fs::read_dir(&locked).is_ok() {
         // Permissions are not enforced (e.g. running as root): premise void.
+        eprintln!("premise void: running as root, perms unenforced; skipping permission test");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         return;
     }

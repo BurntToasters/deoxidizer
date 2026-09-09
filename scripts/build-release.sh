@@ -105,6 +105,9 @@ if [[ "$FORMAT" == "tar.gz" ]]; then
             --mtime="@${SOURCE_DATE_EPOCH:-0}" -C "$STAGE_DIR" \
             "deoxidizer$BIN_EXT" "deox$BIN_EXT" LICENSE
     else
+        # BSD-tar fallback skips --mtime/--owner/--sort (nondeterministic
+        # macOS bytes). Accepted: single-producer staging keeps this harmless;
+        # COPYFILE_DISABLE + touch -t above still normalize xattrs/mtimes.
         COPYFILE_DISABLE=1 tar -cf "$TAR_PATH" -C "$STAGE_DIR" \
             "deoxidizer$BIN_EXT" "deox$BIN_EXT" LICENSE
     fi

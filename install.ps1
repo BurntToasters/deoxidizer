@@ -34,7 +34,7 @@ function Invoke-DownloadWithRetry {
     $lastError = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
-            Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+            Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -TimeoutSec 300
             return
         } catch {
             $lastError = $_
@@ -66,11 +66,12 @@ try {
     } else {
         Write-Host 'Downloading latest release from GitHub...'
         $ProgressPreference = 'SilentlyContinue'
-        $release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
+        $release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest" -TimeoutSec 300
         $version = $release.tag_name -replace '^v',''
         # Validate semver before interpolating into asset names/URLs so a
         # malformed tag cannot inject path segments.
-        if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$') {
+        # Leading-zero classes mirror sync-version.cjs validateVersion.
+        if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$') {
             throw "Invalid release version: $version"
         }
         $processArch = if ($env:PROCESSOR_ARCHITEW6432) {

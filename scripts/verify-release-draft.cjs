@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {
   assertGitHubCliAuthenticated,
-  githubApi,
+  findReleaseByTag,
+  githubApiWithRetry,
   repository,
 } = require('./github-cli.cjs');
 const { spawnSync } = require('node:child_process');
@@ -79,15 +80,15 @@ function validateDraft(release, assets, expectedCommit) {
 }
 
 function findDraft() {
-  const releases = githubApi('GET', `/repos/${repository()}/releases?per_page=100`);
-  if (!Array.isArray(releases)) throw new Error('GitHub returned invalid releases payload');
-  return releases.find((release) => release?.tag_name === tag) || null;
+  // Shared paginated lookup with tag-endpoint fallback (see github-cli.cjs).
+  // Binding checks stay in validateDraft/verifyDraft via target_commitish.
+  return findReleaseByTag(tag);
 }
 
 function listAssets(releaseId) {
   const assets = [];
   for (let page = 1; ; page += 1) {
-    const batch = githubApi(
+    const batch = githubApiWithRetry(
       'GET',
       `/repos/${repository()}/releases/${releaseId}/assets?per_page=100&page=${page}`,
     );

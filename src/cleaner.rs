@@ -312,10 +312,12 @@ fn is_real_directory(path: &Path) -> bool {
 
 /// Helper to collect subdirectories with a specific name.
 ///
-/// No `max_depth` limit is applied: matching relies on the directory name
-/// plus `validate_clean_path` symlink/containment re-checks at clean time,
-/// so deeper triple/profile layouts are fully covered rather than silently
-/// under-cleaned.
+/// Fail-closed depth cap: `max_depth(3)` covers the deepest documented Cargo
+/// triple layout `target/<triple>/<profile>/{incremental,deps}` (exactly
+/// depth 3) while intentionally under-cleaning deeper layouts rather than
+/// risking unbounded traversal/deletion. Name matching plus
+/// `validate_clean_path` symlink/containment re-checks still apply at clean
+/// time.
 fn collect_subdirs_named(
     root: &Path,
     target_name: &str,
@@ -327,6 +329,7 @@ fn collect_subdirs_named(
         .follow_links(false)
         // Root symlinks already rejected by validation; harden explicitly.
         .follow_root_links(false)
+        .max_depth(3)
         .into_iter()
     {
         let entry = result
@@ -348,10 +351,15 @@ fn collect_subdirs_named(
 /// Calculate how many bytes would be freed for a project + mode (for dry run).
 ///
 /// Discovery shares [`paths_to_clean`] with the actual clean path, so dry-run
-/// and clean agree on *which* directories are targeted. When a scan-time
-/// `breakdown` is present the estimate reuses it for speed, but that snapshot
-/// may be stale if the target tree changed after scanning; the `None` path
-/// (and all actual cleans) re-measures via [`validate_and_size`].
+/// and clean agree on *which* directories are targeted under the same
+/// depth-aware (`max_depth(3)`, fail-closed) discovery rule. When a scan-time
+/// `breakdown` is present the estimate reuses it for speed; that snapshot was
+/// built with the same depth rule at scan time but may be stale if the target
+/// tree changed afterwards, so `clean --dry-run` (which re-measures via
+/// [`validate_and_size`]) remains the canonical reclaimable-byte source. The
+/// `None` fallback path (and all actual cleans) re-measures live via
+/// [`validate_and_size`] using the same depth-aware helper. Empty discovery
+/// returns 0 without consulting the snapshot.
 pub fn estimate_freed(project: &DiscoveredProject, mode: &CleanMode) -> Result<u64, String> {
     let paths = paths_to_clean(project, mode)?;
     if paths.is_empty() {

@@ -59,9 +59,13 @@ if [[ -n "${APPLE_KEYCHAIN_PROFILE:-}" ]]; then
     PROFILE="${APPLE_KEYCHAIN_PROFILE:-}"
     NOTARIZE_TEMPS=()
     cleanup_notarize_temps() {
-        for temp in ${NOTARIZE_TEMPS[@]:-}; do
-            [[ -n "$temp" ]] && rm -rf "$temp"
-        done
+        # Quoted expansion avoids word-splitting/globbing; length guard keeps
+        # set -u safe when no notarization temps were staged.
+        if (( ${#NOTARIZE_TEMPS[@]} )); then
+            for temp in "${NOTARIZE_TEMPS[@]}"; do
+                [[ -n "$temp" ]] && rm -rf "$temp"
+            done
+        fi
     }
     trap cleanup_notarize_temps EXIT
     for bin in "${BINARIES[@]}"; do

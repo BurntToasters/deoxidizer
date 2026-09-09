@@ -23,6 +23,8 @@ jobs:
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
+      # Exception: rust-cache stays on mutable @v2 (other actions SHA-pinned).
+      # TODO: SHA-pin to the current v2 digest from the release page.
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --check

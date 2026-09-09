@@ -345,34 +345,68 @@ test('check-changelog rejects a fixture missing BCLS markers', () => {
   assert.match(result.stdout + result.stderr, /missing changelog marker/);
 });
 
+// Fixture pins are read from repo files at runtime so toolchain bumps do not
+// cause fixture drift. The synthetic scripts/release.cjs snippet mirrors the
+// real invocation line asserted below.
+function repoToolchainPins() {
+  const repoRoot = path.resolve(__dirname, '../..');
+  const toolchain = fs
+    .readFileSync(path.join(repoRoot, 'rust-toolchain.toml'), 'utf8')
+    .match(/^channel\s*=\s*"([^"]+)"/m)?.[1];
+  const nodePin = fs.readFileSync(path.join(repoRoot, '.node-version'), 'utf8').trim();
+  const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  const npmPin = /npm@([\d.]+)/.exec(packageJson.packageManager ?? '')?.[1];
+  const npmEngines = packageJson.engines?.npm;
+  const rustVersion = fs
+    .readFileSync(path.join(repoRoot, 'Cargo.toml'), 'utf8')
+    .match(/^rust-version\s*=\s*"([^"]+)"/m)?.[1];
+  assert.ok(toolchain, 'repo rust-toolchain.toml must pin a channel');
+  assert.ok(nodePin, 'repo .node-version must pin a version');
+  assert.ok(npmPin, 'repo package.json must pin packageManager npm');
+  assert.ok(npmEngines, 'repo package.json must declare engines.npm');
+  assert.ok(rustVersion, 'repo Cargo.toml must declare rust-version');
+  return { toolchain, nodePin, npmPin, npmEngines, rustVersion };
+}
+
 function consistentToolchainFixture() {
+  const { toolchain, nodePin, npmPin, npmEngines, rustVersion } = repoToolchainPins();
   const sha = 'a'.repeat(40);
   const workflow = (extra = '') =>
-    `jobs:\n  build:\n    steps:\n      - uses: dtolnay/rust-toolchain@${sha}\n        with:\n          toolchain: 1.98.1\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 24.20.0\n      - run: npm install --global npm@12.0.2\n${extra}`;
+    `jobs:\n  build:\n    steps:\n      - uses: dtolnay/rust-toolchain@${sha}\n        with:\n          toolchain: ${toolchain}\n      - uses: actions/setup-node@v4\n        with:\n          node-version: ${nodePin}\n      - run: npm install --global npm@${npmPin}\n${extra}`;
   return {
-    'rust-toolchain.toml': '[toolchain]\nchannel = "1.98.1"\n',
-    'Cargo.toml': '[package]\nname = "deoxidizer"\nversion = "0.1.0"\nrust-version = "1.98"\n',
-    '.node-version': '24.20.0\n',
+    'rust-toolchain.toml': `[toolchain]\nchannel = "${toolchain}"\n`,
+    'Cargo.toml': `[package]\nname = "deoxidizer"\nversion = "0.1.0"\nrust-version = "${rustVersion}"\n`,
+    '.node-version': `${nodePin}\n`,
     'package.json': JSON.stringify({
-      packageManager: 'npm@12.0.2',
-      engines: { npm: '>=12.0.1' },
+      packageManager: `npm@${npmPin}`,
+      engines: { npm: npmEngines },
     }),
     '.github/workflows/ci.yml': workflow(),
     '.github/workflows/release.yml': workflow(),
     'scripts/release.cjs':
-      "run('rustup', ['target', 'add', '--toolchain', '1.98.1', target], buildEnv);\n",
+      `run('rustup', ['target', 'add', '--toolchain', '${toolchain}', target], buildEnv);\n`,
   };
 }
 
 test('check-toolchain main accepts a consistent fixture, rejects pin drift', () => {
-  const goodDir = stageScript('check-toolchain.cjs', consistentToolchainFixture());
+  const { toolchain } = repoToolchainPins();
+  // The synthetic snippet must mirror the real scripts/release.cjs invocation line.
+  const realRelease = fs.readFileSync(
+    path.join(__dirname, '../../scripts/release.cjs'),
+    'utf8',
+  );
+  const escaped = toolchain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  assert.match(realRelease, new RegExp(`--toolchain',\\s*'${escaped}'`));
+  const fixture = consistentToolchainFixture();
+  assert.ok(fixture['scripts/release.cjs'].includes(`'${toolchain}'`));
+  const goodDir = stageScript('check-toolchain.cjs', fixture);
   const stagedGood = require(path.join(goodDir, 'scripts/check-toolchain.cjs'));
   assert.doesNotThrow(() => stagedGood.main());
   fs.rmSync(goodDir, { recursive: true, force: true });
 
   const badFiles = consistentToolchainFixture();
   badFiles['.github/workflows/ci.yml'] = badFiles['.github/workflows/ci.yml'].replace(
-    'toolchain: 1.98.1',
+    `toolchain: ${toolchain}`,
     'toolchain: 0.0.0',
   );
   const badDir = stageScript('check-toolchain.cjs', badFiles);

@@ -33,7 +33,7 @@
 - **Codebase:** Added deterministic target-aware archives for Linux, macOS, and Windows, including both command binaries and GPL license text.
 - **Testing:** Added scanner, cleaner, configuration, CLI parity, updater, checksum, release-session, and release-draft validation coverage.
 - **Licenses:** Standardized project metadata and distributed documentation on GPL-3.0-or-later.
-- **PKG:** Pinned Rust `1.98.0` and Node.js `24.20.0` release tooling.
+- **PKG:** Pinned Rust `1.98.1` and Node.js `24.20.0` release tooling.
 
 ## ℹ️ Release Info
 

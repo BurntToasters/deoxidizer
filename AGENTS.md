@@ -297,7 +297,7 @@ APPLE_KEYCHAIN_PROFILE=
    - Passphrases enter through stdin, never command-line arguments.
 4. **Node release orchestration:**
    - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state.
-  - `npm run u -- <version>` synchronizes `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and BCLS download metadata.
+    - `npm run u -- <version>` synchronizes `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and BCLS download metadata.
     - `npm run release:windows[:arch]` creates the single draft and uploads Windows artifacts.
        `npm run release:linux[:arch]` and `npm run release:macos[:arch]` wait for that
        draft and upload their artifacts. Release sessions require a clean Git checkout

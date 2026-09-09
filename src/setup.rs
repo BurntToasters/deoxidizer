@@ -198,6 +198,10 @@ pub fn run_setup(args: SetupArgs) {
         ignored_projects,
     };
 
+    let config_path = Config::config_path();
+    if config_path.exists() {
+        backup_existing_config(&config_path);
+    }
     match config.save() {
         Ok(()) => {
             println!();

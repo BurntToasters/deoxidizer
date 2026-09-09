@@ -42,8 +42,8 @@ deox clean                   # confirm and clean
 `clean` always shows project count and estimated space before prompting.
 Use `--yes` only for deliberate non-interactive cleanup.
 
-An empty `scan` reports `No projects with build artifacts found.`, while an
-empty `clean` reports `No projects with cleanable artifacts found.`.
+An empty `scan` and an empty `clean` both report
+`No projects with build artifacts found.` (shared message).
 `inspect` bypasses the configured scope, min-size, and ignored-projects
 filters by design: an explicitly named project is inspected regardless of scan
 preferences (`--scope` can still narrow recognition).
@@ -70,11 +70,13 @@ Useful options:
 --older-than <days>        Only keep projects not modified in N days (scan: display filter only;
                            clean: pre-estimate filter). Projects with unknown modification time are dropped.
 -m, --mode <mode>          Canonical modes: full, debug-only, incremental-only, deps-only (clean).
-                           CLI aliases: debug, incremental, deps. `settings config --default-mode`
-                           accepts loose names (case-insensitive, `_`/`-`, aliases).
+                           CLI is kebab-case, case-insensitive, plus aliases debug, incremental, deps
+                           (e.g. `--mode DEBUG-ONLY` works; `--mode debug_only` is rejected, exit 2).
+                           Underscore forms are only accepted inside the config file via the loose parser.
 --scope <scope>            Override the scope filter for inspection (inspect, default: tauri-and-rust)
 --dry-run                  Preview cleanup without changing files (clean)
--y, --yes                  Skip cleanup confirmation (clean, settings reset)
+-y, --yes                  Skip confirmation prompts (clean, settings reset); setup --yes skips
+                           the overwrite confirmation when `--default` replaces an existing config file
 -d, --default              Apply defaults without prompting (setup)
 -u, --update               Global: verify and install the latest release. Usable alongside subcommands.
 -h, --help                 Print help
@@ -92,10 +94,14 @@ deox settings config [--projects-dir <dir>] [--scope <scope>]
                      [--min-size-mb <mb>] [--ignored-projects <names>]
 ```
 
-`settings config` accepts loose names for `--scope`, `--clean-behavior`, and
-`--default-mode` (case-insensitive, `_`/`-` interchangeable, aliases such as
-`debug`, `incremental`, `deps`, `tauri`, `both`, `rust`). The configuration
-file stores canonical kebab-case values.
+CLI flags (`--mode`, `settings config --scope/--clean-behavior/--default-mode`,
+`inspect --scope`) accept canonical kebab-case values case-insensitively plus
+listed aliases only: modes `debug`, `incremental`, `deps`; scopes `tauri`,
+`both`, `all`, `rust`; behaviors `rm`, `remove`, `recycle`, `bin`
+(e.g. `--mode DEBUG-ONLY` and `--scope TAURI` work; `--mode debug_only` and
+`--scope tauri_only` are rejected, exit 2). Underscore forms such as
+`debug_only` or `tauri_only` are only accepted inside the config file via the
+loose parser. The configuration file stores canonical kebab-case values.
 
 ## Configuration
 
@@ -169,7 +175,7 @@ so do not sum the columns.
 | Symptom | Meaning | Fix |
 | --- | --- | --- |
 | `No projects with build artifacts found.` (scan, bare `deox`) | No in-scope projects passed filters | Run `settings show` to check scope, min-size, and ignored list; `inspect <path>` bypasses those filters |
-| `No projects with cleanable artifacts found.` (clean) | Same filters, clean-time wording differs by design | Same as above; use `clean --dry-run` to preview |
+| `No projects with build artifacts found.` (clean) | No in-scope projects passed filters (same shared message as scan) | Same as above; use `clean --dry-run` to preview |
 | `Configuration error: invalid configuration JSON: ...` / `unsupported configuration version ...` | Malformed or future-version config | Delete `~/.deox_config` or run `deox setup --default` to recreate |
 | `Scan failed: ...` | Bad path, unreadable root, or symlinked scan root | Check `--path` exists, is readable, and is a real directory (not a symlink) |
 | `delete failed: ...` / `trash failed: ...` | Permissions, or full/unavailable Trash | Check permissions; for Trash, empty it or switch to `delete` behavior for deliberate permanent removal |

@@ -360,6 +360,9 @@ fn test_scan_triple_artifact_breakdown() {
 }
 
 /// Backdate a fixture file by whole days (wide margins only, never exact-now).
+/// Whole-day offsets with a 5-day vs 2-day cutoff gap keep the test TZ/DST-safe:
+/// sub-day clock shifts cannot flip the stale/fresh verdict. Shells only
+/// (date/touch or powershell); no new deps by design (avoids Cargo churn).
 fn backdate_file(path: &Path, days_ago: u64) {
     #[cfg(unix)]
     {
@@ -509,11 +512,23 @@ fn test_scan_sort_ties_deterministic() {
     let second = scan_dir(tmp.path(), &Scope::TauriAndRust).unwrap();
     assert_eq!(first.len(), 2);
     assert_eq!(first[0].artifact_size, first[1].artifact_size);
-    // Sorted by size descending at minimum.
-    assert!(first[0].artifact_size >= first[1].artifact_size);
-    // Identical order across repeated scans.
+    // Contract: size descending, name ascending on ties.
     let first_names: Vec<&str> = first.iter().map(|project| project.name.as_str()).collect();
     let second_names: Vec<&str> = second.iter().map(|project| project.name.as_str()).collect();
+    assert_eq!(first_names, ["aaa-app", "zzz-app"]);
+    // Tolerant exact-contract check: results equal sort by (Reverse(size), name).
+    let mut expected = first.clone();
+    expected.sort_by(|a, b| {
+        b.artifact_size
+            .cmp(&a.artifact_size)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let expected_names: Vec<&str> = expected
+        .iter()
+        .map(|project| project.name.as_str())
+        .collect();
+    assert_eq!(first_names, expected_names);
+    // Identical order across repeated scans.
     assert_eq!(first_names, second_names);
 }
 
@@ -535,6 +550,7 @@ fn test_scan_permission_denied_no_panic() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
     if fs::read_dir(&locked).is_ok() {
         // Permissions are not enforced (e.g. running as root): premise void.
+        eprintln!("premise void: running as root, perms unenforced; skipping permission test");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         return;
     }

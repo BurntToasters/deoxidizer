@@ -4,11 +4,23 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
+// Shared [package]-scoped parser from sync-version.cjs; fallback keeps
+// isolated fixture execution (staged without sync-version.cjs) runnable.
+let cargoVersion;
+try {
+  ({ cargoVersion } = require('./sync-version.cjs'));
+} catch {
+  cargoVersion = (cargo) =>
+    cargo.match(/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1] ||
+    (() => {
+      throw new Error('Cargo.toml has no package version');
+    })();
+}
 const manifest = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
 const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
-const version = manifest.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-
-if (!version) throw new Error('Cargo.toml has no package version');
+// Shared [package]-scoped parser; do not use an inline ^version regex here
+// (a dependency's version line could shadow the package version).
+const version = cargoVersion(manifest);
 
 const requiredMarkers = [
   '# ⬇️ Downloads',

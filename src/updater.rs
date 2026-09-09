@@ -670,8 +670,9 @@ fn verify_signed_manifest(manifest: &[u8], signature: &[u8]) -> Result<(), Strin
         if detail.is_empty() {
             return Err("signature does not match pinned release key".to_string());
         }
-        return Err(format!(
-            "signature does not match pinned release key: {detail}"
+        return Err(scrub_temp_dir(
+            format!("signature does not match pinned release key: {detail}"),
+            temp_dir.path(),
         ));
     }
     let status = String::from_utf8_lossy(&verify.stdout);
@@ -701,8 +702,9 @@ fn verify_signed_manifest(manifest: &[u8], signature: &[u8]) -> Result<(), Strin
         if detail.is_empty() {
             return Err("signature is not from the pinned release key".to_string());
         }
-        return Err(format!(
-            "signature is not from the pinned release key: {detail}"
+        return Err(scrub_temp_dir(
+            format!("signature is not from the pinned release key: {detail}"),
+            temp_dir.path(),
         ));
     }
     Ok(())
@@ -837,10 +839,18 @@ fn install_update(archive_bytes: &[u8], asset_name: &str) -> Result<(), InstallF
 
 /// Recursively find a binary by name in a directory.
 fn find_binary_in_dir(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    for entry in walkdir::WalkDir::new(dir)
+    for result in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .follow_root_links(false)
         .into_iter()
-        .filter_map(|e| e.ok())
     {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!("Warning: skipping unreadable entry during update scan: {error}");
+                continue;
+            }
+        };
         if entry.file_type().is_file()
             && !entry.file_type().is_symlink()
             && entry.file_name().to_string_lossy() == name

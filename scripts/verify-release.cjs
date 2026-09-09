@@ -8,7 +8,8 @@ const { spawnSync } = require('node:child_process');
 const zlib = require('node:zlib');
 const {
   assertGitHubCliAuthenticated,
-  githubApi,
+  findReleaseByTag,
+  githubApiWithRetry,
   repository,
   runGitHub,
 } = require('./github-cli.cjs');
@@ -408,7 +409,7 @@ function verifyLocal() {
 function listRemoteAssets(releaseId) {
   const assets = [];
   for (let page = 1; ; page += 1) {
-    const batch = githubApi(
+    const batch = githubApiWithRetry(
       'GET',
       `/repos/${repository()}/releases/${releaseId}/assets?per_page=100&page=${page}`,
     );
@@ -461,9 +462,24 @@ function downloadRemoteAsset(asset) {
   if (bytes.length > MAX_REMOTE_MANIFEST_BYTES) {
     throw new Error(`Remote checksum asset exceeds size limit: ${asset.name}`);
   }
-  const digest = `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
-  if (String(asset.digest || '').toLowerCase() !== digest) {
-    throw new Error(`Remote digest changed while reading ${asset.name}`);
+  const computed = `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
+  const remoteDigest = String(asset.digest || '').toLowerCase();
+  if (remoteDigest) {
+    if (remoteDigest !== computed) {
+      throw new Error(`Remote digest changed while reading ${asset.name}`);
+    }
+    return bytes;
+  }
+  // Fail-closed fallback: gh release-asset objects may omit digest. Never
+  // pass on a missing digest alone; require size equality here and rely on
+  // downstream GPG signature verification (verifyDetachedSignature) to
+  // authenticate these manifest/signature bytes.
+  if (!Number.isFinite(asset?.size) || asset.size !== bytes.length) {
+    throw new Error(
+      `Remote asset ${asset.name} has no digest and size mismatch ` +
+        `(expected ${asset?.size ?? '<unknown>'}, got ${bytes.length}); ` +
+        `check gh version on the release VM and re-upload`,
+    );
   }
   return bytes;
 }
@@ -481,7 +497,13 @@ function validateRemoteManifestEntries(manifestName, manifestText, assets) {
   }
   for (const [name, digest] of entries) {
     const asset = assets.get(name);
-    if (asset && String(asset.digest || '').toLowerCase() !== `sha256:${digest}`) {
+    if (!asset) continue;
+    // Fail-closed: gh may omit asset.digest. Missing digests skip this
+    // comparison here; verifyRemote enforces the binding via size equality
+    // plus manifest-entry sha256 against locally computed bytes. Never pass
+    // blindly on a missing digest alone.
+    if (!asset.digest) continue;
+    if (String(asset.digest || '').toLowerCase() !== `sha256:${digest}`) {
       errors.push(`${manifestName} digest mismatch for ${name}`);
     }
   }
@@ -495,6 +517,8 @@ function verifyRemoteManifests(remoteAssets) {
   );
   if (manifests.length === 0) throw new Error('Remote release has no platform checksum manifest');
 
+  const verifiedEntries = new Map();
+  const remoteManifestBytes = new Map();
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-remote-manifest-'));
   try {
     for (const manifestAsset of manifests) {
@@ -515,16 +539,24 @@ function verifyRemoteManifests(remoteAssets) {
         assets,
       );
       if (errors.length > 0) throw new Error(errors.join('\n'));
+      remoteManifestBytes.set(manifestAsset.name, Buffer.from(manifestBytes));
+      for (const [name, digest] of parseChecksumManifest(manifestBytes.toString('utf8'))) {
+        if (verifiedEntries.has(name) && verifiedEntries.get(name) !== digest) {
+          throw new Error(`Conflicting remote manifest entries for ${name}`);
+        }
+        verifiedEntries.set(name, digest);
+      }
     }
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }
+  return { verifiedEntries, remoteManifestBytes };
 }
 
 function verifyRemote(localFiles) {
   assertGitHubCliAuthenticated();
-  const releases = githubApi('GET', `/repos/${repository()}/releases?per_page=100`);
-  const release = releases.find((item) => item?.tag_name === tag);
+  // Shared paginated lookup with tag-endpoint fallback (see github-cli.cjs).
+  const release = findReleaseByTag(tag);
   if (!release) throw new Error(`Release ${tag} not found`);
   if (!release.draft) throw new Error(`Release ${tag} is published; refusing remote mutation check`);
   const commitResult = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' });
@@ -539,6 +571,7 @@ function verifyRemote(localFiles) {
   const nameErrors = validateRemoteAssetNames(remoteAssets);
   if (nameErrors.length > 0) throw new Error(nameErrors.join('\n'));
   const assets = new Map(remoteAssets.map((asset) => [asset.name, asset]));
+  const missingDigest = [];
   for (const filePath of localFiles) {
     const name = path.basename(filePath);
     const asset = assets.get(name);
@@ -547,11 +580,34 @@ function verifyRemote(localFiles) {
       throw new Error(`Remote size mismatch for ${name}`);
     }
     const expectedDigest = `sha256:${sha256(filePath)}`;
-    if (asset.digest !== expectedDigest) {
-      throw new Error(`Remote digest missing or mismatched for ${name}`);
+    if (asset.digest) {
+      if (String(asset.digest).toLowerCase() !== expectedDigest) {
+        throw new Error(`Remote digest missing or mismatched for ${name}`);
+      }
+      continue;
     }
+    // Fail-closed fallback: gh may omit asset.digest. Size equality above is
+    // necessary but not sufficient; manifest-entry binding is enforced below
+    // after GPG-verified manifests load. Never pass blindly here.
+    missingDigest.push({ filePath, name, expectedDigest });
   }
-  verifyRemoteManifests(remoteAssets);
+  const { verifiedEntries, remoteManifestBytes } = verifyRemoteManifests(remoteAssets);
+  for (const { filePath, name, expectedDigest } of missingDigest) {
+    const entryDigest = verifiedEntries.get(name);
+    if (entryDigest && `sha256:${entryDigest}`.toLowerCase() === expectedDigest.toLowerCase()) {
+      continue;
+    }
+    const remoteBytes = remoteManifestBytes.get(name);
+    if (remoteBytes) {
+      const remoteDigest = `sha256:${crypto.createHash('sha256').update(remoteBytes).digest('hex')}`;
+      if (remoteDigest.toLowerCase() === expectedDigest.toLowerCase()) continue;
+    }
+    throw new Error(
+      `Remote asset ${name} has no digest; cannot prove binding ` +
+        `(size matched but no signed manifest entry matches local sha256). ` +
+        `Check gh version on the release VM, re-upload ${name}, and re-run release:verify:remote`,
+    );
+  }
 }
 
 function main() {

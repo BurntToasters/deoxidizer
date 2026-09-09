@@ -104,7 +104,8 @@ fn update_settings(args: SettingsConfigArgs) {
 
     // Clap `ValueEnum` already rejects unknown scope/behavior/mode values
     // (exit 2 with possible values); `from_str_loose` in `config.rs` remains
-    // for settings-file/back-compat, not CLI parsing.
+    // for CLI/settings input compat only; the tool writes kebab-case via
+    // `Display` and the config file requires kebab-case strict serde.
     if let Some(scope) = args.scope {
         config.scope = scope;
         changed = true;
@@ -213,7 +214,7 @@ fn reset_settings(args: SettingsResetArgs) {
                 return;
             }
             Err(error) => {
-                eprintln!("Reset cancelled: {error}.");
+                eprintln!("Reset cancelled: {error} (use --yes to skip confirmation).");
                 std::process::exit(1);
             }
         }
