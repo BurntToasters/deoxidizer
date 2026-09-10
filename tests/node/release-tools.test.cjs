@@ -25,7 +25,7 @@ const {
   validateRemoteManifestEntries,
 } = require('../../scripts/verify-release.cjs');
 const { validateFresh, validateIdentity } = require('../../scripts/release-session.cjs');
-const { requireConfirmation } = require('../../scripts/branch-sync.cjs');
+const { requireConfirmation, parseArgs } = require('../../scripts/branch-sync.cjs');
 const { requireConfirmation: requireViConfirmation } = require('../../scripts/vi.cjs');
 const {
   requireConfirmation: requirePruneConfirmation,
@@ -203,6 +203,19 @@ test('destructive branch sync requires explicit confirmation', () => {
   assert.throws(() => requireConfirmation(), /DEOX_RELEASE_CONFIRM=YES/);
   if (previous === undefined) delete process.env.DEOX_RELEASE_CONFIRM;
   else process.env.DEOX_RELEASE_CONFIRM = previous;
+});
+
+test('branch sync --force-always bypasses confirmation gate', () => {
+  assert.deepEqual(parseArgs(['main', '--force-always']), {
+    branch: 'main',
+    forceAlways: true,
+  });
+  assert.deepEqual(parseArgs(['main']), { branch: 'main', forceAlways: false });
+  assert.deepEqual(parseArgs(['--force-always', 'beta']), {
+    branch: 'beta',
+    forceAlways: true,
+  });
+  assert.throws(() => parseArgs(['main', '--bogus']), /unknown flag/);
 });
 
 test('draft validator requires every supported target manifest and archive', () => {
