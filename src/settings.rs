@@ -2,18 +2,18 @@ use crate::cli::{SettingsAction, SettingsArgs, SettingsConfigArgs, SettingsReset
 use crate::config::{Config, ConfigError};
 use colored::Colorize;
 
-pub fn run_settings(args: SettingsArgs) {
+pub fn run_settings(args: SettingsArgs, config_override: Option<&std::path::PathBuf>) {
+    let config_path: std::path::PathBuf =
+        config_override.cloned().unwrap_or_else(Config::config_path);
     match args.action {
-        SettingsAction::Show => show_settings(),
-        SettingsAction::Config(config_args) => update_settings(config_args),
-        SettingsAction::Reset(reset_args) => reset_settings(reset_args),
+        SettingsAction::Show => show_settings(&config_path),
+        SettingsAction::Config(config_args) => update_settings(config_args, &config_path),
+        SettingsAction::Reset(reset_args) => reset_settings(reset_args, &config_path),
     }
 }
 
-fn show_settings() {
-    let config_path = Config::config_path();
-
-    let config = match Config::load() {
+fn show_settings(config_path: &std::path::Path) {
+    let config = match Config::load_from(config_path) {
         Ok(config) => config,
         Err(ConfigError::Missing(_)) => {
             println!();
@@ -76,9 +76,10 @@ fn show_settings() {
     println!();
 }
 
-fn update_settings(args: SettingsConfigArgs) {
-    let mut config = match Config::load_or_default() {
+fn update_settings(args: SettingsConfigArgs, config_path: &std::path::Path) {
+    let mut config = match Config::load_from(config_path) {
         Ok(config) => config,
+        Err(ConfigError::Missing(_)) => Config::default(),
         Err(error) => {
             eprintln!("  {} Failed to load settings: {error}.", "✗".red().bold());
             std::process::exit(1);
@@ -180,7 +181,7 @@ fn update_settings(args: SettingsConfigArgs) {
         std::process::exit(2);
     }
     if changed {
-        match config.save() {
+        match config.save_to(config_path) {
             Ok(()) => {
                 for line in pending {
                     println!("{line}");
@@ -198,7 +199,7 @@ fn update_settings(args: SettingsConfigArgs) {
     println!("Run 'deox settings show' to view current settings.");
 }
 
-fn reset_settings(args: SettingsResetArgs) {
+fn reset_settings(args: SettingsResetArgs, config_path: &std::path::Path) {
     if !args.yes {
         use dialoguer::Confirm;
         // Declining (Ok(false)) is a normal cancel with exit 0; only prompt
@@ -221,7 +222,7 @@ fn reset_settings(args: SettingsResetArgs) {
     }
 
     let config = Config::default();
-    match config.save() {
+    match config.save_to(config_path) {
         Ok(()) => {
             println!("  {} Settings reset to defaults.", "✓".green().bold());
         }

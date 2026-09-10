@@ -113,15 +113,23 @@ fn malformed_config_does_not_fall_back_to_destructive_defaults() {
 #[test]
 fn invalid_settings_exit_nonzero_without_writing_config() {
     let home = tempfile::tempdir().unwrap();
+    let config_path = home.path().join(".deox_config");
     let mut command = Command::new(env!("CARGO_BIN_EXE_deox"));
     apply_home_env(&mut command, home.path());
     let output = command
-        .args(["settings", "config", "--scope", "invalid"])
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "settings",
+            "config",
+            "--scope",
+            "invalid",
+        ])
         .output()
         .unwrap();
 
     assert!(!output.status.success());
-    assert!(!home.path().join(".deox_config").exists());
+    assert!(!config_path.exists());
 }
 
 #[test]
@@ -143,6 +151,7 @@ fn scan_help_output_parity_between_binaries() {
     for stdout in [&deoxidizer_stdout, &deox_stdout] {
         assert!(stdout.contains("--path"));
         assert!(stdout.contains("--min-size"));
+        assert!(stdout.contains("--config"));
     }
     // Usage line embeds the invoked binary name, so normalize before comparing.
     let normalized = deoxidizer_stdout.replace("deoxidizer", "deox");
@@ -172,12 +181,20 @@ fn inspect_missing_path_exit_codes_match_between_binaries() {
 #[test]
 fn setup_default_writes_config_to_home() {
     let home = tempfile::tempdir().unwrap();
+    let config_path = home.path().join(".deox_config");
     let mut command = Command::new(env!("CARGO_BIN_EXE_deox"));
     apply_home_env(&mut command, home.path());
-    let output = command.args(["setup", "--default"]).output().unwrap();
+    let output = command
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "setup",
+            "--default",
+        ])
+        .output()
+        .unwrap();
 
     assert!(output.status.success());
-    let config_path = home.path().join(".deox_config");
     assert!(config_path.exists());
     let content = std::fs::read_to_string(&config_path).unwrap();
     assert!(content.contains("\"version\": 2"));
@@ -197,6 +214,8 @@ fn test_clean_dry_run_parity_between_binaries() {
         apply_home_env(&mut command, home.path());
         let output = command
             .args([
+                "--config",
+                home.path().join(".deox_config").to_str().unwrap(),
                 "clean",
                 "--dry-run",
                 "--yes",
@@ -270,13 +289,54 @@ fn test_inspect_help_parity_between_binaries() {
 #[test]
 fn test_invalid_settings_config_default_mode_exits_nonzero() {
     let home = tempfile::tempdir().unwrap();
+    let config_path = home.path().join(".deox_config");
     let mut command = Command::new(env!("CARGO_BIN_EXE_deox"));
     apply_home_env(&mut command, home.path());
     let output = command
-        .args(["settings", "config", "--default-mode", "invalid"])
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "settings",
+            "config",
+            "--default-mode",
+            "invalid",
+        ])
         .output()
         .unwrap();
 
     assert!(!output.status.success());
-    assert!(!home.path().join(".deox_config").exists());
+    assert!(!config_path.exists());
+}
+
+#[test]
+fn config_override_missing_file_refuses_clean_but_scans_with_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("no-such-config.json");
+    assert!(!missing.exists());
+
+    let clean = Command::new(env!("CARGO_BIN_EXE_deox"))
+        .args([
+            "--config",
+            missing.to_str().unwrap(),
+            "clean",
+            "--dry-run",
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert!(!clean.status.success());
+    assert_eq!(clean.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&clean.stderr).contains("No configuration found"));
+
+    let scan = Command::new(env!("CARGO_BIN_EXE_deox"))
+        .args([
+            "--config",
+            missing.to_str().unwrap(),
+            "scan",
+            "--path",
+            temp.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(scan.status.success());
 }

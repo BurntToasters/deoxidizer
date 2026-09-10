@@ -5,15 +5,19 @@ use dialoguer::{Confirm, Input, Select};
 
 /// Run the setup wizard.
 /// If `use_defaults` is true, apply defaults without prompting.
-pub fn run_setup(args: SetupArgs) {
+/// `config_override` selects the file to write (explicit `--config`);
+/// otherwise the default home config path is used.
+pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) {
+    use std::path::PathBuf;
+
     let use_defaults = args.use_defaults;
+    let config_path: PathBuf = config_override.cloned().unwrap_or_else(Config::config_path);
     println!();
     println!("  {} deoxidizer setup", "🔧".bold());
     println!("  {}", "─".repeat(40).dimmed());
     println!();
 
     if use_defaults {
-        let config_path = Config::config_path();
         if config_path.exists() && !args.yes {
             match Confirm::new()
                 .with_prompt(format!(
@@ -38,12 +42,12 @@ pub fn run_setup(args: SetupArgs) {
             backup_existing_config(&config_path);
         }
         let config = Config::default();
-        match config.save() {
+        match config.save_to(&config_path) {
             Ok(()) => {
                 println!(
                     "  {} Default configuration saved to {}",
                     "✓".green().bold(),
-                    Config::config_path().display()
+                    config_path.display()
                 );
                 println!();
                 print_config_summary(&config);
@@ -198,17 +202,16 @@ pub fn run_setup(args: SetupArgs) {
         ignored_projects,
     };
 
-    let config_path = Config::config_path();
     if config_path.exists() {
         backup_existing_config(&config_path);
     }
-    match config.save() {
+    match config.save_to(&config_path) {
         Ok(()) => {
             println!();
             println!(
                 "  {} Configuration saved to {}",
                 "✓".green().bold(),
-                Config::config_path().display()
+                config_path.display()
             );
             println!();
             print_config_summary(&config);

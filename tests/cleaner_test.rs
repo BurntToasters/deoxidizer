@@ -514,6 +514,16 @@ fn apply_home_env(command: &mut Command, home: &std::path::Path) {
     command.env("HOME", home);
 }
 
+fn assert_cli_success(output: &std::process::Output, what: &str) {
+    assert!(
+        output.status.success(),
+        "{what} failed with status {}.\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 fn create_cli_project(projects_dir: &std::path::Path) -> std::path::PathBuf {
     let root = projects_dir.join("test-project");
     fs::create_dir_all(&root).unwrap();
@@ -533,11 +543,19 @@ fn test_cli_clean_dry_run_is_read_only() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_deox"));
     apply_home_env(&mut command, home.path());
     let output = command
-        .args(["clean", "--dry-run", "--yes", "--mode", "full"])
+        .args([
+            "--config",
+            home.path().join(".deox_config").to_str().unwrap(),
+            "clean",
+            "--dry-run",
+            "--yes",
+            "--mode",
+            "full",
+        ])
         .output()
         .unwrap();
 
-    assert!(output.status.success());
+    assert_cli_success(&output, "clean --dry-run");
     assert!(sentinel.exists());
     assert!(root.join("target").exists());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -555,6 +573,8 @@ fn test_cli_clean_older_than_filters_fresh_artifacts() {
     apply_home_env(&mut command, home.path());
     let output = command
         .args([
+            "--config",
+            home.path().join(".deox_config").to_str().unwrap(),
             "clean",
             "--dry-run",
             "--yes",
@@ -566,7 +586,7 @@ fn test_cli_clean_older_than_filters_fresh_artifacts() {
         .output()
         .unwrap();
 
-    assert!(output.status.success());
+    assert_cli_success(&output, "clean --older-than");
     assert!(root.join("target").exists());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("No projects"));
@@ -584,6 +604,8 @@ fn test_cli_clean_path_override_is_read_only() {
     apply_home_env(&mut command, home.path());
     let output = command
         .args([
+            "--config",
+            home.path().join(".deox_config").to_str().unwrap(),
             "clean",
             "--dry-run",
             "--yes",
@@ -593,7 +615,7 @@ fn test_cli_clean_path_override_is_read_only() {
         .output()
         .unwrap();
 
-    assert!(output.status.success());
+    assert_cli_success(&output, "clean --path override");
     assert!(root.join("target").exists());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("test-project"));

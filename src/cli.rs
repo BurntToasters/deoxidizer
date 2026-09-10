@@ -27,6 +27,17 @@ pub struct Cli {
     /// Check for updates and self-update the binary.
     #[arg(short = 'u', long = "update")]
     pub update: bool,
+
+    /// Use a specific config file instead of ~/.deox_config.
+    /// (Portable installs, testing, multiple profiles. `inspect` ignores
+    /// stored config by design, so this flag is a no-op there.)
+    #[arg(
+        long = "config",
+        global = true,
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath
+    )]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -238,28 +249,28 @@ pub fn run_app() {
         return;
     }
 
+    let config_override = cli.config.clone();
+    let config_path = config_override.as_ref();
+
     match cli.command {
         Some(Commands::Setup(args)) => {
-            crate::setup::run_setup(args);
+            crate::setup::run_setup(args, config_path);
         }
         Some(Commands::Clean(args)) => {
-            run_clean(args);
+            run_clean(args, config_path);
         }
         Some(Commands::Scan(args)) => {
-            run_scan(args);
+            run_scan(args, config_path);
         }
         Some(Commands::Settings(args)) => {
-            crate::settings::run_settings(args);
+            crate::settings::run_settings(args, config_path);
         }
         Some(Commands::Inspect(args)) => {
             run_inspect(args);
         }
         None => {
-            let config = match Config::load_or_default() {
-                Ok(config) => config,
-                Err(error) => exit_with_config_error(error),
-            };
-            if !Config::config_path().exists() {
+            let config = load_config_or_default(config_path);
+            if !effective_config_path(config_path).exists() {
                 eprintln!(
                     "No configuration found. Run 'deox setup' first, or 'deox setup --default' for quick defaults."
                 );
@@ -272,7 +283,7 @@ pub fn run_app() {
                     eprintln!(
                         "Scan failed for '{}' (config {}): {error}.",
                         config.projects_dir,
-                        Config::config_path().display()
+                        effective_config_path(config_path).display()
                     );
                     std::process::exit(1);
                 }
@@ -282,21 +293,53 @@ pub fn run_app() {
     }
 }
 
-fn run_clean(args: CleanArgs) {
-    use crate::cleaner::{self, CleanMode};
-    use crate::display;
-    use crate::scanner;
-    use colored::Colorize;
-    use humansize::{format_size, BINARY};
+/// Config path shown in messages: explicit `--config` or the default home path.
+fn effective_config_path(config_override: Option<&PathBuf>) -> PathBuf {
+    config_override.cloned().unwrap_or_else(Config::config_path)
+}
 
-    let mut config = match Config::load() {
+/// Strict load for commands that refuse to run without a config file.
+/// An explicit `--config` path is honored the same way as the default path:
+/// a missing file refuses, corrupt content fails closed.
+fn load_config_strict(config_override: Option<&PathBuf>) -> Config {
+    let result = match config_override {
+        Some(path) => Config::load_from(path),
+        None => Config::load(),
+    };
+    match result {
         Ok(config) => config,
         Err(ConfigError::Missing(_)) => {
             eprintln!("No configuration found. Run 'deox setup' before cleaning.");
             std::process::exit(1);
         }
         Err(error) => exit_with_config_error(error),
+    }
+}
+
+/// Lenient load for commands that fall back to defaults when no config exists.
+fn load_config_or_default(config_override: Option<&PathBuf>) -> Config {
+    let result = match config_override {
+        Some(path) => match Config::load_from(path) {
+            Ok(config) => Ok(config),
+            Err(ConfigError::Missing(_)) => Ok(Config::default()),
+            Err(error) => Err(error),
+        },
+        None => Config::load_or_default(),
     };
+    match result {
+        Ok(config) => config,
+        Err(error) => exit_with_config_error(error),
+    }
+}
+
+fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
+    use crate::cleaner::{self, CleanMode};
+    use crate::display;
+    use crate::scanner;
+    use colored::Colorize;
+    use humansize::{format_size, BINARY};
+
+    let mut config = load_config_strict(config_override);
 
     apply_scan_overrides(&mut config, args.path.as_ref(), args.min_size);
 
@@ -312,7 +355,7 @@ fn run_clean(args: CleanArgs) {
             eprintln!(
                 "Scan failed for '{}' (config {}): {error}.",
                 config.projects_dir,
-                Config::config_path().display()
+                effective_config_path(config_override).display()
             );
             std::process::exit(1);
         }
@@ -408,15 +451,11 @@ fn run_clean(args: CleanArgs) {
     }
 }
 
-fn run_scan(args: ScanArgs) {
-    use crate::config::Config;
+fn run_scan(args: ScanArgs, config_override: Option<&PathBuf>) {
     use crate::display;
     use crate::scanner;
 
-    let mut config = match Config::load_or_default() {
-        Ok(config) => config,
-        Err(error) => exit_with_config_error(error),
-    };
+    let mut config = load_config_or_default(config_override);
 
     apply_scan_overrides(&mut config, args.path.as_ref(), args.min_size);
 
@@ -427,7 +466,7 @@ fn run_scan(args: ScanArgs) {
             eprintln!(
                 "Scan failed for '{}' (config {}): {error}.",
                 config.projects_dir,
-                Config::config_path().display()
+                effective_config_path(config_override).display()
             );
             std::process::exit(1);
         }
