@@ -79,6 +79,8 @@ Useful options:
                            the overwrite confirmation when `--default` replaces an existing config file
 -d, --default              Apply defaults without prompting (setup)
 -u, --update               Global: verify and install the latest release. Usable alongside subcommands.
+--config <path>            Global: use a specific config file instead of ~/.deox_config
+                           (portable installs, testing, multiple profiles; no-op for inspect).
 -h, --help                 Print help
 -V, --version              Print version
 ```
@@ -105,7 +107,9 @@ loose parser. The configuration file stores canonical kebab-case values.
 
 ## Configuration
 
-Configuration lives at `~/.deox_config`.
+Configuration lives at `~/.deox_config`. Override per run with
+`deox --config <path> <command>` (the home directory is resolved via OS
+known folders, so `%USERPROFILE%` overrides are not honored on Windows).
 
 Example (non-default values shown):
 
