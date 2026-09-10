@@ -1,5 +1,7 @@
 use deoxidizer_lib::config::{Config, Scope};
-use deoxidizer_lib::scanner::{scan, scan_dir, ScanError};
+#[cfg(unix)]
+use deoxidizer_lib::scanner::ScanError;
+use deoxidizer_lib::scanner::{scan, scan_dir};
 use std::fs;
 use std::path::Path;
 
