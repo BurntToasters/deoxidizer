@@ -1008,6 +1008,11 @@ fn extract_zip(archive_bytes: &[u8], destination: &Path) -> Result<(), String> {
                 .map_err(|error| format!("Failed to create {raw_name}: {error}"))?;
             continue;
         }
+        // Mirror `extract_tar`: setuid/setgid entries reject the whole
+        // archive fail-closed instead of landing on disk stripped.
+        if unix_mode.is_some_and(|mode| mode & 0o6000 != 0) {
+            return Err(format!("archive contains setuid/setgid entry {raw_name}"));
+        }
         // Declared-size precheck; authoritative accounting uses the actual
         // `io::copy` byte count below.
         let declared = entry.size();
@@ -1039,7 +1044,8 @@ fn extract_zip(archive_bytes: &[u8], destination: &Path) -> Result<(), String> {
         if extracted_bytes > MAX_EXTRACTED_BYTES {
             return Err("archive exceeds extracted size limit".to_string());
         }
-        // Honor the entry's unix mode when present (stripping setuid/setgid);
+        // Honor the entry's unix mode when present (setuid/setgid already
+        // rejected above, so `0o777` only carries ordinary permission bits);
         // otherwise leave permissions alone. Only the located binary is made
         // executable later in `install_update` — never every file.
         #[cfg(unix)]
@@ -1060,6 +1066,70 @@ fn extract_zip(archive_bytes: &[u8], destination: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// Build an in-memory stored (uncompressed) zip; always available with
+    /// the deflate-only feature set, so tests need no extra features.
+    fn build_zip(entries: &[(&str, u32, &[u8])]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            for (name, mode, data) in entries {
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored)
+                    .unix_permissions(*mode);
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(data).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn extract_to_scratch(zip_bytes: &[u8]) -> (tempfile::TempDir, Result<(), String>) {
+        let dir = tempfile::Builder::new()
+            .prefix("deoxidizer-test-")
+            .tempdir()
+            .unwrap();
+        let result = extract_zip(zip_bytes, dir.path());
+        (dir, result)
+    }
+
+    /// Overwrite the first central-directory entry's declared uncompressed
+    /// size (little-endian u32 at signature+24) to simulate a lying header.
+    fn patch_central_uncompressed_size(zip_bytes: &mut [u8], file_name: &str, new_size: u32) {
+        let pos = zip_bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .expect("central directory header");
+        let name_len = u16::from_le_bytes([zip_bytes[pos + 28], zip_bytes[pos + 29]]) as usize;
+        assert_eq!(
+            &zip_bytes[pos + 46..pos + 46 + name_len],
+            file_name.as_bytes()
+        );
+        zip_bytes[pos + 24..pos + 28].copy_from_slice(&new_size.to_le_bytes());
+    }
+
+    /// Overwrite the first central-directory entry's external attributes
+    /// (little-endian u32 at signature+38). The public writer API masks
+    /// modes to `0o777`, so attacker-controlled file-type/setuid bits can
+    /// only be simulated by patching the raw header — which is also exactly
+    /// what a malicious archive on the wire looks like.
+    fn patch_central_external_attributes(zip_bytes: &mut [u8], attrs: u32) {
+        let pos = zip_bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .expect("central directory header");
+        zip_bytes[pos + 38..pos + 42].copy_from_slice(&attrs.to_le_bytes());
+    }
+
+    fn assert_contained(dir: &tempfile::TempDir) {
+        for result in walkdir::WalkDir::new(dir.path()).follow_links(false) {
+            let entry = result.unwrap();
+            assert!(entry.path().starts_with(dir.path()));
+            assert!(!entry.file_type().is_symlink());
+        }
+    }
 
     #[test]
     fn checksum_requires_exact_asset_entry() {
@@ -1109,6 +1179,94 @@ mod tests {
         assert!(validate_archive_path(Path::new("deoxidizer")).is_ok());
         assert!(validate_archive_path(Path::new("../outside")).is_err());
         assert!(validate_archive_path(Path::new("/absolute")).is_err());
+    }
+
+    #[test]
+    fn zip_symlink_entry_rejects_whole_archive() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.add_symlink("link", "target", options).unwrap();
+            writer.finish().unwrap();
+        }
+        let (dir, result) = extract_to_scratch(&buf.into_inner());
+        let error = result.expect_err("symlink entry must be rejected");
+        assert!(error.contains("link entry"), "unexpected: {error}");
+        assert_contained(&dir);
+    }
+
+    #[test]
+    fn zip_setuid_and_setgid_entries_reject_whole_archive() {
+        for mode in [0o104755, 0o102755, 0o106755] {
+            let mut zip_bytes = build_zip(&[("tool", 0o644, b"binary")]);
+            patch_central_external_attributes(&mut zip_bytes, (mode as u32) << 16);
+            let (dir, result) = extract_to_scratch(&zip_bytes);
+            let error = result.expect_err("setuid/setgid entry must be rejected");
+            assert!(error.contains("setuid/setgid"), "unexpected: {error}");
+            assert_contained(&dir);
+        }
+    }
+
+    #[test]
+    fn zip_backslash_traversal_and_absolute_paths_rejected() {
+        for name in ["evil\\tool", "..\\tool", "../evil", "/absolute/evil", ".."] {
+            let zip_bytes = build_zip(&[(name, 0o644, b"x")]);
+            let (dir, result) = extract_to_scratch(&zip_bytes);
+            assert!(result.is_err(), "name must be rejected: {name}");
+            assert_contained(&dir);
+        }
+    }
+
+    #[test]
+    fn zip_curdir_prefix_extracts_inside_destination() {
+        let zip_bytes = build_zip(&[("./deoxidizer", 0o644, b"binary")]);
+        let (dir, result) = extract_to_scratch(&zip_bytes);
+        result.expect("CurDir-prefixed path must extract");
+        assert_eq!(fs::read(dir.path().join("deoxidizer")).unwrap(), b"binary");
+        assert_contained(&dir);
+    }
+
+    #[test]
+    fn zip_valid_entry_extracts_with_content_intact() {
+        let zip_bytes = build_zip(&[("deoxidizer", 0o644, b"binary-bytes")]);
+        let (dir, result) = extract_to_scratch(&zip_bytes);
+        result.expect("valid entry must extract");
+        assert_eq!(
+            fs::read(dir.path().join("deoxidizer")).unwrap(),
+            b"binary-bytes"
+        );
+        assert_contained(&dir);
+    }
+
+    #[test]
+    fn zip_lying_declared_size_hits_precheck_before_disk_write() {
+        let mut zip_bytes = build_zip(&[("tool", 0o644, b"tiny")]);
+        patch_central_uncompressed_size(&mut zip_bytes, "tool", 600_000_000);
+        let (dir, result) = extract_to_scratch(&zip_bytes);
+        let error = result.expect_err("declared-size bomb must be rejected");
+        assert!(
+            error.contains("exceeds extracted size limit"),
+            "unexpected: {error}"
+        );
+        assert_contained(&dir);
+    }
+
+    #[test]
+    fn zip_non_utf8_name_cannot_escape_destination() {
+        let mut zip_bytes = build_zip(&[("tool", 0o644, b"tiny")]);
+        // Corrupt the central-directory filename to invalid UTF-8; the
+        // reader lossy-converts it, and every downstream check still applies.
+        let pos = zip_bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .expect("central directory header");
+        zip_bytes[pos + 46] = 0xFF;
+        let (dir, result) = extract_to_scratch(&zip_bytes);
+        // Either outcome is safe as long as nothing escapes the destination.
+        let _ = result;
+        assert_contained(&dir);
     }
 
     #[test]

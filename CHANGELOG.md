@@ -34,6 +34,7 @@
 - **Testing:** Added scanner, cleaner, configuration, CLI parity, updater, checksum, release-session, and release-draft validation coverage.
 - **Licenses:** Standardized project metadata and distributed documentation on GPL-3.0-or-later.
 - **PKG:** Pinned Rust `1.98.1` and Node.js `24.20.0` release tooling.
+- **PKG:** Updated dependencies (`dirs 7`, `dialoguer 0.12`, `sha2 0.11`, `toml 1.x`, `zip 8`).
 
 ## ℹ️ Release Info
 

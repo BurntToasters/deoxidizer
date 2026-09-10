@@ -257,7 +257,11 @@ fn read_manifest(path: &Path) -> Option<Value> {
             return None;
         }
     };
-    match content.parse::<Value>() {
+    // NOTE: `toml::from_str` (document semantics) is required here, not
+    // `str::parse::<Value>()`: since toml 1.x the latter parses a single
+    // TOML *value*, so a table-header document like `[package]` fails with
+    // "unexpected content, expected nothing".
+    match toml::from_str::<Value>(&content) {
         Ok(manifest) => Some(manifest),
         Err(error) => {
             eprintln!(
