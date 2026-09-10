@@ -1,7 +1,5 @@
 use deoxidizer_lib::config::{CleanBehavior, Config, ConfigError, DefaultMode, Scope};
 
-static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn test_default_config() {
     let config = Config::default();
@@ -152,7 +150,6 @@ fn test_config_path() {
 
 #[test]
 fn test_tilde_expansion() {
-    let _guard = ENV_GUARD.lock().unwrap();
     let mut config = Config {
         projects_dir: "~".to_string(),
         ..Default::default()
@@ -282,23 +279,10 @@ fn test_unknown_fields_are_rejected() {
 
 #[test]
 fn test_load_or_default_falls_back_when_missing() {
-    let _guard = ENV_GUARD.lock().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let previous_home = std::env::var_os("HOME");
-    let previous_profile = std::env::var_os("USERPROFILE");
-    std::env::set_var("HOME", home.path());
-    std::env::set_var("USERPROFILE", home.path());
+    let config_path = home.path().join(".deox_config");
 
-    let result = Config::load_or_default();
-
-    match previous_home {
-        Some(value) => std::env::set_var("HOME", value),
-        None => std::env::remove_var("HOME"),
-    }
-    match previous_profile {
-        Some(value) => std::env::set_var("USERPROFILE", value),
-        None => std::env::remove_var("USERPROFILE"),
-    }
+    let result = Config::load_or_default_from(&config_path);
 
     let config = result.expect("missing config should fall back to defaults");
     assert_eq!(config.version, 2);
@@ -306,24 +290,11 @@ fn test_load_or_default_falls_back_when_missing() {
 
 #[test]
 fn test_load_or_default_propagates_malformed() {
-    let _guard = ENV_GUARD.lock().unwrap();
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join(".deox_config"), "{not-json").unwrap();
-    let previous_home = std::env::var_os("HOME");
-    let previous_profile = std::env::var_os("USERPROFILE");
-    std::env::set_var("HOME", home.path());
-    std::env::set_var("USERPROFILE", home.path());
+    let config_path = home.path().join(".deox_config");
+    std::fs::write(&config_path, "{not-json").unwrap();
 
-    let result = Config::load_or_default();
-
-    match previous_home {
-        Some(value) => std::env::set_var("HOME", value),
-        None => std::env::remove_var("HOME"),
-    }
-    match previous_profile {
-        Some(value) => std::env::set_var("USERPROFILE", value),
-        None => std::env::remove_var("USERPROFILE"),
-    }
+    let result = Config::load_or_default_from(&config_path);
 
     assert!(matches!(result, Err(ConfigError::Parse(_))));
 }

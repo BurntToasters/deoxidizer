@@ -247,7 +247,15 @@ impl Config {
 
     /// Load config, using defaults only when no config file exists.
     pub fn load_or_default() -> Result<Self, ConfigError> {
-        match Self::load() {
+        let path = Self::try_config_path()?;
+        Self::load_or_default_from(&path)
+    }
+
+    /// Load config from a specific path, using defaults only when the file
+    /// does not exist. Other errors (malformed JSON, unsupported version)
+    /// propagate so callers never silently fall back on corrupt config.
+    pub fn load_or_default_from(path: &Path) -> Result<Self, ConfigError> {
+        match Self::load_from(path) {
             Ok(config) => Ok(config),
             Err(ConfigError::Missing(_)) => Ok(Self::default()),
             Err(error) => Err(error),

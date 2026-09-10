@@ -319,11 +319,7 @@ fn load_config_strict(config_override: Option<&PathBuf>) -> Config {
 /// Lenient load for commands that fall back to defaults when no config exists.
 fn load_config_or_default(config_override: Option<&PathBuf>) -> Config {
     let result = match config_override {
-        Some(path) => match Config::load_from(path) {
-            Ok(config) => Ok(config),
-            Err(ConfigError::Missing(_)) => Ok(Config::default()),
-            Err(error) => Err(error),
-        },
+        Some(path) => Config::load_or_default_from(path),
         None => Config::load_or_default(),
     };
     match result {
