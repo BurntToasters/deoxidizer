@@ -93,7 +93,8 @@ fn scan_invalid_root_exits_nonzero() {
 #[test]
 fn malformed_config_does_not_fall_back_to_destructive_defaults() {
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join(".deox_config"), "{not-json").unwrap();
+    let config_path = home.path().join(".deox_config");
+    std::fs::write(&config_path, "{not-json").unwrap();
     let projects = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_deox"));
     #[cfg(windows)]
@@ -101,7 +102,13 @@ fn malformed_config_does_not_fall_back_to_destructive_defaults() {
     #[cfg(not(windows))]
     command.env("HOME", home.path());
     let output = command
-        .args(["scan", "--path", projects.path().to_str().unwrap()])
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "scan",
+            "--path",
+            projects.path().to_str().unwrap(),
+        ])
         .output()
         .unwrap();
 
