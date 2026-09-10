@@ -4,7 +4,19 @@ const { spawnSync } = require('node:child_process');
 const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
-const branch = process.argv[2];
+
+function parseArgs(argv = process.argv.slice(2)) {
+  const args = [...argv];
+  for (const arg of args) {
+    if (arg.startsWith('--') && arg !== '--force-always') {
+      throw new Error(`unknown flag: ${arg} (supported: --force-always)`);
+    }
+  }
+  return {
+    branch: args.find((arg) => !arg.startsWith('--')),
+    forceAlways: args.includes('--force-always'),
+  };
+}
 
 function run(command, args) {
   const result = spawnSync(command, args, {
@@ -27,8 +39,15 @@ function requireConfirmation() {
 }
 
 function main() {
+  const { branch, forceAlways } = parseArgs();
   if (!['main', 'beta'].includes(branch)) {
     throw new Error('branch must be main or beta');
+  }
+  if (forceAlways) {
+    console.error(
+      '! --force-always passed: DEOX_RELEASE_CONFIRM gate bypassed. Destructive sync proceeds.',
+    );
+    process.env.DEOX_RELEASE_CONFIRM = 'YES';
   }
   requireConfirmation();
   run('git', ['fetch', 'origin']);
@@ -52,4 +71,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { requireConfirmation };
+module.exports = { requireConfirmation, parseArgs };

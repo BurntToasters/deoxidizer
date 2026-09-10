@@ -296,7 +296,7 @@ APPLE_KEYCHAIN_PROFILE=
    - Requires `GPG_KEY_ID` unless `--allow-unsigned` is explicitly used for local staging.
    - Passphrases enter through stdin, never command-line arguments.
 4. **Node release orchestration:**
-   - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state.
+   - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state. Passing `--force-always` (`npm run r -- --force-always`) bypasses the confirmation gate and propagates it to child steps; use only on throwaway release VMs.
     - `npm run u -- <version>` synchronizes `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and BCLS download metadata.
     - `npm run release:windows[:arch]` creates the single draft and uploads Windows artifacts.
        `npm run release:linux[:arch]` and `npm run release:macos[:arch]` wait for that
