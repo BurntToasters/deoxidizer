@@ -14,6 +14,8 @@ const {
   normalizeOs,
   TARGETS,
   buildEnvironment,
+  verificationEnvironment,
+  windowsFileVersion,
 } = require('../../scripts/release.cjs');
 const { githubCliEnvironment } = require('../../scripts/github-cli.cjs');
 const {
@@ -111,6 +113,13 @@ test('rejects host architecture for a different operating system', () => {
   assert.throws(() => normalizeArch('host', differentOs), /host architecture/);
 });
 
+test('uses a numeric four-part Windows file version for prereleases', () => {
+  assert.equal(windowsFileVersion('0.1.0'), '0.1.0.0');
+  assert.equal(windowsFileVersion('0.2.0-beta.1'), '0.2.0.0');
+  const installer = fs.readFileSync(path.join(__dirname, '../../installer.nsi'), 'utf8');
+  assert.match(installer, /VIProductVersion "\$\{FILE_VERSION\}"/);
+});
+
 test('parses checksum manifests and rejects duplicates', () => {
   assert.equal(tag, `v${packageManifest.version}`);
   const manifest = parseChecksumManifest(
@@ -181,6 +190,25 @@ test('release build and upload environment excludes signing credentials', () => 
   assert.equal(environment.AZURE_CLIENT_SECRET, undefined);
   assert.equal(environment.APPLE_PASSWORD, undefined);
   assert.equal(environment.PATH, '/bin');
+});
+
+test('unsigned opt-in reaches only local verification', () => {
+  const environment = {
+    DEOX_ALLOW_UNSIGNED_RELEASE: '1',
+    GPG_PASSPHRASE: 'secret',
+    PATH: '/bin',
+  };
+  const build = buildEnvironment(environment);
+  const verification = verificationEnvironment(environment, true);
+  assert.equal(build.DEOX_ALLOW_UNSIGNED_RELEASE, undefined);
+  assert.equal(verification.DEOX_ALLOW_UNSIGNED_RELEASE, '1');
+  assert.equal(verification.GPG_PASSPHRASE, undefined);
+  assert.equal(verification.PATH, '/bin');
+});
+
+test('release Rust quality commands use the lockfile', () => {
+  assert.match(packageManifest.scripts['quality:rust'], /cargo clippy --all-targets --locked/);
+  assert.match(packageManifest.scripts['quality:rust'], /cargo test --locked/);
 });
 
 test('release identity validation rejects drift and expiry', () => {

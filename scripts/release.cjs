@@ -84,6 +84,10 @@ function normalizeArch(value, os) {
   throw new Error(`Unsupported release architecture: ${value}`);
 }
 
+function windowsFileVersion(version) {
+  return `${version.split('-', 1)[0]}.0`;
+}
+
 function run(command, args, env = process.env) {
   const result = spawnSync(command, args, {
     cwd: root,
@@ -104,6 +108,12 @@ function buildEnvironment(env) {
   // uses its credential store instead (see github-cli.cjs).
   delete sanitized.GH_TOKEN;
   delete sanitized.GITHUB_TOKEN;
+  return sanitized;
+}
+
+function verificationEnvironment(env, unsigned) {
+  const sanitized = buildEnvironment(env);
+  if (unsigned) sanitized.DEOX_ALLOW_UNSIGNED_RELEASE = '1';
   return sanitized;
 }
 
@@ -239,6 +249,7 @@ function main() {
     );
   }
   const buildEnv = buildEnvironment(env);
+  const verificationEnv = verificationEnvironment(env, unsigned);
   const signEnv = signingEnvironment(env, os);
   const gpgEnv = gpgEnvironment(env);
 
@@ -272,7 +283,8 @@ function main() {
         signEnv,
       );
     }
-    const installerName = `deoxidizer-v${packageVersion()}-windows-${arch}-setup.exe`;
+    const version = packageVersion();
+    const installerName = `deoxidizer-v${version}-windows-${arch}-setup.exe`;
     const buildDir = targetReleaseDir.replaceAll(path.sep, '\\');
     run(
       'makensis.exe',
@@ -280,7 +292,8 @@ function main() {
         `/DBUILD_DIR=${buildDir}`,
         '/DOUTPUT_DIR=release',
         `/DOUTPUT_NAME=${installerName}`,
-        `/DVERSION=${packageVersion()}`,
+        `/DVERSION=${version}`,
+        `/DFILE_VERSION=${windowsFileVersion(version)}`,
         'installer.nsi',
       ],
       buildEnv,
@@ -321,7 +334,7 @@ function main() {
     );
   }
   run('bash', ['scripts/gpg-sign.sh', 'release', ...(unsigned ? ['--allow-unsigned'] : [])], gpgEnv);
-  run('npm', ['run', 'release:verify'], buildEnv);
+  run('npm', ['run', 'release:verify'], verificationEnv);
 
   const version = validateVersion(packageVersion());
   const tag = `v${version}`;
@@ -349,4 +362,11 @@ if (require.main === module) {
   }
 }
 
-module.exports = { TARGETS, normalizeArch, normalizeOs, buildEnvironment };
+module.exports = {
+  TARGETS,
+  normalizeArch,
+  normalizeOs,
+  buildEnvironment,
+  verificationEnvironment,
+  windowsFileVersion,
+};

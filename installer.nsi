@@ -10,7 +10,10 @@ Name "deoxidizer"
 !ifndef VERSION
 !define VERSION "0.0.0"
 !endif
-VIProductVersion "${VERSION}.0"
+!ifndef FILE_VERSION
+!define FILE_VERSION "0.0.0.0"
+!endif
+VIProductVersion "${FILE_VERSION}"
 VIAddVersionKey "ProductName" "deoxidizer"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "FileVersion" "${VERSION}"

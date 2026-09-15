@@ -23,7 +23,7 @@
     "check:changelog": "node scripts/check-changelog.cjs",
     "check:toolchain": "node scripts/check-toolchain.cjs",
     "check:release-key": "node scripts/check-release-key.cjs",
-    "quality:rust": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test",
+    "quality:rust": "cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked",
     "quality:node": "node --test tests/node/release-tools.test.cjs tests/node/sync-version.test.cjs",
     "release:prepare": "npm run quality && node scripts/release-session.cjs quality && node scripts/release-session.cjs start",
     "release:linux": "node scripts/release.cjs linux x86_64 --upload --wait",
