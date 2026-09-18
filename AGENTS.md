@@ -307,7 +307,9 @@ APPLE_KEYCHAIN_PROFILE=
       72-hour crates.io publish-age gate, git-dep and foreign-registry blocks, validated
       temp-lockfile install) and then synchronizes the version across `package.json`,
       `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and BCLS download metadata.
-      Bare `npm run u` runs the updaters plus a version-consistency pass.
+      Bare `npm run u` runs the updaters, then propagates the `package.json`
+      version across the other manifests (edit `package.json` first to bump;
+      `package.json` is the version source of truth).
       `npm run update:safe` runs only the dependency updaters. Never run raw
       `cargo update` / `npm update` / `npm audit fix` or delete `Cargo.lock`;
       `npm run check:update-policy` (in `npm run quality`) fails closed on any

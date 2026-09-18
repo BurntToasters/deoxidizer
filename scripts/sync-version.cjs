@@ -105,39 +105,40 @@ function updateChangelog(changelog, fromVersion, toVersion) {
     .replace(oldHeading, newHeading)}`;
 }
 
-function syncVersion(versionArgument) {
-  const packageJson = readJson(packagePath);
+function syncVersion(versionArgument, rootOverride) {
+  const base = rootOverride || root;
+  const packageJson = readJson(path.join(base, 'package.json'));
   const packageVersion = validateVersion(String(packageJson.version));
-  const cargo = fs.readFileSync(cargoPath, 'utf8');
+  const cargo = fs.readFileSync(path.join(base, 'Cargo.toml'), 'utf8');
   const currentCargoVersion = validateVersion(cargoVersion(cargo));
-  if (!versionArgument && packageVersion !== currentCargoVersion) {
-    throw new Error(
-      `package.json (${packageVersion}) and Cargo.toml (${currentCargoVersion}) differ; pass target version explicitly`,
-    );
-  }
 
+  // No explicit target: package.json is the source of truth (edit it, then
+  // run bare `npm run u`). The changelog moves from the version the rest of
+  // the repo is at; a half-bumped Cargo.toml still fails closed via the
+  // missing-heading error below before anything is written.
   const version = validateVersion(versionArgument || packageVersion);
-  const packageLock = fs.readFileSync(packageLockPath, 'utf8');
-  const cargoLock = fs.readFileSync(cargoLockPath, 'utf8');
-  const changelog = fs.readFileSync(changelogPath, 'utf8');
+  const fromVersion = versionArgument ? packageVersion : currentCargoVersion;
+  const packageLock = fs.readFileSync(path.join(base, 'package-lock.json'), 'utf8');
+  const cargoLock = fs.readFileSync(path.join(base, 'Cargo.lock'), 'utf8');
+  const changelog = fs.readFileSync(path.join(base, 'CHANGELOG.md'), 'utf8');
 
   const updatedPackage = { ...packageJson, version };
   const updatedPackageLock = updatePackageLock(packageLock, version);
   const updatedCargo = updateCargoToml(cargo, version);
   const updatedCargoLock = updateCargoLock(cargoLock, version);
-  const updatedChangelog = updateChangelog(changelog, packageVersion, version);
+  const updatedChangelog = updateChangelog(changelog, fromVersion, version);
 
   const changes = [
-    [packagePath, `${JSON.stringify(updatedPackage, null, 2)}\n`, JSON.stringify(packageJson, null, 2) + '\n'],
-    [packageLockPath, updatedPackageLock, packageLock],
-    [cargoPath, updatedCargo, cargo],
-    [cargoLockPath, updatedCargoLock, cargoLock],
-    [changelogPath, updatedChangelog, changelog],
+    [path.join(base, 'package.json'), `${JSON.stringify(updatedPackage, null, 2)}\n`, JSON.stringify(packageJson, null, 2) + '\n'],
+    [path.join(base, 'package-lock.json'), updatedPackageLock, packageLock],
+    [path.join(base, 'Cargo.toml'), updatedCargo, cargo],
+    [path.join(base, 'Cargo.lock'), updatedCargoLock, cargoLock],
+    [path.join(base, 'CHANGELOG.md'), updatedChangelog, changelog],
   ];
   for (const [filePath, updated, original] of changes) {
     if (updated !== original) {
       fs.writeFileSync(filePath, updated);
-      console.log(`${path.relative(root, filePath)} → ${version}`);
+      console.log(`${path.relative(base, filePath)} → ${version}`);
     }
   }
   return version;
