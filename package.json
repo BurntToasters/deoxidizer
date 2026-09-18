@@ -16,15 +16,17 @@
     "r": "node scripts/branch-sync.cjs main",
     "b": "node scripts/branch-sync.cjs beta",
     "sync-version": "node scripts/sync-version.cjs",
-    "u": "node scripts/sync-version.cjs",
-    "quality": "npm run check:license && npm run check:version && npm run check:changelog && npm run check:toolchain && npm run check:release-key && npm run quality:rust && npm run quality:node",
+    "u": "node scripts/npm-safe-update.cjs && node scripts/cargo-safe-update.cjs && node scripts/sync-version.cjs",
+    "update:safe": "node scripts/npm-safe-update.cjs && node scripts/cargo-safe-update.cjs",
+    "quality": "npm run check:license && npm run check:version && npm run check:changelog && npm run check:toolchain && npm run check:release-key && npm run check:update-policy && npm run quality:rust && npm run quality:node",
     "check:license": "node scripts/check-license.cjs",
     "check:version": "node scripts/check-version.cjs",
     "check:changelog": "node scripts/check-changelog.cjs",
     "check:toolchain": "node scripts/check-toolchain.cjs",
     "check:release-key": "node scripts/check-release-key.cjs",
+    "check:update-policy": "node scripts/check-cargo-update-policy.cjs",
     "quality:rust": "cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked",
-    "quality:node": "node --test tests/node/release-tools.test.cjs tests/node/sync-version.test.cjs",
+    "quality:node": "node --test tests/node/release-tools.test.cjs tests/node/sync-version.test.cjs tests/node/cargo-safe-update.test.cjs tests/node/check-cargo-update-policy.test.cjs",
     "release:prepare": "npm run quality && node scripts/release-session.cjs quality && node scripts/release-session.cjs start",
     "release:linux": "node scripts/release.cjs linux x86_64 --upload --wait",
     "release:linux:x64": "node scripts/release.cjs linux x86_64 --upload --wait",
@@ -41,6 +43,6 @@
     "release:upload": "node scripts/release.cjs --upload-only",
     "release:publish": "node scripts/publish-release.cjs",
     "release:sign": "bash scripts/gpg-sign.sh release",
-    "test:release": "node --test tests/node/release-tools.test.cjs tests/node/sync-version.test.cjs"
+    "test:release": "node --test tests/node/release-tools.test.cjs tests/node/sync-version.test.cjs tests/node/cargo-safe-update.test.cjs tests/node/check-cargo-update-policy.test.cjs"
   }
 }

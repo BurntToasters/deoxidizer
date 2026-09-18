@@ -204,7 +204,8 @@ network access.
 ```bash
 npm ci
 
-npm run u -- 0.1.1                 # e.g. next version: sync version across manifests and changelog
+npm run u -- 0.1.1                 # e.g. next version: safe dep updates (72h/3d age-gated) + sync version across manifests and changelog
+npm run update:safe                # dep lockfile updates only, no version sync
 DEOX_RELEASE_CONFIRM=YES npm run r  # sync main, test, prune
 DEOX_RELEASE_CONFIRM=YES npm run b  # sync beta, test
 

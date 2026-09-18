@@ -7,6 +7,7 @@ const test = require('node:test');
 
 const {
   isPrerelease,
+  syncVersion,
   updateCargoLock,
   updateCargoToml,
   updateChangelog,
@@ -70,7 +71,17 @@ test('rejects malformed versions and fixtures', () => {
 
 test('shared prerelease predicate mirrors the accepted version suffix', () => {
   assert.equal(isPrerelease(validateVersion('0.2.0-beta.1')), true);
-  assert.equal(isPrerelease(validateVersion('0.1.0')), false);
+  assert.equal(isPrerelease('0.1.0'), false);
   assert.equal(isPrerelease('0.2.0-rc.3'), true);
   assert.equal(isPrerelease('0.2.0'), false);
+});
+
+test('no-arg sync propagates package.json version with no edits when consistent', () => {
+  const files = ['package.json', 'package-lock.json', 'Cargo.toml', 'Cargo.lock', 'CHANGELOG.md'];
+  const before = new Map(files.map((name) => [name, fs.readFileSync(path.join(root, name))]));
+  const version = syncVersion(undefined);
+  assert.equal(version, JSON.parse(before.get('package.json').toString()).version);
+  for (const name of files) {
+    assert.deepEqual(fs.readFileSync(path.join(root, name)), before.get(name));
+  }
 });

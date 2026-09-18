@@ -139,6 +139,9 @@ deoxidizer/
 │   ├── vi.cjs                  # Explicitly confirmed checkout bootstrap
 │   ├── git-prune.cjs           # Explicitly confirmed local-only branch deletion
 │   ├── sync-version.cjs        # Version synchronization across manifests and changelog
+│   ├── npm-safe-update.cjs     # Age-gated npm lock updates (3d min-release-age, lock-only, audited)
+│   ├── cargo-safe-update.cjs   # Age-gated cargo updates (72h min publish age, validated temp lockfile)
+│   ├── check-cargo-update-policy.cjs # Regression scanner: dep mutations must route via safe updaters
 │   ├── release.cjs             # Target build, signing, and optional publication
 │   ├── release-session.cjs     # Quality proof and release identity binding
 │   ├── github-cli.cjs          # Token-scrubbed gh wrapper
@@ -162,7 +165,9 @@ deoxidizer/
     ├── config_test.rs          # Serialization, validation, and safe tilde expansion tests
     ├── scanner_test.rs         # Mock projects, workspaces, Tauri detection, and ignore tests
     ├── node/release-tools.test.cjs # Node release helper tests
-    └── node/sync-version.test.cjs  # Node version-sync helper tests
+    ├── node/sync-version.test.cjs  # Node version-sync helper tests
+    ├── node/cargo-safe-update.test.cjs # Safe-updater age-gate, lockfile transaction, env tests
+    └── node/check-cargo-update-policy.test.cjs # Update-policy scanner regression tests
 ```
 
 ---
@@ -297,7 +302,16 @@ APPLE_KEYCHAIN_PROFILE=
    - Passphrases enter through stdin, never command-line arguments.
 4. **Node release orchestration:**
    - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state. Passing `--force-always` (`npm run r -- --force-always`) bypasses the confirmation gate and propagates it to child steps; use only on throwaway release VMs.
-    - `npm run u -- <version>` synchronizes `package.json`, `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and BCLS download metadata.
+    - `npm run u -- <version>` runs the safe dependency updaters (`npm-safe-update.cjs`:
+      3-day npm min-release-age, lock-only, high-severity audit; `cargo-safe-update.cjs`:
+      72-hour crates.io publish-age gate, git-dep and foreign-registry blocks, validated
+      temp-lockfile install) and then synchronizes the version across `package.json`,
+      `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and BCLS download metadata.
+      Bare `npm run u` runs the updaters plus a version-consistency pass.
+      `npm run update:safe` runs only the dependency updaters. Never run raw
+      `cargo update` / `npm update` / `npm audit fix` or delete `Cargo.lock`;
+      `npm run check:update-policy` (in `npm run quality`) fails closed on any
+      unguarded mutation path. Review both lockfile diffs before committing.
     - `npm run release:windows[:arch]` creates the single draft and uploads Windows artifacts.
        `npm run release:linux[:arch]` and `npm run release:macos[:arch]` wait for that
        draft and upload their artifacts. Release sessions require a clean Git checkout
@@ -363,3 +377,5 @@ cargo build --release --locked
 - `tests/cli_test.rs`: Validates dual-binary version/output parity and invalid-mode rejection.
 - `tests/node/release-tools.test.cjs`: Validates target mapping, checksums, release identity, token scrubbing, and destructive Git confirmation.
 - `tests/node/sync-version.test.cjs`: Validates version parsing, Cargo/npm manifest updates, and BCLS changelog rewrites.
+- `tests/node/cargo-safe-update.test.cjs`: Validates 72h publish-age gating, emergency overrides, temp-lockfile transactions, env pins, and guarded `u`/`update:safe` entry points.
+- `tests/node/check-cargo-update-policy.test.cjs`: Validates the unguarded-mutation scanner across scripts, workflows, and cargo aliases.
