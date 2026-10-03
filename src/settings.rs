@@ -59,7 +59,7 @@ fn show_settings(config_path: &std::path::Path) {
         config.default_mode.to_string().cyan()
     );
     println!(
-        "  {:<20} {} MB",
+        "  {:<20} {} MiB",
         "Min size filter:".bold(),
         config.min_size_mb
     );
@@ -97,6 +97,14 @@ fn update_settings(args: SettingsConfigArgs, config_path: &std::path::Path) {
             invalid = true;
             eprintln!("  {} Invalid projects-dir: must not be empty.", "✗".red());
         } else {
+            let dir = crate::config::normalize_projects_dir(&dir);
+            if !crate::config::expand_tilde(&dir).is_dir() {
+                eprintln!(
+                    "  {} Note: {} does not exist yet; saving it anyway.",
+                    "⚠".yellow(),
+                    dir
+                );
+            }
             config.projects_dir = dir.clone();
             changed = true;
             pending.push(format!("  {} projects-dir = {}", "✓".green(), dir.cyan()));
@@ -104,9 +112,7 @@ fn update_settings(args: SettingsConfigArgs, config_path: &std::path::Path) {
     }
 
     // Clap `ValueEnum` already rejects unknown scope/behavior/mode values
-    // (exit 2 with possible values); `from_str_loose` in `config.rs` remains
-    // for CLI/settings input compat only; the tool writes kebab-case via
-    // `Display` and the config file requires kebab-case strict serde.
+    // (exit 2); the config file stores canonical kebab-case values.
     if let Some(scope) = args.scope {
         config.scope = scope;
         changed = true;

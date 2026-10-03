@@ -59,9 +59,9 @@ fi
 CARGO_TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 OUT_DIR="$CARGO_TARGET_ROOT/$TARGET/release"
 case "$TARGET" in
-    x86_64-unknown-linux-gnu)
+    x86_64-unknown-linux-musl|x86_64-unknown-linux-gnu)
         OS="linux"; ARCH="x86_64"; FORMAT="tar.gz"; BIN_EXT="" ;;
-    aarch64-unknown-linux-gnu)
+    aarch64-unknown-linux-musl|aarch64-unknown-linux-gnu)
         OS="linux"; ARCH="aarch64"; FORMAT="tar.gz"; BIN_EXT="" ;;
     x86_64-apple-darwin)
         OS="darwin"; ARCH="x86_64"; FORMAT="tar.gz"; BIN_EXT="" ;;

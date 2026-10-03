@@ -1,14 +1,23 @@
 version: 2
 updates:
+  # Cooldowns mirror the repo's age gates (scripts/cargo-safe-update.cjs:
+  # 72h crates.io publish age; scripts/npm-safe-update.cjs: 3-day npm
+  # min-release-age) so Dependabot never proposes a just-published release.
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 3
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 3
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 3

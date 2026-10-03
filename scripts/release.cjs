@@ -29,12 +29,15 @@ const SIGNING_ENV_KEYS = [
   // stray SKIP/ALLOW in the caller cannot silently weaken a signed build.
   'SKIP_WIN_CODESIGN',
   'DEOX_ALLOW_UNSIGNED_RELEASE',
+  'DEOX_ALLOW_UNNOTARIZED',
 ];
 
 const TARGETS = {
+  // Static musl binaries run on every Linux distribution regardless of the
+  // release VM's glibc version.
   linux: {
-    x86_64: 'x86_64-unknown-linux-gnu',
-    aarch64: 'aarch64-unknown-linux-gnu',
+    x86_64: 'x86_64-unknown-linux-musl',
+    aarch64: 'aarch64-unknown-linux-musl',
   },
   darwin: {
     x86_64: 'x86_64-apple-darwin',
@@ -84,6 +87,28 @@ function normalizeArch(value, os) {
   throw new Error(`Unsupported release architecture: ${value}`);
 }
 
+/**
+ * Environment additions for building `target` on this host. Linux musl
+ * builds compile `ring`'s C code with `musl-gcc` (Debian/Ubuntu package
+ * `musl-tools`) and must run on a host of the same architecture; cross
+ * builds fail early with a clear message instead of an obscure cc error.
+ */
+function targetBuildEnvironment(os, arch, env = process.env, host = { os: hostOs(), arch: hostArch() }) {
+  if (os !== 'linux') return {};
+  if (host.os !== 'linux' || host.arch !== arch) {
+    throw new Error(
+      `Linux ${arch} releases must be built on a Linux ${arch} host (got ${host.os} ${host.arch})`,
+    );
+  }
+  const variable = `CC_${TARGETS.linux[arch].replaceAll('-', '_')}`;
+  if (env[variable]) return {};
+  const probe = spawnSync('musl-gcc', ['--version'], { stdio: 'ignore' });
+  if (probe.error || probe.status !== 0) {
+    throw new Error('musl-gcc is required for Linux release builds (install the musl-tools package)');
+  }
+  return { [variable]: 'musl-gcc' };
+}
+
 function windowsFileVersion(version) {
   return `${version.split('-', 1)[0]}.0`;
 }
@@ -123,7 +148,14 @@ function signingEnvironment(env, os) {
   delete scoped.GITHUB_TOKEN;
   const keep = new Set();
   if (os === 'darwin') {
-    for (const key of ['APPLE_SIGNING_IDENTITY', 'APPLE_ID', 'APPLE_PASSWORD', 'APPLE_TEAM_ID', 'APPLE_KEYCHAIN_PROFILE']) {
+    for (const key of [
+      'APPLE_SIGNING_IDENTITY',
+      'APPLE_ID',
+      'APPLE_PASSWORD',
+      'APPLE_TEAM_ID',
+      'APPLE_KEYCHAIN_PROFILE',
+      'DEOX_ALLOW_UNNOTARIZED',
+    ]) {
       keep.add(key);
     }
   }
@@ -233,6 +265,7 @@ function main() {
   }
   const env = {
     ...process.env,
+    ...targetBuildEnvironment(os, arch),
     DEOX_RELEASE_TARGET: target,
     DEOX_CHECKSUM_NAME: `SHA256SUMS-${os}-${arch}.txt`,
     ...(unsigned ? { DEOX_ALLOW_UNSIGNED_RELEASE: '1' } : {}),
@@ -367,6 +400,7 @@ module.exports = {
   normalizeArch,
   normalizeOs,
   buildEnvironment,
+  targetBuildEnvironment,
   verificationEnvironment,
   windowsFileVersion,
 };

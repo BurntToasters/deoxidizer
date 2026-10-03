@@ -4,8 +4,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REPO_OWNER: &str = "BurntToasters";
 const REPO_NAME: &str = "deoxidizer";
@@ -24,12 +23,19 @@ const MAX_REDIRECT_HOPS: usize = 3;
 /// aborts on exceed. Single-attempt, no-retry: timeouts fail closed.
 const UPDATE_DEADLINE: Duration = Duration::from_secs(150);
 
-/// Expected fingerprint of the pinned release signing key.
+/// Pinned release signing keys. A checksum manifest must carry a valid
+/// detached signature from the primary key of one of these.
 ///
-/// Pinned to `release-signing-key.asc` in the repository root (same key whose
-/// fingerprint is enforced by `install.sh`). Signature verification must show
-/// a `VALIDSIG` from this fingerprint; there is no rotation mechanism.
-const EXPECTED_FPR: &str = "CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F";
+/// Rotation: add the new key file and entry here, ship a release signed by
+/// the old key (so existing installs learn the new key), then sign later
+/// releases with the new key. `valid_until` is the key's expiry: signatures
+/// created after it are rejected, older ones stay valid.
+const PINNED_KEYS: &[crate::openpgp::PinnedKey] = &[crate::openpgp::PinnedKey {
+    fingerprint: "CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F",
+    armored: include_str!("../release-signing-key.asc"),
+    // 2030-10-20, the key's OpenPGP expiration time.
+    valid_until: 1_918_709_940,
+}];
 
 /// Install outcome that distinguishes a clean failure from a partial
 /// update where the running binary was already replaced but the sibling
@@ -68,7 +74,9 @@ fn scrub_temp_dir(message: String, temp_dir: &Path) -> String {
 /// checksum manifest and its detached signature are fetched and verified
 /// first so a tampered manifest aborts before the large asset download;
 /// the asset is hashed against the verified manifest before install.
-pub fn run_update() {
+///
+/// With `check_only`, report whether a newer release exists and stop.
+pub fn run_update(check_only: bool) {
     println!();
     println!("  {} Checking for updates...", "🔄".bold());
 
@@ -101,6 +109,10 @@ pub fn run_update() {
         current.dimmed(),
         latest_tag.green().bold()
     );
+    if check_only {
+        println!("  Run 'deox --update' to install it.");
+        return;
+    }
 
     // Determine the asset name for this platform
     let asset_name = platform_asset_name(latest_tag);
@@ -147,8 +159,6 @@ pub fn run_update() {
             std::process::exit(1);
         }
     };
-
-    println!("  Downloading {}...", asset_name);
 
     let checksums_url = match checksums_url {
         Some(url) => url,
@@ -484,11 +494,12 @@ fn request_with_redirect_validation(
 }
 
 fn http_agent() -> ureq::Agent {
-    // Direct HTTPS only by design: no proxy env is honored, so a poisoned
-    // `HTTP_PROXY`/`HTTPS_PROXY` cannot reroute the updater. TLS is
-    // verified by ureq's defaults; authenticity still rests on the detached
-    // signature plus SHA256 (`verify_signed_manifest` + `verify_sha256`).
+    // Proxy environment variables (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`)
+    // are honored so updates work behind corporate proxies. A proxy cannot
+    // forge an update: TLS is verified end to end, every URL is allowlisted,
+    // and authenticity rests on the pinned signature plus SHA256.
     ureq::AgentBuilder::new()
+        .try_proxy_from_env(true)
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .timeout_write(Duration::from_secs(30))
@@ -526,9 +537,10 @@ fn read_limited<R: Read>(
 
 /// Allowlist for updater download URLs.
 ///
-/// The `objects.githubusercontent.com/` prefix is intentionally open:
-/// release asset bytes are served from per-file hashed object URLs under
-/// that host, so the prefix alone cannot authenticate content. Authenticity
+/// GitHub serves release asset bytes from signed CDN URLs on
+/// `release-assets.githubusercontent.com` (formerly
+/// `objects.githubusercontent.com`); those prefixes are intentionally open
+/// because they cannot authenticate content on their own. Authenticity
 /// comes from the detached signature plus SHA256 verification
 /// (`verify_signed_manifest` + `verify_sha256`); redirect targets under this
 /// prefix are additionally re-validated hop-by-hop by
@@ -536,6 +548,7 @@ fn read_limited<R: Read>(
 fn is_allowed_download_url(url: &str) -> bool {
     url.starts_with("https://api.github.com/repos/BurntToasters/deoxidizer/")
         || url.starts_with("https://github.com/BurntToasters/deoxidizer/releases/download/")
+        || url.starts_with("https://release-assets.githubusercontent.com/")
         || url.starts_with("https://objects.githubusercontent.com/")
 }
 
@@ -607,107 +620,16 @@ fn verify_sha256(data: &[u8], asset_name: &str, checksums: &str) -> bool {
     expected.is_some_and(|value| value.eq_ignore_ascii_case(&computed))
 }
 
-/// Verify checksum manifest using the repository's pinned release key.
-///
-/// Fail-closed: missing `gpg` aborts the update. An isolated `--homedir`
-/// under the secure tempdir keeps the verification off the user's keyring.
+/// Verify the checksum manifest's detached signature against the pinned
+/// release keys, in-process (no external `gpg` required).
 fn verify_signed_manifest(manifest: &[u8], signature: &[u8]) -> Result<(), String> {
-    let temp_dir = tempfile::Builder::new()
-        .prefix("deoxidizer-update-")
-        .tempdir()
-        .map_err(|error| format!("cannot create signature workspace: {error}"))?;
-    let manifest_path = temp_dir.path().join("SHA256SUMS.txt");
-    let signature_path = temp_dir.path().join("SHA256SUMS.txt.asc");
-    let key_path = temp_dir.path().join("release-key.asc");
-    let keyring_path = temp_dir.path().join("release-keyring.gpg");
-    let homedir = temp_dir.path().join("gnupg");
-    fs::create_dir_all(&homedir).map_err(|error| format!("cannot create gpg homedir: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&homedir, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("cannot secure gpg homedir: {error}"))?;
-    }
-    fs::write(&manifest_path, manifest)
-        .map_err(|error| format!("cannot write manifest: {error}"))?;
-    fs::write(&signature_path, signature)
-        .map_err(|error| format!("cannot write signature: {error}"))?;
-    fs::write(&key_path, include_bytes!("../release-signing-key.asc"))
-        .map_err(|error| format!("cannot write pinned key: {error}"))?;
-
-    let homedir_str = homedir.to_string_lossy().to_string();
-    let dearmor = Command::new("gpg")
-        .args(["--batch", "--yes", "--no-tty", "--homedir"])
-        .arg(&homedir_str)
-        .args(["--dearmor", "--output"])
-        .arg(&keyring_path)
-        .arg(&key_path)
-        .output()
-        .map_err(|error| format!("gpg unavailable: {error}"))?;
-    if !dearmor.status.success() {
-        return Err("cannot load pinned release key".to_string());
-    }
-    let verify = Command::new("gpg")
-        .args(["--batch", "--no-tty", "--no-options", "--homedir"])
-        .arg(&homedir_str)
-        .args(["--no-default-keyring", "--keyring"])
-        .arg(&keyring_path)
-        .args([
-            "--trust-model",
-            "direct",
-            "--weak-digest",
-            "sha1",
-            "--status-fd",
-            "1",
-            "--verify",
-        ])
-        .arg(&signature_path)
-        .arg(&manifest_path)
-        .output()
-        .map_err(|error| format!("gpg unavailable: {error}"))?;
-    if !verify.status.success() {
-        let detail = String::from_utf8_lossy(&verify.stderr).trim().to_string();
-        if detail.is_empty() {
-            return Err("signature does not match pinned release key".to_string());
-        }
-        return Err(scrub_temp_dir(
-            format!("signature does not match pinned release key: {detail}"),
-            temp_dir.path(),
-        ));
-    }
-    let status = String::from_utf8_lossy(&verify.stdout);
-    // Strict VALIDSIG: the status line must be exactly
-    // `[GNUPG:] VALIDSIG <EXPECTED_FPR> ...`. Any BADSIG/ERRSIG/EXPSIG/
-    // EXPKEYSIG/REVKEYSIG line rejects, even alongside a VALIDSIG.
-    let mut valid = false;
-    for line in status.lines() {
-        let payload = line.strip_prefix("[GNUPG:] ").unwrap_or(line).trim();
-        if payload.starts_with("BADSIG ")
-            || payload.starts_with("ERRSIG ")
-            || payload.starts_with("EXPSIG ")
-            || payload.starts_with("EXPKEYSIG ")
-            || payload.starts_with("REVKEYSIG ")
-        {
-            return Err("signature shows a bad/expired/revoked key".to_string());
-        }
-        if let Some(rest) = payload.strip_prefix("VALIDSIG ") {
-            let fpr = rest.split_whitespace().next().unwrap_or("");
-            if fpr.eq_ignore_ascii_case(EXPECTED_FPR) {
-                valid = true;
-            }
-        }
-    }
-    if !valid {
-        let detail = String::from_utf8_lossy(&verify.stderr).trim().to_string();
-        if detail.is_empty() {
-            return Err("signature is not from the pinned release key".to_string());
-        }
-        return Err(scrub_temp_dir(
-            format!("signature is not from the pinned release key: {detail}"),
-            temp_dir.path(),
-        ));
-    }
-    Ok(())
+    let signature =
+        std::str::from_utf8(signature).map_err(|_| "signature is not ASCII armor".to_string())?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    crate::openpgp::verify_detached(manifest, signature, PINNED_KEYS, now)
 }
 
 /// Extract the update and replace the current binary.
@@ -718,7 +640,7 @@ fn verify_signed_manifest(manifest: &[u8], signature: &[u8]) -> Result<(), Strin
 /// never half-installed into the live binary path).
 ///
 /// Note: no macOS quarantine (`com.apple.quarantine`) is applied by design;
-/// trust comes from the detached signature plus SHA256 (`EXPECTED_FPR`),
+/// trust comes from the pinned detached signature plus SHA256,
 /// not from Gatekeeper quarantine bits.
 fn install_update(archive_bytes: &[u8], asset_name: &str) -> Result<(), InstallFailure> {
     let temp_dir = tempfile::Builder::new()
@@ -1165,6 +1087,12 @@ mod tests {
         assert!(is_allowed_download_url(
             "https://github.com/BurntToasters/deoxidizer/releases/download/v1/a.tar.gz"
         ));
+        assert!(is_allowed_download_url(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/x?sig=y"
+        ));
+        assert!(!is_allowed_download_url(
+            "https://release-assets.githubusercontent.com.evil.example/x"
+        ));
         assert!(!is_allowed_download_url(
             "https://github.com/another-owner/deoxidizer/releases/download/v1/a.tar.gz"
         ));
@@ -1267,6 +1195,21 @@ mod tests {
         // Either outcome is safe as long as nothing escapes the destination.
         let _ = result;
         assert_contained(&dir);
+    }
+
+    #[test]
+    fn pinned_release_key_matches_checked_in_fingerprint() {
+        assert_eq!(
+            PINNED_KEYS[0].fingerprint,
+            "CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F"
+        );
+        // An unrelated signature never verifies against the release key.
+        let error = verify_signed_manifest(
+            b"data",
+            include_bytes!("../tests/fixtures/openpgp/good-sha256.asc"),
+        )
+        .unwrap_err();
+        assert!(error.contains("pinned"), "{error}");
     }
 
     #[test]

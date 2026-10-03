@@ -99,7 +99,7 @@ async function ensureDraft() {
   } catch (error) {
     // Another concurrent builder may have created the draft (422 validation
     // failed / already_exists): sleep 2s then re-fetch up to 3 attempts and
-    // reuse it instead of failing (see iyeris ensure-draft-release.cjs).
+    // reuse it instead of failing.
     if (error?.statusCode === 422) {
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         await sleep(2000);

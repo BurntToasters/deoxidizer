@@ -20,7 +20,7 @@ on:
         options: [x86_64, aarch64]
         default: x86_64
       runner:
-        description: Runner label with target toolchain installed
+        description: Runner label (Linux aarch64 needs an arm64 runner, e.g. ubuntu-24.04-arm)
         required: true
         default: ubuntu-latest
       upload:
@@ -65,6 +65,13 @@ jobs:
         run: cargo fmt --check
       - name: Install release dependencies
         run: npm ci
+      - name: Install musl toolchain (Linux)
+        # Linux releases are static musl binaries built natively; pick a
+        # runner whose architecture matches the `arch` input.
+        if: ${{ inputs.os == 'linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
       - name: Build and stage release
         shell: bash
         env:

@@ -18,14 +18,22 @@ function run(args, allowFailure = false) {
   return String(result.stdout || '').trim();
 }
 
-function hasRemoteBranch(branch) {
-  const result = spawnSync(
-    'git',
-    ['show-ref', '--verify', '--quiet', `refs/remotes/origin/${branch}`],
-    { cwd: root, stdio: 'ignore' },
-  );
-  if (result.error) throw result.error;
-  return result.status === 0;
+/**
+ * Local branches whose upstream was deleted on the remote (`[gone]`).
+ * Branches that were never pushed have no upstream and are always kept, so
+ * unpushed work can never be pruned.
+ */
+function goneBranches(refLines) {
+  return refLines
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [name, ...track] = line.split(' ');
+      return { name, track: track.join(' ') };
+    })
+    .filter(({ track }) => track === '[gone]')
+    .map(({ name }) => name);
 }
 
 function requireConfirmation() {
@@ -37,14 +45,15 @@ function requireConfirmation() {
 function main() {
   requireConfirmation();
   const current = run(['branch', '--show-current']);
-  const branches = run(['for-each-ref', '--format=%(refname:short)', 'refs/heads/'])
-    .split(/\r?\n/)
-    .filter(Boolean);
-  for (const branch of branches) {
+  run(['fetch', '--prune', 'origin']);
+  const refs = run([
+    'for-each-ref',
+    '--format=%(refname:short) %(upstream:track)',
+    'refs/heads/',
+  ]);
+  for (const branch of goneBranches(refs)) {
     if (branch === current || branch === 'main' || branch === 'beta') continue;
-    if (!hasRemoteBranch(branch)) {
-      run(['branch', '-D', branch]);
-    }
+    run(['branch', '-D', branch]);
   }
 }
 
@@ -57,4 +66,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { requireConfirmation };
+module.exports = { requireConfirmation, goneBranches };

@@ -83,7 +83,8 @@ test('normalizes release aliases to supported target triples', () => {
   assert.equal(normalizeOs('win'), 'windows');
   assert.equal(normalizeArch('amd64', 'linux'), 'x86_64');
   assert.equal(normalizeArch('arm64', 'linux'), 'aarch64');
-  assert.equal(TARGETS.linux.aarch64, 'aarch64-unknown-linux-gnu');
+  assert.equal(TARGETS.linux.aarch64, 'aarch64-unknown-linux-musl');
+  assert.equal(TARGETS.linux.x86_64, 'x86_64-unknown-linux-musl');
 });
 
 test('release scripts match the manual VM draft ownership protocol', () => {

@@ -3,6 +3,19 @@
 
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
+!include "LogicLib.nsh"
+!include "WordFunc.nsh"
+
+; Standard NSIS builds read registry strings into a 1024-character buffer.
+; A longer user PATH makes ReadRegStr fail (error flag set, empty result),
+; and writing that back would destroy the PATH. The installer and
+; uninstaller therefore only edit PATH when the read succeeded and the
+; result leaves room to append, and otherwise tell the user to edit PATH by
+; hand. A large-strings NSIS build (NSIS_MAX_STRLEN=8192) handles more
+; users automatically.
+!if ${NSIS_MAX_STRLEN} < 8192
+  !warning "NSIS_MAX_STRLEN is ${NSIS_MAX_STRLEN}; users with long PATHs must add deoxidizer to PATH manually."
+!endif
 
 Unicode True
 
@@ -18,6 +31,8 @@ VIAddVersionKey "ProductName" "deoxidizer"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "Publisher" "BurntToasters"
+VIAddVersionKey "FileDescription" "deoxidizer installer"
+VIAddVersionKey "LegalCopyright" "GPL-3.0-or-later"
 !ifndef OUTPUT_DIR
 !define OUTPUT_DIR "release"
 !endif
@@ -64,17 +79,27 @@ Section "Install"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\deoxidizer" "NoModify" 1
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\deoxidizer" "NoRepair" 1
 
-  ; Add to user PATH (delimited check mirrors the uninstall side so only a
-  ; complete semicolon-separated entry matches; never a substring).
+  ; Add to user PATH (complete semicolon-delimited entries only).
+  ClearErrors
   ReadRegStr $0 HKCU "Environment" "Path"
-  StrCmp $0 "" 0 +2
-    StrCpy $0 ""
-  StrCpy $1 ";$0;"
-  ${WordReplace} $1 ";$INSTDIR;" ";" "+" $2
-  ${If} $1 == $2
-    WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$0"
-    ; Broadcast WM_SETTINGCHANGE
-    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+  ${If} ${Errors}
+    MessageBox MB_OK|MB_ICONINFORMATION "Could not read your user PATH safely (it may be longer than this installer supports). Add $INSTDIR to PATH manually."
+  ${Else}
+    StrLen $3 "$0;$INSTDIR;"
+    ${If} $3 >= ${NSIS_MAX_STRLEN}
+      MessageBox MB_OK|MB_ICONINFORMATION "Your user PATH is too long for this installer to edit safely. Add $INSTDIR to PATH manually."
+    ${Else}
+      StrCpy $1 ";$0;"
+      ${WordReplace} $1 ";$INSTDIR;" ";" "+" $2
+      ${If} $1 == $2
+        ${If} $0 == ""
+          WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR"
+        ${Else}
+          WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$0"
+        ${EndIf}
+        SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+      ${EndIf}
+    ${EndIf}
   ${EndIf}
 SectionEnd
 
@@ -85,21 +110,32 @@ Section "Uninstall"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 
-  ; Remove from PATH
+  ; Remove from PATH only when the full value was read; never write back a
+  ; failed or truncated read.
+  ClearErrors
   ReadRegStr $0 HKCU "Environment" "Path"
-  ; Add delimiters so only a complete semicolon-separated entry is removed.
-  StrCpy $1 ";$0;"
-  ${WordReplace} $1 ";$INSTDIR;" ";" "+" $1
-  StrCpy $2 $1 "" 1
-  StrLen $3 $2
-  IntOp $3 $3 - 1
-  ${If} $3 > 0
-    StrCpy $2 $2 $3
-  ${Else}
-    StrCpy $2 ""
+  ${IfNot} ${Errors}
+  ${AndIf} $0 != ""
+    StrLen $3 "$0"
+    IntOp $4 ${NSIS_MAX_STRLEN} - 1
+    ${If} $3 < $4
+      StrCpy $1 ";$0;"
+      ${WordReplace} $1 ";$INSTDIR;" ";" "+" $2
+      ${If} $1 != $2
+        ; Strip the delimiters added above.
+        StrCpy $2 $2 "" 1
+        StrLen $3 $2
+        IntOp $3 $3 - 1
+        ${If} $3 > 0
+          StrCpy $2 $2 $3
+        ${Else}
+          StrCpy $2 ""
+        ${EndIf}
+        WriteRegExpandStr HKCU "Environment" "Path" $2
+        SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+      ${EndIf}
+    ${EndIf}
   ${EndIf}
-  WriteRegExpandStr HKCU "Environment" "Path" $2
-  SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
   ; Remove registry keys
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\deoxidizer"

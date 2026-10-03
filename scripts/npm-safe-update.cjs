@@ -9,8 +9,8 @@ const os = require("node:os");
 const path = require("node:path");
 const process = require("node:process");
 
-// Minimal npm invocation helper (mirrors Zinnia scripts/npm-cli.cjs, which
-// this repo does not have; deoxidizer has no npm dependencies to resolve).
+// Minimal npm invocation helper (deoxidizer has no npm dependencies to
+// resolve, only lockfile metadata).
 function npmInvocation({
   env = process.env,
   platform = process.platform,
@@ -91,8 +91,8 @@ function npmUpdateArguments(cachePath) {
 }
 
 // Deoxidizer has no npm dependencies and no reviewed-dev audit script:
-// the production audit below is the whole audit plan. `root` is kept so
-// callers share the Zinnia (root, cachePath, npm) audit-plan shape.
+// the production audit below is the whole audit plan. `root` is accepted
+// for a stable (root, cachePath, npm) call signature.
 function npmAuditPlan(root, cachePath, npm) {
   void root;
   return [

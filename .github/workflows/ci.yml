@@ -28,8 +28,15 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
-      - name: Test
+      - name: Test (unit, integration, and E2E)
         run: cargo test --locked
+      - name: Upload E2E transcripts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-transcripts-${{ matrix.os }}
+          path: target/e2e-artifacts/
+          if-no-files-found: error
       - name: Release build
         run: cargo build --release --locked
       - name: Verify both binaries
@@ -42,6 +49,16 @@ jobs:
             ./target/release/deoxidizer --version
             ./target/release/deox --version
           fi
+
+  supply-chain:
+    name: Dependency policy (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses sources
 
   release-tools:
     name: Node release tooling
@@ -60,15 +77,39 @@ jobs:
       - run: npm run check:changelog
       - run: npm run check:toolchain
       - run: npm run check:release-key
+      - run: npm run check:update-policy
       - run: npm run quality:node
-      - run: bash -n install.sh scripts/*.sh
-      - name: Lint PowerShell
+      - name: Shell syntax
+        # `bash -n a b` only checks `a` (later names are arguments), so check
+        # each script separately.
+        run: for f in install.sh scripts/*.sh; do bash -n "$f"; done
+      - name: PowerShell parse and lint
         shell: pwsh
-        continue-on-error: true
         run: |
+          $files = @(Get-ChildItem -Path install.ps1, scripts/*.ps1)
+          $failed = $false
+          foreach ($file in $files) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            foreach ($e in $errors) {
+              Write-Host "::error file=$($file.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              $failed = $true
+            }
+          }
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
-          $results = Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Warning, Error
+          $results = @($files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName -Severity Warning, Error })
           $results | Format-Table -AutoSize
+          if ($results | Where-Object Severity -eq 'Error') { $failed = $true }
+          if ($failed) { exit 1 }
+      - name: NSIS installer compiles
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nsis
+          mkdir -p "$RUNNER_TEMP/nsis-bin" "$RUNNER_TEMP/nsis-out"
+          printf 'MZ' > "$RUNNER_TEMP/nsis-bin/deoxidizer.exe"
+          printf 'MZ' > "$RUNNER_TEMP/nsis-bin/deox.exe"
+          makensis -V2 -DBUILD_DIR="$RUNNER_TEMP/nsis-bin" -DOUTPUT_DIR="$RUNNER_TEMP/nsis-out" \
+            -DVERSION=0.0.0 -DFILE_VERSION=0.0.0.0 installer.nsi
 
   rust-targets:
     name: Rust target (${{ matrix.target }})
@@ -77,13 +118,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each target checks on a native runner: cross C builds (ring) fail
-        # under a foreign host compiler, so ubuntu-only checks never worked.
+        # Each target builds on a native runner: ring compiles C, and Linux
+        # releases are static musl binaries built with musl-gcc.
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
           - os: macos-14
             target: x86_64-apple-darwin
           - os: macos-14
@@ -98,14 +139,21 @@ jobs:
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install cross linker (aarch64 Linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'linux-musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y musl-tools
       - name: Install target
         run: rustup target add --toolchain 1.98.1 ${{ matrix.target }}
+      - name: Build target
+        if: contains(matrix.target, 'linux-musl')
+        shell: bash
+        run: |
+          export "CC_$(echo '${{ matrix.target }}' | tr '-' '_')=musl-gcc"
+          cargo build --release --locked --target ${{ matrix.target }}
+          file target/${{ matrix.target }}/release/deoxidizer | grep -q 'static'
+          target/${{ matrix.target }}/release/deox --version
       - name: Check target
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        if: ${{ !contains(matrix.target, 'linux-musl') }}
         run: cargo check --locked --target ${{ matrix.target }}
