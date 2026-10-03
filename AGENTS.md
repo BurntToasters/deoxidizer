@@ -55,7 +55,11 @@ These rules are non-negotiable. Do not violate them for convenience.
    `Cargo.toml`, `.git/`, or parent directories.
 2. **Never follow symlinks when scanning or deleting.** Traversal must strictly
    use `.follow_links(false)`. Never allow symlink escapes to delete files outside
-   the project tree.
+   the project tree. A symlinked project root, `target/`, or intermediate
+   directory on a clean path is refused; symlinks *inside* a clean path are
+   removed as links (`remove_dir_all`/`remove_file` never follow them). Do not
+   reintroduce a blanket "refuse any symlink inside target" rule: Tauri AppImage
+   bundles and CMake-built `-sys` crates create such links routinely.
 3. **Never bypass interactive confirmation unless explicitly requested.**
    `deox clean` must always display the project count and reclaimable byte estimate
    and prompt the user `[Y/n]` before taking action, unless `--yes` / `-y` is
@@ -73,9 +77,15 @@ These rules are non-negotiable. Do not violate them for convenience.
 7. **Never perform unverified self-updates.** The self-updater must strictly verify
    the SHA256 checksum of any downloaded asset against its platform-scoped
    `SHA256SUMS-<os>-<arch>.txt` manifest (or legacy global `SHA256SUMS.txt`)
-   and verify detached manifest signature against checked-in
-   `release-signing-key.asc` before invoking `self-replace`.
-   Runtime updater hosts must provide `gpg`; absence or signature failure aborts update.
+   and verify the detached manifest signature against a pinned key
+   (`PINNED_KEYS` in `src/updater.rs`, built from checked-in
+   `release-signing-key.asc`) before invoking `self-replace`. Verification is
+   in-process (`src/openpgp.rs`: OpenPGP v4, Ed25519 primary key, SHA-256/512,
+   binary signature type, inside the key's validity window); no external `gpg`
+   is used at runtime. Any parse or verification failure aborts the update.
+   Never widen the accepted profile (other algorithms, SHA-1, text signatures,
+   subkeys) without failure-mode tests first. Key rotation: add the new key to
+   `PINNED_KEYS`, ship a release signed by the old key, then switch signing.
 8. **Never use predictable fixed paths in `/tmp` for updates.** Updates must use
    `tempfile::Builder::new().prefix("deoxidizer-update-").tempdir()` to prevent
    symlink and pre-creation attacks on multi-user systems.
@@ -119,6 +129,8 @@ deoxidizer/
 ├── CHANGELOG.md                # BCLS-formatted release notes and GitHub body
 ├── AGENTS.md                   # This durable agent context and invariant specification
 ├── release-signing-key.asc     # Pinned public key for release manifest verification
+├── deny.toml                   # cargo-deny advisories/licenses/sources policy
+├── .gitattributes              # Keeps signed test fixtures byte-exact (-text)
 ├── install.sh                  # macOS/Linux installer script (local build or GitHub release)
 ├── install.ps1                 # Windows PowerShell installer script
 ├── installer.nsi               # Windows NSIS GUI installer script
@@ -138,7 +150,8 @@ deoxidizer/
 │   ├── display.rs              # Colored terminal output, scan tables, inspection view
 │   ├── setup.rs                # Interactive setup wizard via dialoguer + --default
 │   ├── settings.rs             # Settings management: show, config, reset
-│   └── updater.rs              # GitHub API release checker, SHA256 validator, self-replace
+│   ├── updater.rs              # GitHub API release checker, SHA256 validator, self-replace
+│   └── openpgp.rs              # In-process Ed25519 OpenPGP detached-signature verifier
 ├── scripts/
 │   ├── build-release.sh        # Builds release binaries and packages tar.gz / zip
 │   ├── gpg-sign.sh             # Generates target-scoped checksums and GPG signatures
@@ -167,6 +180,8 @@ deoxidizer/
 │   ├── check-toolchain.cjs      # Rust/Node toolchain pin verification
 │   └── check-version.cjs        # Cargo/package version consistency check
 └── tests/
+    ├── e2e_test.rs             # E2E: fixture trees + real `deox` binary; transcripts in target/e2e-artifacts/
+    ├── fixtures/openpgp/       # gpg-generated keys/signatures for verifier failure-mode tests
     ├── cleaner_test.rs         # Unit and integration tests for clean modes and path safety
     ├── cli_test.rs             # Dual-binary parity and CLI rejection tests
     ├── config_test.rs          # Serialization, validation, and safe tilde expansion tests
@@ -213,7 +228,13 @@ The configuration file is stored in the user's home directory as JSON:
   - `"incremental-only"`: Removes incremental compiler cache directories (`*/incremental`).
   - `"deps-only"`: Removes dependency compilation units (`*/deps`).
 - `min_size_mb` (`u64`): Minimum artifact size in megabytes to include in scan/clean (0 = all).
-- `ignored_projects` (`Vec<String>`): Project names to always exclude from scan and clean operations.
+- `ignored_projects` (`Vec<String>`): Names to always exclude from scan and clean. A name matches a
+  project's name or any package in its `members` list (case-insensitive), so ignoring one
+  workspace member protects the shared `target/`.
+
+`projects_dir` is stored absolute (`config::normalize_projects_dir`); a leading `~` is kept
+verbatim and expanded at use (`config::expand_tilde`, also `~\` on Windows). Underscore
+spellings (`tauri_only`) are rejected everywhere; there is no loose parser.
 
 ---
 
@@ -239,11 +260,36 @@ addition to top-level `debug/` and `release/`.
 as a triple candidate and cleans its `debug/` child when present; do not narrow
 to a known triple list. `incremental-only`/`deps-only` collect matches up to
 depth 3 and intentionally under-clean deeper layouts fail-closed.
-`trash` behavior uses the OS Trash (Finder Trash, Recycle Bin, freedesktop
-Trash); trashed files still occupy disk until emptied, and `trash failed` does
-not fall back to `delete`. Sizes are logical file bytes and `clean --dry-run`
-is the canonical reclaimable-byte source; breakdown subtotals overlap, so do
-not sum them.
+`trash` behavior uses the OS Trash (macOS via `NSFileManager`, Recycle Bin,
+freedesktop Trash); trashed files still occupy disk until emptied, and
+`trash failed` does not fall back to `delete`. Sizes are logical bytes of
+regular files (symlinks count as 0).
+
+### Project model and clean pipeline
+- One `DiscoveredProject` per `target/` directory. `scanner::scan_dir_report`
+  groups every package by the target it builds into; the project is named
+  after the owning root (root `package.name`, else directory name) and lists
+  all package names in `members`. Kind is Tauri if any member is Tauri.
+- Target resolution: a real `target/` next to the manifest wins, else the
+  *nearest* ancestor `[workspace]` (bounded by the scan root) owns the build;
+  if it has no `target/`, the package has none. Virtual workspace roots are
+  candidates themselves.
+- Unreadable folders below the scan root are skipped with a warning (the root
+  itself must be readable). Projects whose `target/` cannot be analyzed are
+  counted in `ScanReport::analysis_failures`; `clean` exits 1 if any exist.
+- `scanner::is_artifact_dir` skips `node_modules` and `target` dirs that are
+  build outputs (sibling `Cargo.toml` or `CACHEDIR.TAG`); a crate inside a
+  folder named `target` is still scanned.
+- `cleaner::plan` validates the root and target once, builds the path list
+  for the mode (plus `--keep-bundles`, which preserves `*/release/bundle`),
+  drops nested duplicates, and validates each path. `estimate_with` and
+  `clean_project_with` both execute that plan, so `--dry-run` and the
+  confirmation estimate equal the freed bytes. `TargetBreakdown` buckets use
+  the same rules (profile at depth 1 or under a triple; `incremental`/`deps`
+  at depth 1-3).
+- `cleaner::build_in_progress` probes `.cargo-lock` files (depth <= 3) with a
+  non-blocking `File::try_lock` on a read-only handle; a held lock skips the
+  project as `build in progress`.
 
 ---
 
@@ -295,12 +341,24 @@ APPLE_KEYCHAIN_PROFILE=
    - Enforces subject DN match against `$env:AZURE_ARTIFACT_SIGNING_PUBLISHER_DN`.
    - NSIS setup output is signed before packaging and loose/archive contents are
      verified using `scripts/verify-windows-authenticode.ps1`.
+   - `installer.nsi` edits the user PATH only after a successful, complete
+     `ReadRegStr` (standard NSIS truncates at 1024 chars); otherwise it tells
+     the user to add the directory manually. It needs `LogicLib.nsh` and
+     `WordFunc.nsh`; CI compiles it with `makensis`.
+   - PowerShell scripts must stay ASCII-only (PowerShell 5.1 misreads BOM-less
+     UTF-8). `install.ps1` runs inside `& { }` so strict mode never leaks into
+     the caller's session, writes PATH as `REG_EXPAND_SZ` via the registry, and
+     requires Authenticode (`gpg.exe` checks are additional when present).
 2. **macOS Codesigning:**
    - Run via `scripts/macos-codesign.sh`.
    - Developer ID signing requires `--options runtime --timestamp`.
    - Ad-hoc signing (`-s -`) requires explicit `--allow-adhoc` and is for local
      staging only; release workflows fail when identity is missing.
-   - Submits `.zip` payload to `xcrun notarytool` when `APPLE_KEYCHAIN_PROFILE` is set.
+   - Notarization is required: each binary is zipped and submitted to
+     `xcrun notarytool --wait --output-format json`, and the parsed status
+     must be `Accepted` (notarytool can exit 0 on rejection). Missing
+     `APPLE_KEYCHAIN_PROFILE` fails unless `DEOX_ALLOW_UNNOTARIZED=1` and
+     `DEOX_RELEASE_CONFIRM=YES` (local staging only).
    - Notarization uses preconfigured `APPLE_KEYCHAIN_PROFILE`; passwords never enter process arguments.
 3. **Artifact Integrity & GPG:**
    - Run via `scripts/gpg-sign.sh release`.
@@ -308,7 +366,10 @@ APPLE_KEYCHAIN_PROFILE=
    - Requires `GPG_KEY_ID` unless `--allow-unsigned` is explicitly used for local staging.
    - Passphrases enter through stdin, never command-line arguments.
 4. **Node release orchestration:**
-   - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state. Passing `--force-always` (`npm run r -- --force-always`) bypasses the confirmation gate and propagates it to child steps; use only on throwaway release VMs.
+   - Linux release targets are `*-unknown-linux-musl` (static). `release.cjs`
+     builds them only on a Linux host of the same architecture, with
+     `CC_<triple>=musl-gcc` (package `musl-tools`); cross builds fail early.
+   - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state. Passing `--force-always` (`npm run r -- --force-always`) bypasses the confirmation gate and propagates it to child steps; use only on throwaway release VMs. `npm run r` also runs `scripts/git-prune.cjs`, which deletes only local branches whose upstream is `[gone]`; never-pushed branches are kept.
     - `npm run u -- <version>` runs the safe dependency updaters (`npm-safe-update.cjs`:
       3-day npm min-release-age, lock-only, high-severity audit; `cargo-safe-update.cjs`:
       72-hour crates.io publish-age gate, git-dep and foreign-registry blocks, validated
@@ -366,12 +427,15 @@ npm run check:changelog
 npm run check:toolchain
 npm run check:release-key
 npm run quality:node
-for f in install.sh scripts/*.sh; do bash -n "$f"; done
+for f in install.sh scripts/*.sh; do bash -n "$f"; done   # never `bash -n a b`: it only checks `a`
 
-# 5. Release build verification
+# 5. Supply chain
+cargo deny check advisories bans licenses sources
+
+# 6. Release build verification
 cargo build --release --locked
 
-# 6. Dual binary verification
+# 7. Dual binary verification
 ./target/release/deoxidizer --version
 ./target/release/deox --version
 ```
@@ -379,10 +443,18 @@ cargo build --release --locked
 `cargo run -- --help` fails with two binaries; use
 `cargo run --bin deox -- --help` for ground-truth help output.
 
+CI additionally parse-checks and lints every PowerShell script
+(PSScriptAnalyzer errors fail), compiles `installer.nsi` with `makensis`,
+builds static musl binaries natively on x86_64 and arm64 runners, and uploads
+`target/e2e-artifacts/` (E2E transcripts) from every OS. Dependabot uses a
+3-day cooldown matching the safe-updater age gates.
+
 ### Test Coverage Highlights
+- `tests/e2e_test.rs`: Drives the real `deox` binary against fixture trees (Tauri AppImage symlinks, unreadable folders, workspaces, nested paths, build locks, bundles) and writes a transcript per scenario to `target/e2e-artifacts/` (override with `DEOX_E2E_ARTIFACTS`). Permission scenarios skip when run as root; run them as an unprivileged user to exercise them.
+- `src/openpgp.rs` tests: Verifier failure modes (tampered data, unpinned key, SHA-1, text mode, expired, outside validity window, truncated/garbled/multi-packet armor, bad CRC) using fixtures in `tests/fixtures/openpgp/`. Regenerate fixtures with `gpg` (use `--faked-system-time` for dated signatures).
 - `tests/config_test.rs`: Validates default configuration, atomic round-trip serialization, malformed/future-version rejection, enum parsing, and safe tilde expansion.
 - `tests/scanner_test.rs`: Validates Tauri project detection, renamed/inherited dependencies, shared workspaces, size calculation, symlink exclusion, and `ignored_projects` filtering.
-- `tests/cleaner_test.rs`: Validates deletion in all 4 clean modes, target triples, symlink rejection, dry-run safety, and preservation of release builds in `debug-only` mode.
+- `tests/cleaner_test.rs`: Validates deletion in all 4 clean modes, target triples, symlink handling (refuse symlinked roots, remove interior links without following), dry-run safety, and preservation of release builds in `debug-only` mode.
 - `tests/cli_test.rs`: Validates dual-binary version/output parity and invalid-mode rejection.
 - `tests/node/release-tools.test.cjs`: Validates target mapping, checksums, release identity, token scrubbing, and destructive Git confirmation.
 - `tests/node/sync-version.test.cjs`: Validates version parsing, Cargo/npm manifest updates, and BCLS changelog rewrites.

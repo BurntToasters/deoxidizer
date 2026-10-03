@@ -50,38 +50,52 @@ for bin in "${BINARIES[@]}"; do
     echo "Verified: $bin"
 done
 
-# Notarize when a preconfigured notarytool keychain profile is supplied.
-# Per-binary notarization (not the final tar.gz): standalone Mach-O binaries
-# cannot carry a stapled ticket, so each binary is zipped individually for the
-# notarytool submission and verified online via Gatekeeper afterwards. The
-# final tar.gz stays unstapled by design; behavior kept, documented here.
-if [[ -n "${APPLE_KEYCHAIN_PROFILE:-}" ]]; then
-    PROFILE="${APPLE_KEYCHAIN_PROFILE:-}"
-    NOTARIZE_TEMPS=()
-    cleanup_notarize_temps() {
-        # Quoted expansion avoids word-splitting/globbing; length guard keeps
-        # set -u safe when no notarization temps were staged.
-        if (( ${#NOTARIZE_TEMPS[@]} )); then
-            for temp in "${NOTARIZE_TEMPS[@]}"; do
-                [[ -n "$temp" ]] && rm -rf "$temp"
-            done
-        fi
-    }
-    trap cleanup_notarize_temps EXIT
-    for bin in "${BINARIES[@]}"; do
-        TEMP_DIR="$(mktemp -d -t deoxidizer-notarize.XXXXXX)"
-        NOTARIZE_TEMPS+=("$TEMP_DIR")
-        ZIP_PATH="$TEMP_DIR/payload.zip"
-        ditto -c -k --keepParent "$bin" "$ZIP_PATH"
-        echo "Submitting $bin for notarization..."
-        xcrun notarytool submit "$ZIP_PATH" \
-            --keychain-profile "$PROFILE" \
-            --wait
-        rm -rf "$TEMP_DIR"
-        echo "Notarization complete: $bin"
-    done
-    trap - EXIT
-elif [[ -n "${APPLE_ID:-}" || -n "${APPLE_PASSWORD:-}" || -n "${APPLE_TEAM_ID:-}" ]]; then
+# Notarize each binary with a preconfigured notarytool keychain profile.
+# Standalone Mach-O binaries cannot carry a stapled ticket, so each binary is
+# zipped individually for submission; Gatekeeper verifies online. Releases
+# require notarization: skipping it needs DEOX_ALLOW_UNNOTARIZED=1 plus
+# DEOX_RELEASE_CONFIRM=YES (local staging only).
+if [[ -z "${APPLE_KEYCHAIN_PROFILE:-}" ]]; then
+    if [[ "${DEOX_ALLOW_UNNOTARIZED:-0}" == "1" && "${DEOX_RELEASE_CONFIRM:-}" == "YES" ]]; then
+        echo "APPLE_KEYCHAIN_PROFILE not set; skipping notarization (explicitly allowed)."
+        exit 0
+    fi
     echo "APPLE_KEYCHAIN_PROFILE is required for notarization; configure it with xcrun notarytool store-credentials." >&2
+    echo "(Local staging only: DEOX_ALLOW_UNNOTARIZED=1 DEOX_RELEASE_CONFIRM=YES skips it.)" >&2
     exit 1
 fi
+
+PROFILE="$APPLE_KEYCHAIN_PROFILE"
+NOTARIZE_TEMPS=()
+cleanup_notarize_temps() {
+    if (( ${#NOTARIZE_TEMPS[@]} )); then
+        for temp in "${NOTARIZE_TEMPS[@]}"; do
+            [[ -n "$temp" ]] && rm -rf "$temp"
+        done
+    fi
+}
+trap cleanup_notarize_temps EXIT
+for bin in "${BINARIES[@]}"; do
+    TEMP_DIR="$(mktemp -d -t deoxidizer-notarize.XXXXXX)"
+    NOTARIZE_TEMPS+=("$TEMP_DIR")
+    ZIP_PATH="$TEMP_DIR/payload.zip"
+    ditto -c -k --keepParent "$bin" "$ZIP_PATH"
+    echo "Submitting $bin for notarization..."
+    # notarytool can exit 0 for a finished-but-rejected submission, so the
+    # final status is parsed and must be exactly "Accepted".
+    RESULT="$(xcrun notarytool submit "$ZIP_PATH" \
+        --keychain-profile "$PROFILE" \
+        --wait \
+        --output-format json)"
+    echo "$RESULT"
+    STATUS="$(printf '%s' "$RESULT" | plutil -extract status raw -o - - 2>/dev/null || true)"
+    if [[ "$STATUS" != "Accepted" ]]; then
+        SUBMISSION_ID="$(printf '%s' "$RESULT" | plutil -extract id raw -o - - 2>/dev/null || true)"
+        echo "Notarization failed for $bin (status: ${STATUS:-unknown})." >&2
+        if [[ -n "$SUBMISSION_ID" ]]; then
+            xcrun notarytool log "$SUBMISSION_ID" --keychain-profile "$PROFILE" >&2 || true
+        fi
+        exit 1
+    fi
+    echo "Notarization accepted: $bin"
+done
