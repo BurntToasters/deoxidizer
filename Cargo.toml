@@ -41,6 +41,9 @@ tar = "0.4"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 tempfile = "3"
 semver = "1.0"
+dunce = "1.0.5"
+console = "0.16"
+ed25519-dalek = { version = "3.0", default-features = false }
 
 [profile.release]
 opt-level = "s"

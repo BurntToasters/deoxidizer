@@ -60,8 +60,21 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
         return;
     }
 
+    // Re-running setup starts from the current settings.
+    let current = match Config::load_from(&config_path) {
+        Ok(config) => config,
+        Err(crate::config::ConfigError::Missing(_)) => Config::default(),
+        Err(error) => {
+            eprintln!(
+                "  {} Existing config is unreadable ({error}); starting from defaults.",
+                "⚠".yellow()
+            );
+            Config::default()
+        }
+    };
+
     // Step 1: Projects directory
-    let default_dir = Config::default().projects_dir;
+    let default_dir = current.projects_dir.clone();
     let projects_dir: String = Input::new()
         .with_prompt("  Main projects/GitHub directory")
         .default(default_dir)
@@ -78,9 +91,9 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
         std::process::exit(1);
     }
 
-    // Validate directory exists
-    let path = std::path::Path::new(&projects_dir);
-    if !path.is_dir() {
+    let projects_dir = crate::config::normalize_projects_dir(&projects_dir);
+    // Validate directory exists (with `~` expanded, as scans resolve it).
+    if !crate::config::expand_tilde(&projects_dir).is_dir() {
         eprintln!(
             "  {} Directory does not exist: {}",
             "⚠".yellow(),
@@ -98,7 +111,11 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
     let scope_idx = Select::new()
         .with_prompt("  Project scope")
         .items(scope_options)
-        .default(0)
+        .default(match current.scope {
+            Scope::TauriOnly => 0,
+            Scope::TauriAndRust => 1,
+            Scope::RustOnly => 2,
+        })
         .interact()
         .unwrap_or_else(|error| {
             eprintln!("Setup cancelled: {error}.");
@@ -120,7 +137,10 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
     let behavior_idx = Select::new()
         .with_prompt("  Default clean behavior")
         .items(behavior_options)
-        .default(0)
+        .default(match current.clean_behavior {
+            CleanBehavior::Delete => 0,
+            CleanBehavior::Trash => 1,
+        })
         .interact()
         .unwrap_or_else(|error| {
             eprintln!("Setup cancelled: {error}.");
@@ -143,7 +163,12 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
     let mode_idx = Select::new()
         .with_prompt("  Default clean mode")
         .items(mode_options)
-        .default(0)
+        .default(match current.default_mode {
+            DefaultMode::Full => 0,
+            DefaultMode::DebugOnly => 1,
+            DefaultMode::IncrementalOnly => 2,
+            DefaultMode::DepsOnly => 3,
+        })
         .interact()
         .unwrap_or_else(|error| {
             eprintln!("Setup cancelled: {error}.");
@@ -160,8 +185,8 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
 
     // Step 5: Minimum artifact size filter
     let min_size_mb: u64 = Input::new()
-        .with_prompt("  Minimum artifact size to show (MB, 0 = show all)")
-        .default(0)
+        .with_prompt("  Minimum artifact size to show (MiB, 0 = show all)")
+        .default(current.min_size_mb)
         .interact_text()
         .unwrap_or_else(|error| {
             eprintln!("Setup cancelled: {error}.");
@@ -178,7 +203,7 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
     // Step 6: Ignored projects
     let ignored_input: String = Input::new()
         .with_prompt("  Ignored projects (comma-separated, blank = none)")
-        .default(String::new())
+        .default(current.ignored_projects.join(", "))
         .allow_empty(true)
         .interact_text()
         .unwrap_or_else(|error| {
@@ -250,7 +275,7 @@ fn print_config_summary(config: &Config) {
         config.default_mode.to_string().cyan()
     );
     println!(
-        "    Min size:        {} MB",
+        "    Min size:        {} MiB",
         config.min_size_mb.to_string().cyan()
     );
     if config.ignored_projects.is_empty() {

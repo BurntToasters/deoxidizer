@@ -195,7 +195,8 @@ tauri.workspace = true
 
     let projects = scan_dir(tmp.path(), &Scope::TauriOnly).unwrap();
     assert_eq!(projects.len(), 1);
-    assert_eq!(projects[0].name, "workspace-app");
+    assert_eq!(projects[0].name, "workspace");
+    assert_eq!(projects[0].members, vec!["workspace-app".to_string()]);
     assert_eq!(projects[0].path, workspace.canonicalize().unwrap());
     assert_eq!(
         projects[0].artifact_dir,
@@ -236,7 +237,8 @@ framework.workspace = true
 
     let projects = scan_dir(tmp.path(), &Scope::TauriOnly).unwrap();
     assert_eq!(projects.len(), 1);
-    assert_eq!(projects[0].name, "workspace-renamed");
+    assert_eq!(projects[0].name, "workspace");
+    assert_eq!(projects[0].members, vec!["workspace-renamed".to_string()]);
 }
 
 #[test]

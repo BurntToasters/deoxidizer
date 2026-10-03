@@ -1,6 +1,6 @@
 use crate::config::{Config, Scope};
 use crate::project::{DiscoveredProject, ProjectKind, TargetBreakdown};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use toml::Value;
 use walkdir::WalkDir;
+
+/// Maximum number of skipped-folder paths printed individually.
+const MAX_SKIPPED_SHOWN: usize = 5;
 
 /// Errors encountered while scanning configured project roots.
 #[derive(Debug)]
@@ -29,90 +32,116 @@ impl std::error::Error for ScanError {}
 
 /// Scan the configured directory for Rust/Tauri projects with build artifacts.
 pub fn scan(config: &Config) -> Result<Vec<DiscoveredProject>, ScanError> {
+    scan_with_report(config).map(|report| report.projects)
+}
+
+/// Projects found by a scan plus the number of projects whose `target/`
+/// could not be analyzed (reported as warnings and left out).
+pub struct ScanReport {
+    pub projects: Vec<DiscoveredProject>,
+    pub analysis_failures: usize,
+}
+
+/// Like [`scan`], but also reports projects that had to be skipped.
+pub fn scan_with_report(config: &Config) -> Result<ScanReport, ScanError> {
     let root = config.projects_path();
-    let mut projects = scan_dir(&root, &config.scope)?;
+    let ScanReport {
+        mut projects,
+        analysis_failures,
+    } = scan_dir_report(&root, &config.scope)?;
 
     // Apply config-level min size filter
     if config.min_size_mb > 0 {
         // min_size_mb is denominated in MiB (1024*1024 bytes), not decimal MB.
         let Some(min_bytes) = config.min_size_mb.checked_mul(1024 * 1024) else {
             eprintln!("Warning: min_size_mb is too large; no projects included.");
-            return Ok(Vec::new());
+            return Ok(ScanReport {
+                projects: Vec::new(),
+                analysis_failures,
+            });
         };
         projects.retain(|p| p.artifact_size >= min_bytes);
     }
 
-    // Apply config-level ignored projects filter. This matches the package
-    // `name` (Cargo.toml `package.name`, falling back to the directory name),
-    // not the filesystem path. Comparison trims surrounding whitespace and is
-    // case-insensitive via lowercase.
+    // Ignored names match the project name or any package building into the
+    // same target: ignoring one workspace member protects the shared target.
+    // Comparison trims whitespace and is case-insensitive.
     if !config.ignored_projects.is_empty() {
+        let ignored: Vec<String> = config
+            .ignored_projects
+            .iter()
+            .map(|name| name.trim().to_lowercase())
+            .collect();
         projects.retain(|p| {
-            let normalized = p.name.trim().to_lowercase();
-            !config
-                .ignored_projects
-                .iter()
-                .any(|ign| ign.trim().to_lowercase() == normalized)
+            !std::iter::once(&p.name)
+                .chain(p.members.iter())
+                .any(|name| ignored.contains(&name.trim().to_lowercase()))
         });
     }
 
-    Ok(projects)
+    Ok(ScanReport {
+        projects,
+        analysis_failures,
+    })
+}
+
+/// Packages and owner of one `target/` directory, gathered during a scan.
+struct TargetGroup {
+    owner: PathBuf,
+    target: PathBuf,
+    members: Vec<(String, ProjectKind)>,
 }
 
 /// Scan a specific directory for projects.
 ///
-/// Top-walk fail-closed intent: a candidate-walk `Err` aborts the whole scan
-/// with `ScanError::Traversal` rather than warn-continuing (as
-/// `analyze_target` does per-project), trading availability for safety so a
-/// partially-visible tree never yields a silently incomplete project list.
+/// The configured root must be a real, readable directory (fail-closed).
+/// Unreadable folders below it are skipped with a warning: the scan is
+/// read-only, so a partial view can only under-report, never over-delete.
 pub fn scan_dir(root: &Path, scope: &Scope) -> Result<Vec<DiscoveredProject>, ScanError> {
-    let root = validate_scan_root(root)?;
-    // Cache workspace manifest re-parses: ancestor Cargo.toml files are read
-    // once per scan instead of once per candidate project.
-    let mut manifest_cache: HashMap<PathBuf, Option<Value>> = HashMap::new();
-    let mut seen_targets: HashSet<PathBuf> = HashSet::new();
+    scan_dir_report(root, scope).map(|report| report.projects)
+}
 
-    // Collect candidate manifests first so dedup is deterministic: sorted order
-    // guarantees the lexicographically-first project claims a shared target
-    // dir regardless of filesystem walk order.
+/// Like [`scan_dir`], but also reports projects that had to be skipped.
+pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanError> {
+    let root = validate_scan_root(root)?;
+    let mut manifest_cache: HashMap<PathBuf, Option<Value>> = HashMap::new();
+
+    // Collect candidate manifests first so grouping is deterministic.
     // NOTE: same_file_system(true) is deliberately not set; target dirs may
     // legitimately span mount points and must still be found.
     let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
     for result in WalkDir::new(&root)
         .follow_links(false)
-        // Root symlinks are already rejected by validate_scan_root, so
-        // follow_root_links(false) only hardens against races/odd entries.
         .follow_root_links(false)
         .into_iter()
         .filter_entry(|e| e.depth() == 0 || (!is_hidden(e) && !is_artifact_dir(e)))
     {
         let entry = match result {
             Ok(entry) => entry,
-            Err(error) => {
-                return Err(ScanError::Traversal(error.to_string()));
+            Err(error) if error.depth() > 0 => {
+                let path = error
+                    .path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| error.to_string());
+                skipped.push(path);
+                continue;
             }
+            Err(error) => return Err(ScanError::Traversal(error.to_string())),
         };
-        if !entry.file_type().is_file() {
-            continue;
+        if entry.file_type().is_file() && entry.file_name() == OsStr::new("Cargo.toml") {
+            candidates.push(entry.path().to_path_buf());
         }
-
-        let path = entry.path();
-        if path.file_name() != Some(OsStr::new("Cargo.toml")) {
-            continue;
-        }
-        candidates.push(path.to_path_buf());
     }
+    report_skipped(&skipped);
     candidates.sort();
 
-    let mut projects = Vec::new();
-    let mut analyze_warnings = 0u32;
-
+    // Group every package by the target directory it builds into.
+    let mut groups: BTreeMap<PathBuf, TargetGroup> = BTreeMap::new();
     for path in &candidates {
-        let project_dir = match path.parent() {
-            Some(p) => p.to_path_buf(),
-            None => continue,
+        let Some(project_dir) = path.parent() else {
+            continue;
         };
-
         let Some(manifest) = cached_manifest(path, &mut manifest_cache) else {
             eprintln!(
                 "Warning: ignoring unreadable or invalid manifest {}",
@@ -120,90 +149,91 @@ pub fn scan_dir(root: &Path, scope: &Scope) -> Result<Vec<DiscoveredProject>, Sc
             );
             continue;
         };
-        if manifest.get("package").is_none() && manifest.get("workspace").is_some() {
+        let has_package = manifest.get("package").is_some();
+        if !has_package && manifest.get("workspace").is_none() {
             continue;
         }
-
-        let Some((artifact_root, target_dir)) =
-            resolve_target_dir(&project_dir, &manifest, &root, &mut manifest_cache)
+        let Some((owner, target_dir)) =
+            resolve_target_dir(project_dir, &manifest, &root, &mut manifest_cache)
         else {
             continue;
         };
-
-        let workspace_manifest = find_workspace_manifest(&project_dir, &root, &mut manifest_cache);
-        let kind = detect_project_kind(&manifest, workspace_manifest.as_ref());
-
-        // Apply scope filter
-        match scope {
-            Scope::TauriOnly => {
-                if kind != ProjectKind::TauriApp {
-                    continue;
-                }
-            }
-            Scope::RustOnly => {
-                if kind != ProjectKind::RustProject {
-                    continue;
-                }
-            }
-            Scope::TauriAndRust => {
-                // Include both Tauri and plain Rust
-            }
-        }
-
-        // Avoid duplicates (e.g. workspace members sharing a target dir) only
-        // after scope filtering, so an in-scope workspace member is not hidden
-        // by an out-of-scope manifest encountered first. Sorted candidates
-        // make the lexicographically-first claimant win deterministically.
-        let canonical = match target_dir.canonicalize() {
+        let canonical = match dunce::canonicalize(&target_dir) {
             Ok(canonical) => canonical,
             Err(error) => {
                 eprintln!(
-                    "Warning: cannot resolve target directory {}: {}",
-                    target_dir.display(),
-                    error
+                    "Warning: cannot resolve target directory {}: {error}",
+                    target_dir.display()
                 );
                 continue;
             }
         };
-        if !seen_targets.insert(canonical.clone()) {
-            eprintln!(
-                "Warning: duplicate target directory {} for {}; keeping lexicographically-first claimant",
-                canonical.display(),
-                path.display(),
-            );
+        let group = groups.entry(canonical).or_insert_with(|| TargetGroup {
+            owner: owner.clone(),
+            target: target_dir.clone(),
+            members: Vec::new(),
+        });
+        if has_package {
+            let workspace_manifest =
+                find_workspace_manifest(project_dir, &root, &mut manifest_cache);
+            let kind = detect_project_kind(&manifest, workspace_manifest.as_ref());
+            group
+                .members
+                .push((extract_project_name(&manifest, project_dir), kind));
+        }
+    }
+
+    let mut projects = Vec::new();
+    let mut analyze_warnings = 0usize;
+    for group in groups.into_values() {
+        let kind = if group
+            .members
+            .iter()
+            .any(|(_, kind)| *kind == ProjectKind::TauriApp)
+        {
+            ProjectKind::TauriApp
+        } else {
+            ProjectKind::RustProject
+        };
+        let in_scope = match scope {
+            Scope::TauriOnly => kind == ProjectKind::TauriApp,
+            Scope::RustOnly => kind == ProjectKind::RustProject,
+            Scope::TauriAndRust => true,
+        };
+        if !in_scope {
             continue;
         }
 
-        let name = extract_project_name(&manifest, &project_dir);
-        let (artifact_size, breakdown, last_modified) = match analyze_target(&target_dir) {
+        let owner_manifest = cached_manifest(&group.owner.join("Cargo.toml"), &mut manifest_cache);
+        let name = owner_manifest
+            .as_ref()
+            .and_then(package_name)
+            .unwrap_or_else(|| directory_name(&group.owner));
+        let (artifact_size, breakdown, last_modified) = match analyze_target(&group.target) {
             Ok(result) => result,
             Err(error) => {
                 eprintln!(
-                    "Warning: cannot analyze target directory {}: {error}; skipping project {}",
-                    target_dir.display(),
-                    name,
+                    "Warning: cannot analyze target directory {}: {error}; skipping project {name}",
+                    group.target.display(),
                 );
                 analyze_warnings += 1;
                 continue;
             }
         };
-        // Wire TargetBreakdown::total(): exclusive profile sizes must match
-        // the analyzed apparent size.
-        debug_assert_eq!(
-            breakdown.total(),
-            artifact_size,
-            "breakdown total must match artifact size for {}",
-            target_dir.display()
-        );
+        debug_assert_eq!(breakdown.total(), artifact_size);
 
+        let mut members: Vec<String> = group.members.into_iter().map(|(name, _)| name).collect();
+        members.sort();
+        members.dedup();
         projects.push(DiscoveredProject {
             name,
-            path: artifact_root,
+            path: group.owner,
             kind,
-            artifact_dir: target_dir,
+            artifact_dir: group.target,
             artifact_size,
             last_modified,
             breakdown: Some(breakdown),
+            members,
         });
     }
 
@@ -211,13 +241,33 @@ pub fn scan_dir(root: &Path, scope: &Scope) -> Result<Vec<DiscoveredProject>, Sc
         eprintln!("Warning: skipped {analyze_warnings} project(s) due to target analysis errors.");
     }
 
-    // Sort by size descending, breaking ties by name for determinism.
+    // Sort by size descending, breaking ties by name then path.
     projects.sort_by(|a, b| {
         b.artifact_size
             .cmp(&a.artifact_size)
             .then(a.name.cmp(&b.name))
+            .then(a.path.cmp(&b.path))
     });
-    Ok(projects)
+    Ok(ScanReport {
+        projects,
+        analysis_failures: analyze_warnings,
+    })
+}
+
+fn report_skipped(skipped: &[String]) {
+    if skipped.is_empty() {
+        return;
+    }
+    eprintln!(
+        "Warning: skipped {} unreadable folder(s) while scanning:",
+        skipped.len()
+    );
+    for path in skipped.iter().take(MAX_SKIPPED_SHOWN) {
+        eprintln!("  - {path}");
+    }
+    if skipped.len() > MAX_SKIPPED_SHOWN {
+        eprintln!("  ... and {} more", skipped.len() - MAX_SKIPPED_SHOWN);
+    }
 }
 
 /// Reject symlinked configured roots before canonicalizing them.
@@ -238,7 +288,11 @@ fn validate_scan_root(root: &Path) -> Result<PathBuf, ScanError> {
             message: "configured scan root is not a directory".to_string(),
         });
     }
-    root.canonicalize().map_err(|error| ScanError::Root {
+    fs::read_dir(root).map_err(|error| ScanError::Root {
+        path: root.to_path_buf(),
+        message: format!("cannot read directory: {error}"),
+    })?;
+    dunce::canonicalize(root).map_err(|error| ScanError::Root {
         path: root.to_path_buf(),
         message: format!("path resolution failed: {error}"),
     })
@@ -257,10 +311,8 @@ fn read_manifest(path: &Path) -> Option<Value> {
             return None;
         }
     };
-    // NOTE: `toml::from_str` (document semantics) is required here, not
-    // `str::parse::<Value>()`: since toml 1.x the latter parses a single
-    // TOML *value*, so a table-header document like `[package]` fails with
-    // "unexpected content, expected nothing".
+    // `toml::from_str` (document semantics) is required: since toml 1.x,
+    // `str::parse::<Value>()` parses a single TOML value, not a document.
     match toml::from_str::<Value>(&content) {
         Ok(manifest) => Some(manifest),
         Err(error) => {
@@ -289,8 +341,8 @@ fn real_directory(path: &Path) -> Option<PathBuf> {
     Some(path.to_path_buf())
 }
 
-/// Cached manifest read: ancestor Cargo.toml files are shared across
-/// candidates, so memoize parsed (or missing/invalid) results per scan.
+/// Memoized manifest read: ancestor Cargo.toml files are shared across
+/// candidates, so each is parsed at most once per scan.
 fn cached_manifest(path: &Path, cache: &mut HashMap<PathBuf, Option<Value>>) -> Option<Value> {
     if let Some(cached) = cache.get(path) {
         return cached.clone();
@@ -300,64 +352,57 @@ fn cached_manifest(path: &Path, cache: &mut HashMap<PathBuf, Option<Value>>) -> 
     manifest
 }
 
-/// Resolve the `target/` directory for a project.
+/// Resolve the `target/` directory a manifest builds into, returning the
+/// owning root directory and the target path.
 ///
-/// Limitation (by design, not implemented): `CARGO_TARGET_DIR` and
-/// `.cargo/config.toml` `build.target-dir` overrides are not honored.
-/// Only a `target/` directory directly under the project dir or under an
-/// ancestor workspace root (bounded by the scan root) is recognized.
+/// A real `target/` next to the manifest wins. Otherwise the nearest
+/// ancestor workspace (bounded by the scan root) owns the build, matching
+/// Cargo's nearest-workspace rule; if that workspace has no `target/`, the
+/// package has no artifacts — outer workspaces are never consulted.
+///
+/// `CARGO_TARGET_DIR` and `build.target-dir` overrides are not honored: only
+/// `target/` directly under a project or workspace root is ever cleaned.
 fn resolve_target_dir(
     project_dir: &Path,
     manifest: &Value,
     scan_root: &Path,
     cache: &mut HashMap<PathBuf, Option<Value>>,
 ) -> Option<(PathBuf, PathBuf)> {
-    let local_target = project_dir.join("target");
-    if let Some(target) = real_directory(&local_target) {
+    if let Some(target) = real_directory(&project_dir.join("target")) {
         return Some((project_dir.to_path_buf(), target));
     }
-
-    // Cargo workspaces commonly share a target/ directory at workspace root.
-    // Bound the ancestor walk to the canonical scan root so scanning never
-    // escapes the configured tree (ancestors() would otherwise reach /).
+    if manifest.get("workspace").is_some() {
+        return None;
+    }
     for ancestor in project_dir
         .ancestors()
         .skip(1)
         .take_while(|ancestor| ancestor.starts_with(scan_root))
     {
-        let ancestor_manifest_path = ancestor.join("Cargo.toml");
-        let Some(ancestor_manifest) = cached_manifest(&ancestor_manifest_path, cache) else {
+        let Some(ancestor_manifest) = cached_manifest(&ancestor.join("Cargo.toml"), cache) else {
             continue;
         };
         if ancestor_manifest.get("workspace").is_none() {
             continue;
         }
-        let target = ancestor.join("target");
-        if let Some(target) = real_directory(&target) {
-            return Some((ancestor.to_path_buf(), target));
-        }
-    }
-
-    // A workspace declaration in this manifest can still use its own target.
-    if manifest.get("workspace").is_some() {
-        return real_directory(&local_target).map(|target| (project_dir.to_path_buf(), target));
+        return real_directory(&ancestor.join("target"))
+            .map(|target| (ancestor.to_path_buf(), target));
     }
     None
 }
 
-/// Detect whether a parsed Cargo manifest indicates a Tauri project.
+/// Nearest manifest at or above `project_dir` declaring `[workspace]`,
+/// bounded by the scan root.
 fn find_workspace_manifest(
     project_dir: &Path,
     scan_root: &Path,
     cache: &mut HashMap<PathBuf, Option<Value>>,
 ) -> Option<Value> {
-    // Bound the walk to the scan root so lookup never escapes above it.
     for ancestor in project_dir
         .ancestors()
         .take_while(|ancestor| ancestor.starts_with(scan_root))
     {
-        let path = ancestor.join("Cargo.toml");
-        let Some(manifest) = cached_manifest(&path, cache) else {
+        let Some(manifest) = cached_manifest(&ancestor.join("Cargo.toml"), cache) else {
             continue;
         };
         if manifest.get("workspace").is_some() {
@@ -367,160 +412,96 @@ fn find_workspace_manifest(
     None
 }
 
-/// Revalidate that a cleaner-supplied root is a real Cargo project/workspace.
+/// Revalidate that a cleaner-supplied root is the Cargo project or workspace
+/// the scan reported: a real directory whose manifest is a package named
+/// `expected_name`, or a workspace whose directory is named `expected_name`.
 pub fn validate_project_root(path: &Path, expected_name: &str) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("project root is not a real directory".to_string());
     }
-    let manifest_path = path.join("Cargo.toml");
-    let manifest = read_manifest(&manifest_path)
+    let manifest = read_manifest(&path.join("Cargo.toml"))
         .ok_or_else(|| "project root has no valid Cargo.toml".to_string())?;
     if manifest.get("package").is_none() && manifest.get("workspace").is_none() {
         return Err("project root is not a Cargo package or workspace".to_string());
     }
-    if manifest
-        .get("package")
-        .and_then(|package| package.get("name"))
-        .and_then(Value::as_str)
-        .is_some_and(|name| name == expected_name)
-    {
+    let identity =
+        package_name(&manifest).or_else(|| manifest.get("workspace").map(|_| directory_name(path)));
+    if identity.as_deref() == Some(expected_name) {
         return Ok(());
-    }
-    if manifest.get("workspace").is_some() {
-        // NOTE: same_file_system(true) is deliberately not set; workspace
-        // members may span mount points.
-        for result in WalkDir::new(path)
-            .follow_links(false)
-            // Root symlinks already rejected above; harden explicitly.
-            .follow_root_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
-                entry.depth() == 0 || (!is_hidden(entry) && !is_artifact_dir(entry))
-            })
-        {
-            let entry = result.map_err(|error| format!("workspace validation failed: {error}"))?;
-            if !entry.file_type().is_file() || entry.file_name() != OsStr::new("Cargo.toml") {
-                continue;
-            }
-            let Some(member) = read_manifest(entry.path()) else {
-                continue;
-            };
-            if member
-                .get("package")
-                .and_then(|package| package.get("name"))
-                .and_then(Value::as_str)
-                .is_some_and(|name| name == expected_name)
-            {
-                return Ok(());
-            }
-        }
     }
     Err(format!(
         "project identity does not match Cargo project {expected_name}"
     ))
 }
 
-fn detect_project_kind(manifest: &Value, workspace_manifest: Option<&Value>) -> ProjectKind {
-    // Note: `[dev-dependencies]` are excluded by design. A Tauri crate used
-    // only for tests/examples does not make the project a Tauri app for
-    // scan/clean purposes; only runtime/build dependency tables count.
-    // Note: `optional = true` still counts. An optional Tauri dependency is
-    // still a Tauri app (feature-gated), so no optional filtering applies.
-    // Note: `tauri-plugin-*` crates alone do NOT count. Only the exact
-    // `tauri` / `tauri-build` crates (by key or `package`) mark a Tauri app.
-    let mut dependency_tables = Vec::new();
-
-    if let Some(table) = manifest.get("dependencies").and_then(Value::as_table) {
-        dependency_tables.push(table);
-    }
-    if let Some(table) = manifest.get("build-dependencies").and_then(Value::as_table) {
-        dependency_tables.push(table);
+/// Dependency tables (`[dependencies]`, `[build-dependencies]`, and their
+/// `[target.*]` variants) of a manifest. `[dev-dependencies]` are excluded:
+/// a Tauri crate used only by tests does not make a Tauri app.
+fn dependency_tables(manifest: &Value) -> Vec<&toml::map::Map<String, Value>> {
+    let mut tables = Vec::new();
+    for key in ["dependencies", "build-dependencies"] {
+        if let Some(table) = manifest.get(key).and_then(Value::as_table) {
+            tables.push(table);
+        }
     }
     if let Some(targets) = manifest.get("target").and_then(Value::as_table) {
         for target in targets.values() {
-            if let Some(table) = target.get("dependencies").and_then(Value::as_table) {
-                dependency_tables.push(table);
-            }
-            if let Some(table) = target.get("build-dependencies").and_then(Value::as_table) {
-                dependency_tables.push(table);
-            }
-        }
-    }
-    if let Some(workspace) = manifest.get("workspace") {
-        if let Some(table) = workspace.get("dependencies").and_then(Value::as_table) {
-            dependency_tables.push(table);
-        }
-    }
-
-    // Members may inherit renamed dependencies from [workspace.dependencies].
-    // Match `package = "tauri"` on the workspace side so an inherited alias
-    // (e.g. `framework.workspace = true` with `framework.package = "tauri"`)
-    // is still detected, alongside direct `tauri.workspace = true`.
-    // Checked across [dependencies], [build-dependencies], and all
-    // [target.*.dependencies] / [target.*.build-dependencies] tables, since
-    // any of them may carry `workspace = true`.
-    if let Some(workspace_manifest) = workspace_manifest {
-        let workspace_dependencies = workspace_manifest
-            .get("workspace")
-            .and_then(|value| value.get("dependencies"))
-            .and_then(Value::as_table);
-        if let Some(workspace_dependencies) = workspace_dependencies {
-            let mut member_tables = Vec::new();
-            if let Some(table) = manifest.get("dependencies").and_then(Value::as_table) {
-                member_tables.push(table);
-            }
-            if let Some(table) = manifest.get("build-dependencies").and_then(Value::as_table) {
-                member_tables.push(table);
-            }
-            if let Some(targets) = manifest.get("target").and_then(Value::as_table) {
-                for target in targets.values() {
-                    if let Some(table) = target.get("dependencies").and_then(Value::as_table) {
-                        member_tables.push(table);
-                    }
-                    if let Some(table) = target.get("build-dependencies").and_then(Value::as_table)
-                    {
-                        member_tables.push(table);
-                    }
+            for key in ["dependencies", "build-dependencies"] {
+                if let Some(table) = target.get(key).and_then(Value::as_table) {
+                    tables.push(table);
                 }
             }
-            let inherited = member_tables
-                .into_iter()
-                .flat_map(|table| table.iter())
-                .any(|(name, value)| {
-                    if !value
-                        .get("workspace")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                    {
-                        return false;
-                    }
-                    // Renamed on the member side (`alias = { workspace = true,
-                    // package = "tauri" }`) or direct `tauri.workspace = true`.
-                    if is_tauri_dep_entry(name, value) {
-                        return true;
-                    }
-                    // Inherited alias: look up the same key workspace-side and
-                    // accept either the plain `tauri` key or `package = "tauri"`.
-                    workspace_dependencies
-                        .get(name)
-                        .is_some_and(|ws_value| is_tauri_dep_entry(name, ws_value))
-                });
-            if inherited {
-                return ProjectKind::TauriApp;
-            }
         }
     }
+    tables
+}
 
-    if dependency_tables.into_iter().any(|table| {
-        table
-            .iter()
-            .any(|(name, value)| is_tauri_dep_entry(name, value))
-    }) {
-        ProjectKind::TauriApp
-    } else {
-        ProjectKind::RustProject
+fn detect_project_kind(manifest: &Value, workspace_manifest: Option<&Value>) -> ProjectKind {
+    // `optional = true` still counts (feature-gated Tauri app). Only the
+    // exact `tauri` / `tauri-build` crates (by key or `package`) count;
+    // `tauri-plugin-*` alone does not.
+    let member_tables = dependency_tables(manifest);
+    let mut tables = member_tables.clone();
+    if let Some(table) = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(Value::as_table)
+    {
+        tables.push(table);
     }
+    if tables
+        .iter()
+        .flat_map(|table| table.iter())
+        .any(|(name, value)| is_tauri_dep_entry(name, value))
+    {
+        return ProjectKind::TauriApp;
+    }
+
+    // Members may inherit (possibly renamed) dependencies from
+    // `[workspace.dependencies]` via `name.workspace = true`.
+    let workspace_dependencies = workspace_manifest
+        .and_then(|manifest| manifest.get("workspace"))
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(Value::as_table);
+    if let Some(workspace_dependencies) = workspace_dependencies {
+        let inherited = member_tables
+            .iter()
+            .flat_map(|table| table.iter())
+            .any(|(name, value)| {
+                value
+                    .get("workspace")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    && workspace_dependencies
+                        .get(name)
+                        .is_some_and(|ws_value| is_tauri_dep_entry(name, ws_value))
+            });
+        if inherited {
+            return ProjectKind::TauriApp;
+        }
+    }
+    ProjectKind::RustProject
 }
 
 /// Whether a `(name, dependency-value)` entry refers to `tauri`/`tauri-build`.
@@ -534,58 +515,68 @@ fn is_tauri_dep_entry(name: &str, value: &Value) -> bool {
     name == "tauri" || name == "tauri-build"
 }
 
-/// Extract the project name from a parsed Cargo manifest.
-fn extract_project_name(manifest: &Value, project_dir: &Path) -> String {
+fn package_name(manifest: &Value) -> Option<String> {
     manifest
         .get("package")
         .and_then(|package| package.get("name"))
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            project_dir
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-        })
+}
+
+fn directory_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Extract the project name from a parsed Cargo manifest.
+fn extract_project_name(manifest: &Value, project_dir: &Path) -> String {
+    package_name(manifest).unwrap_or_else(|| directory_name(project_dir))
+}
+
+/// Path components of a target-relative directory, used to classify files
+/// into the same buckets the clean modes remove.
+fn classify(parent: &Path) -> (bool, bool, bool, bool) {
+    let components: Vec<&OsStr> = parent.iter().collect();
+    let profile = |name: &str| {
+        components.first() == Some(&OsStr::new(name))
+            || (components.len() >= 2
+                && components[0] != OsStr::new("debug")
+                && components[0] != OsStr::new("release")
+                && components[1] == OsStr::new(name))
+    };
+    let within_depth = |name: &str| components.iter().take(3).any(|c| *c == OsStr::new(name));
+    (
+        profile("debug"),
+        profile("release"),
+        within_depth("incremental"),
+        within_depth("deps"),
+    )
 }
 
 /// Analyze a target/ directory in a single traversal, computing total size,
 /// breakdown (including target triples), and newest modification time.
 ///
-/// Size accounting notes (no behavior change): sizes are apparent sizes
-/// (`metadata.len()`, i.e. `st_size`), not disk usage. Hardlinked files are
-/// double-counted once per link, and sparse files / APFS clones / reflinks
-/// may misreport relative to actual reclaimed disk space.
+/// Sizes are apparent sizes (`st_size`) of regular files; symlinks count as
+/// zero. Hardlinks are counted once per link, and sparse files / clones may
+/// differ from actual reclaimed disk space.
 pub fn analyze_target(
     target_dir: &Path,
 ) -> Result<(u64, TargetBreakdown, Option<SystemTime>), ScanError> {
+    let mut breakdown = TargetBreakdown::default();
     let mut total_size = 0u64;
-    let mut debug_size = 0u64;
-    let mut release_size = 0u64;
-    let mut incremental_size = 0u64;
-    let mut deps_size = 0u64;
-    let mut other_size = 0u64;
     let mut last_modified: Option<SystemTime> = None;
 
-    // NOTE: same_file_system(true) is deliberately not set; target trees may
-    // span mount points.
     for result in WalkDir::new(target_dir)
         .follow_links(false)
-        // Never follow a symlinked root; validate paths reject those upfront.
         .follow_root_links(false)
         .into_iter()
     {
-        let entry = match result {
-            Ok(entry) => entry,
-            Err(error) => {
-                return Err(ScanError::Traversal(error.to_string()));
-            }
-        };
+        let entry = result.map_err(|error| ScanError::Traversal(error.to_string()))?;
         if !entry.file_type().is_file() {
             continue;
         }
-
         let metadata = match fs::symlink_metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -598,66 +589,56 @@ pub fn analyze_target(
         };
         let len = metadata.len();
         total_size = total_size.saturating_add(len);
-
         if let Ok(mtime) = metadata.modified() {
-            last_modified = Some(match last_modified {
-                Some(prev) => prev.max(mtime),
-                None => mtime,
-            });
+            last_modified = Some(last_modified.map_or(mtime, |prev| prev.max(mtime)));
         }
 
-        if let Ok(rel) = entry.path().strip_prefix(target_dir) {
-            let mut is_debug = false;
-            let mut is_release = false;
-            let mut is_incremental = false;
-            let mut is_deps = false;
-
-            // Classify by parent directory components only: a file literally
-            // named `debug`/`release`/`deps`/`incremental` must not affect
-            // its profile bucket.
-            if let Some(parent) = rel.parent() {
-                for comp in parent.components() {
-                    let name = comp.as_os_str();
-                    if name == OsStr::new("debug") {
-                        is_debug = true;
-                    } else if name == OsStr::new("release") {
-                        is_release = true;
-                    } else if name == OsStr::new("incremental") {
-                        is_incremental = true;
-                    } else if name == OsStr::new("deps") {
-                        is_deps = true;
-                    }
-                }
-            }
-
-            if is_debug {
-                debug_size = debug_size.saturating_add(len);
-            } else if is_release {
-                release_size = release_size.saturating_add(len);
-            } else {
-                other_size = other_size.saturating_add(len);
-            }
-
-            if is_incremental {
-                incremental_size = incremental_size.saturating_add(len);
-            }
-            if is_deps {
-                deps_size = deps_size.saturating_add(len);
-            }
+        let parent = entry
+            .path()
+            .strip_prefix(target_dir)
+            .ok()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new(""));
+        let (is_debug, is_release, is_incremental, is_deps) = classify(parent);
+        if is_debug {
+            breakdown.debug_size = breakdown.debug_size.saturating_add(len);
+        } else if is_release {
+            breakdown.release_size = breakdown.release_size.saturating_add(len);
+        } else {
+            breakdown.other_size = breakdown.other_size.saturating_add(len);
+        }
+        if is_incremental {
+            breakdown.incremental_size = breakdown.incremental_size.saturating_add(len);
+        }
+        if is_deps {
+            breakdown.deps_size = breakdown.deps_size.saturating_add(len);
         }
     }
 
-    Ok((
-        total_size,
-        TargetBreakdown {
-            debug_size,
-            release_size,
-            incremental_size,
-            deps_size,
-            other_size,
-        },
-        last_modified,
-    ))
+    Ok((total_size, breakdown, last_modified))
+}
+
+/// Find the root a path belongs to for `inspect`: the nearest enclosing
+/// workspace if one exists, else the nearest directory with a Cargo.toml.
+/// Read-only; walks ancestors of `path` only.
+pub fn enclosing_project_root(path: &Path) -> Option<PathBuf> {
+    let start = if path.is_dir() { path } else { path.parent()? };
+    let mut nearest_package: Option<PathBuf> = None;
+    for ancestor in start.ancestors() {
+        let Some(manifest) = read_manifest(&ancestor.join("Cargo.toml")) else {
+            continue;
+        };
+        if manifest.get("workspace").is_some() {
+            return Some(ancestor.to_path_buf());
+        }
+        if nearest_package.is_none() && manifest.get("package").is_some() {
+            nearest_package = Some(ancestor.to_path_buf());
+            if real_directory(&ancestor.join("target")).is_some() {
+                return nearest_package;
+            }
+        }
+    }
+    nearest_package
 }
 
 /// Check if a walkdir entry is a hidden directory/file.
@@ -667,11 +648,25 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
     bytes.starts_with(b".") && bytes != b"."
 }
 
-/// Check if a walkdir entry is an artifact directory we should not recurse into.
+/// Check if a walkdir entry is an artifact directory we should not recurse
+/// into: `node_modules`, or a `target` directory that is a Cargo build
+/// output (next to a Cargo.toml, or tagged with Cargo's `CACHEDIR.TAG`).
+/// A crate that merely lives in a folder named `target` is still scanned.
 fn is_artifact_dir(entry: &walkdir::DirEntry) -> bool {
     if !entry.file_type().is_dir() {
         return false;
     }
     let name = entry.file_name();
-    name == OsStr::new("target") || name == OsStr::new("node_modules") || name == OsStr::new(".git")
+    if name == OsStr::new("node_modules") {
+        return true;
+    }
+    if name != OsStr::new("target") {
+        return false;
+    }
+    let path = entry.path();
+    path.join("CACHEDIR.TAG").exists()
+        || path
+            .parent()
+            .is_some_and(|parent| parent.join("Cargo.toml").exists())
+        || !path.join("Cargo.toml").exists()
 }

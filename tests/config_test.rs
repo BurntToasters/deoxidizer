@@ -1,4 +1,10 @@
+use clap::ValueEnum;
 use deoxidizer_lib::config::{CleanBehavior, Config, ConfigError, DefaultMode, Scope};
+
+/// Parse a value exactly as the CLI does (case-insensitive, aliases allowed).
+fn parse<T: ValueEnum>(input: &str) -> Option<T> {
+    T::from_str(input, true).ok()
+}
 
 #[test]
 fn test_default_config() {
@@ -113,33 +119,27 @@ fn test_unsupported_config_version_is_rejected() {
 
 #[test]
 fn test_scope_from_str() {
-    assert_eq!(Scope::from_str_loose("tauri-only"), Some(Scope::TauriOnly));
-    assert_eq!(Scope::from_str_loose("tauri"), Some(Scope::TauriOnly));
-    assert_eq!(
-        Scope::from_str_loose("tauri-and-rust"),
-        Some(Scope::TauriAndRust)
-    );
-    assert_eq!(Scope::from_str_loose("both"), Some(Scope::TauriAndRust));
-    assert_eq!(Scope::from_str_loose("rust-only"), Some(Scope::RustOnly));
-    assert_eq!(Scope::from_str_loose("rust"), Some(Scope::RustOnly));
-    assert_eq!(Scope::from_str_loose("invalid"), None);
+    assert_eq!(parse::<Scope>("tauri-only"), Some(Scope::TauriOnly));
+    assert_eq!(parse::<Scope>("tauri"), Some(Scope::TauriOnly));
+    assert_eq!(parse::<Scope>("tauri-and-rust"), Some(Scope::TauriAndRust));
+    assert_eq!(parse::<Scope>("both"), Some(Scope::TauriAndRust));
+    assert_eq!(parse::<Scope>("rust-only"), Some(Scope::RustOnly));
+    assert_eq!(parse::<Scope>("rust"), Some(Scope::RustOnly));
+    assert_eq!(parse::<Scope>("invalid"), None);
 }
 
 #[test]
 fn test_clean_behavior_from_str() {
     assert_eq!(
-        CleanBehavior::from_str_loose("delete"),
+        parse::<CleanBehavior>("delete"),
         Some(CleanBehavior::Delete)
     );
+    assert_eq!(parse::<CleanBehavior>("trash"), Some(CleanBehavior::Trash));
     assert_eq!(
-        CleanBehavior::from_str_loose("trash"),
+        parse::<CleanBehavior>("recycle"),
         Some(CleanBehavior::Trash)
     );
-    assert_eq!(
-        CleanBehavior::from_str_loose("recycle"),
-        Some(CleanBehavior::Trash)
-    );
-    assert_eq!(CleanBehavior::from_str_loose("invalid"), None);
+    assert_eq!(parse::<CleanBehavior>("invalid"), None);
 }
 
 #[test]
@@ -170,64 +170,45 @@ fn test_tilde_expansion() {
 }
 
 #[test]
-fn test_default_mode_from_str_loose_aliases() {
+fn test_default_mode_cli_aliases() {
     let cases: &[(&str, Option<DefaultMode>)] = &[
         ("full", Some(DefaultMode::Full)),
         ("FULL", Some(DefaultMode::Full)),
         ("debug-only", Some(DefaultMode::DebugOnly)),
-        ("debug_only", Some(DefaultMode::DebugOnly)),
+        ("debug_only", None),
         ("debug", Some(DefaultMode::DebugOnly)),
         ("DEBUG", Some(DefaultMode::DebugOnly)),
         ("incremental-only", Some(DefaultMode::IncrementalOnly)),
-        ("incremental_only", Some(DefaultMode::IncrementalOnly)),
+        ("incremental_only", None),
         ("incremental", Some(DefaultMode::IncrementalOnly)),
         ("deps-only", Some(DefaultMode::DepsOnly)),
-        ("deps_only", Some(DefaultMode::DepsOnly)),
+        ("deps_only", None),
         ("deps", Some(DefaultMode::DepsOnly)),
         ("invalid", None),
     ];
     for (input, expected) in cases {
-        assert_eq!(
-            DefaultMode::from_str_loose(input),
-            *expected,
-            "input: {input}"
-        );
+        assert_eq!(parse::<DefaultMode>(input), *expected, "input: {input}");
     }
 }
 
 #[test]
-fn test_scope_and_behavior_loose_aliases() {
-    assert_eq!(Scope::from_str_loose("all"), Some(Scope::TauriAndRust));
-    assert_eq!(Scope::from_str_loose("ALL"), Some(Scope::TauriAndRust));
-    assert_eq!(Scope::from_str_loose("BOTH"), Some(Scope::TauriAndRust));
+fn test_scope_and_behavior_cli_aliases() {
+    assert_eq!(parse::<Scope>("all"), Some(Scope::TauriAndRust));
+    assert_eq!(parse::<Scope>("ALL"), Some(Scope::TauriAndRust));
+    assert_eq!(parse::<Scope>("BOTH"), Some(Scope::TauriAndRust));
+    assert_eq!(parse::<CleanBehavior>("rm"), Some(CleanBehavior::Delete));
     assert_eq!(
-        CleanBehavior::from_str_loose("rm"),
+        parse::<CleanBehavior>("remove"),
         Some(CleanBehavior::Delete)
     );
+    assert_eq!(parse::<CleanBehavior>("bin"), Some(CleanBehavior::Trash));
+    assert_eq!(parse::<CleanBehavior>("BIN"), Some(CleanBehavior::Trash));
+    assert_eq!(parse::<DefaultMode>("debug"), Some(DefaultMode::DebugOnly));
     assert_eq!(
-        CleanBehavior::from_str_loose("remove"),
-        Some(CleanBehavior::Delete)
-    );
-    assert_eq!(
-        CleanBehavior::from_str_loose("bin"),
-        Some(CleanBehavior::Trash)
-    );
-    assert_eq!(
-        CleanBehavior::from_str_loose("BIN"),
-        Some(CleanBehavior::Trash)
-    );
-    assert_eq!(
-        DefaultMode::from_str_loose("debug"),
-        Some(DefaultMode::DebugOnly)
-    );
-    assert_eq!(
-        DefaultMode::from_str_loose("incremental"),
+        parse::<DefaultMode>("incremental"),
         Some(DefaultMode::IncrementalOnly)
     );
-    assert_eq!(
-        DefaultMode::from_str_loose("deps"),
-        Some(DefaultMode::DepsOnly)
-    );
+    assert_eq!(parse::<DefaultMode>("deps"), Some(DefaultMode::DepsOnly));
 }
 
 #[test]

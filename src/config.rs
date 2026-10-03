@@ -67,17 +67,6 @@ impl std::fmt::Display for Scope {
     }
 }
 
-impl Scope {
-    pub fn from_str_loose(s: &str) -> Option<Self> {
-        match s.to_lowercase().replace('_', "-").as_str() {
-            "tauri-only" | "tauri" => Some(Scope::TauriOnly),
-            "tauri-and-rust" | "both" | "all" => Some(Scope::TauriAndRust),
-            "rust-only" | "rust" => Some(Scope::RustOnly),
-            _ => None,
-        }
-    }
-}
-
 /// Cleaning behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -93,16 +82,6 @@ impl std::fmt::Display for CleanBehavior {
         match self {
             CleanBehavior::Delete => write!(f, "delete"),
             CleanBehavior::Trash => write!(f, "trash"),
-        }
-    }
-}
-
-impl CleanBehavior {
-    pub fn from_str_loose(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "delete" | "rm" | "remove" => Some(CleanBehavior::Delete),
-            "trash" | "recycle" | "bin" => Some(CleanBehavior::Trash),
-            _ => None,
         }
     }
 }
@@ -128,18 +107,6 @@ impl std::fmt::Display for DefaultMode {
             DefaultMode::DebugOnly => write!(f, "debug-only"),
             DefaultMode::IncrementalOnly => write!(f, "incremental-only"),
             DefaultMode::DepsOnly => write!(f, "deps-only"),
-        }
-    }
-}
-
-impl DefaultMode {
-    pub fn from_str_loose(s: &str) -> Option<Self> {
-        match s.to_lowercase().replace('_', "-").as_str() {
-            "full" => Some(DefaultMode::Full),
-            "debug-only" | "debug" => Some(DefaultMode::DebugOnly),
-            "incremental-only" | "incremental" => Some(DefaultMode::IncrementalOnly),
-            "deps-only" | "deps" => Some(DefaultMode::DepsOnly),
-            _ => None,
         }
     }
 }
@@ -223,14 +190,9 @@ impl Config {
         })
     }
 
-    /// Returns the path to the config file: ~/.deox_config
-    ///
-    /// TODO: change this signature to `Result<PathBuf, ConfigError>` and
-    /// remove the `"."` fallback. Kept returning `PathBuf` for backwards
-    /// compatibility because `test_config_path` calls it directly and
-    /// editing tests is out of scope; filesystem-mutating callers
-    /// (`load`, `save`) use [`Config::try_config_path`] so an unset HOME
-    /// propagates as an error instead of writing to `./.deox_config`.
+    /// Path to the config file for display purposes: `~/.deox_config`, or
+    /// `./.deox_config` when the home directory is unknown. Anything that
+    /// reads or writes the file uses [`Config::try_config_path`] instead.
     pub fn config_path() -> PathBuf {
         Self::try_config_path().unwrap_or_else(|_| PathBuf::from(".").join(CONFIG_FILENAME))
     }
@@ -348,19 +310,41 @@ impl Config {
         Ok(())
     }
 
-    /// Returns the projects directory as a PathBuf with safe ~ expansion.
+    /// Returns the projects directory as a PathBuf with safe `~` expansion
+    /// (`~`, `~/...`, and on Windows `~\\...`).
     pub fn projects_path(&self) -> PathBuf {
-        if let Some(rest) = self.projects_dir.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(rest);
-            }
-        } else if self.projects_dir == "~" {
-            if let Some(home) = dirs::home_dir() {
-                return home;
-            }
-        }
-        PathBuf::from(&self.projects_dir)
+        expand_tilde(&self.projects_dir)
     }
+}
+
+/// Expand a leading `~` to the home directory; other paths are unchanged.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    let rest = if path == "~" {
+        Some("")
+    } else {
+        path.strip_prefix("~/")
+            .or_else(|| cfg!(windows).then(|| path.strip_prefix("~\\")).flatten())
+    };
+    match (rest, dirs::home_dir()) {
+        (Some(""), Some(home)) => home,
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(path),
+    }
+}
+
+/// Normalize a user-entered projects directory for storage: `~`-prefixed
+/// paths are kept verbatim (portable across machines), anything else is
+/// made absolute against the current directory so it never depends on
+/// where `deox` is run later.
+pub fn normalize_projects_dir(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed == "~" || trimmed.starts_with("~/") || (cfg!(windows) && trimmed.starts_with("~\\"))
+    {
+        return trimmed.to_string();
+    }
+    std::path::absolute(trimmed)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| trimmed.to_string())
 }
 
 /// Try to auto-detect a sensible default projects directory.

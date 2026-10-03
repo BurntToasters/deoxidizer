@@ -49,6 +49,7 @@ edition = "2021"
             deps_size: 4096 + 1024,
             other_size: 0,
         }),
+        members: vec!["test-project".to_string()],
     }
 }
 
@@ -227,6 +228,7 @@ fn test_clean_rejects_symlinked_target() {
         artifact_size: 1,
         last_modified: None,
         breakdown: None,
+        members: Vec::new(),
     };
 
     let result = clean_project(&project, &CleanMode::Full, &CleanBehavior::Delete, false);
@@ -239,7 +241,7 @@ fn test_clean_rejects_symlinked_target() {
 
 #[cfg(unix)]
 #[test]
-fn test_clean_rejects_symlink_inside_target() {
+fn test_clean_removes_symlink_inside_target_without_following() {
     let project_root = tempfile::tempdir().unwrap();
     let outside_root = tempfile::tempdir().unwrap();
     let outside_file = outside_root.path().join("sentinel");
@@ -261,14 +263,16 @@ fn test_clean_rejects_symlink_inside_target() {
         artifact_size: 1,
         last_modified: None,
         breakdown: None,
+        members: Vec::new(),
     };
 
     let result = clean_project(&project, &CleanMode::Full, &CleanBehavior::Delete, false);
-    assert!(matches!(
-        result,
-        deoxidizer_lib::cleaner::CleanResult::Error { .. }
-    ));
-    assert!(outside_file.exists());
+    assert!(
+        matches!(result, deoxidizer_lib::cleaner::CleanResult::Cleaned { .. }),
+        "got {result:?}"
+    );
+    assert!(!project_root.path().join("target").exists());
+    assert_eq!(fs::read(&outside_file).unwrap(), b"must survive");
 }
 
 #[test]
@@ -290,6 +294,7 @@ fn test_clean_rejects_forged_project_identity() {
         artifact_size: 1,
         last_modified: None,
         breakdown: None,
+        members: Vec::new(),
     };
     assert!(matches!(
         clean_project(&project, &CleanMode::Full, &CleanBehavior::Delete, false),
@@ -398,6 +403,7 @@ fn test_clean_skipped_when_no_matching_dirs() {
         artifact_size: 0,
         last_modified: None,
         breakdown: None,
+        members: Vec::new(),
     };
     let result = clean_project(
         &project,
@@ -430,6 +436,7 @@ fn test_clean_skipped_when_no_matching_dirs() {
         artifact_size: 8,
         last_modified: None,
         breakdown: None,
+        members: Vec::new(),
     };
     assert!(matches!(
         clean_project(
@@ -744,6 +751,7 @@ fn test_estimate_empty_target_is_zero() {
         artifact_size: 0,
         last_modified: None,
         breakdown: None,
+        members: Vec::new(),
     };
 
     assert_eq!(estimate_freed(&project, &CleanMode::Full).unwrap(), 0);
@@ -751,7 +759,7 @@ fn test_estimate_empty_target_is_zero() {
 
 #[cfg(unix)]
 #[test]
-fn test_selective_modes_reject_symlink_inside_target() {
+fn test_selective_modes_remove_symlink_inside_target_without_following() {
     let project_root = tempfile::tempdir().unwrap();
     let outside_root = tempfile::tempdir().unwrap();
     let outside_file = outside_root.path().join("sentinel");
@@ -774,6 +782,7 @@ fn test_selective_modes_reject_symlink_inside_target() {
         artifact_size: 8,
         last_modified: None,
         breakdown: None,
+        members: Vec::new(),
     };
 
     let result = clean_project(
@@ -783,11 +792,11 @@ fn test_selective_modes_reject_symlink_inside_target() {
         false,
     );
     assert!(
-        matches!(result, deoxidizer_lib::cleaner::CleanResult::Error { .. }),
+        matches!(result, deoxidizer_lib::cleaner::CleanResult::Cleaned { .. }),
         "got {result:?}"
     );
-    assert!(outside_file.exists());
-    assert!(deps.join("lib.rlib").exists());
+    assert!(!deps.exists());
+    assert_eq!(fs::read(&outside_file).unwrap(), b"must survive");
 }
 
 #[test]
@@ -807,6 +816,7 @@ fn test_full_mode_on_empty_target() {
         artifact_size: 0,
         last_modified: None,
         breakdown: None,
+        members: Vec::new(),
     };
 
     // Locked-in behavior: an existing but empty target/ still resolves to a
@@ -902,6 +912,7 @@ fn test_windows_symlink_target_rejected() {
         artifact_size: 1,
         last_modified: None,
         breakdown: None,
+        members: Vec::new(),
     };
 
     let result = clean_project(&project, &CleanMode::Full, &CleanBehavior::Delete, false);

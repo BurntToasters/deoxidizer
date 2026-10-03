@@ -1,5 +1,6 @@
 use crate::cleaner::CleanMode;
 use crate::config::{CleanBehavior, Config, ConfigError, DefaultMode, Scope};
+use crate::project::DiscoveredProject;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -24,9 +25,14 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Check for updates and self-update the binary.
+    /// Check for updates and self-update the binary (cannot be combined
+    /// with a subcommand).
     #[arg(short = 'u', long = "update")]
     pub update: bool,
+
+    /// Check whether a newer release exists without installing it.
+    #[arg(long = "check-update", conflicts_with = "update")]
+    pub check_update: bool,
 
     /// Use a specific config file instead of ~/.deox_config.
     /// (Portable installs, testing, multiple profiles. `inspect` ignores
@@ -107,6 +113,18 @@ pub struct CleanArgs {
     /// Override the configured projects directory for this run.
     #[arg(long = "path", value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
     pub path: Option<String>,
+
+    /// Interactively choose which projects to clean (needs a terminal).
+    #[arg(short = 's', long = "select")]
+    pub select: bool,
+
+    /// In full mode, keep Tauri installer bundles (target/*/release/bundle).
+    #[arg(long = "keep-bundles")]
+    pub keep_bundles: bool,
+
+    /// Print results as JSON on stdout (no table).
+    #[arg(long = "json")]
+    pub json: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -157,6 +175,10 @@ pub struct ScanArgs {
         value_parser = clap::value_parser!(u32).range(0..=MAX_OLDER_THAN_DAYS)
     )]
     pub older_than: Option<u32>,
+
+    /// Print results as JSON on stdout (no table).
+    #[arg(long = "json")]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -217,7 +239,8 @@ pub struct SettingsResetArgs {
 
 #[derive(Args)]
 pub struct InspectArgs {
-    /// Path to the project to inspect (explicit path; ignores stored filters).
+    /// Path to the project, or any file or folder inside it (ignores stored
+    /// filters).
     #[arg(value_hint = clap::ValueHint::AnyPath)]
     pub project: PathBuf,
 
@@ -228,11 +251,15 @@ pub struct InspectArgs {
 
 /// Central application runner used by both `deoxidizer` and `deox` binaries.
 pub fn run_app() {
+    #[cfg(windows)]
+    {
+        // Enable ANSI escape processing on legacy Windows consoles.
+        let _ = colored::control::set_virtual_terminal(true);
+    }
     // Show the invoked binary name (deoxidizer vs deox) in help/usage output.
     // `name` above stays "deoxidizer" so `--version` output is identical.
-    // NOTE: argv[0] is display-only here (usage line). A symlinked argv[0]
-    // never changes dispatch, config paths, or update behavior; both
-    // invokers share one parser and one library entry point.
+    // argv[0] is display-only: it never changes dispatch, config paths, or
+    // update behavior.
     let bin_name = std::env::args()
         .next()
         .as_deref()
@@ -241,11 +268,20 @@ pub fn run_app() {
         .map(|stem| stem.to_string_lossy().into_owned())
         .filter(|stem| !stem.is_empty())
         .unwrap_or_else(|| "deoxidizer".to_string());
-    let matches = Cli::command().bin_name(bin_name).get_matches();
+    let mut command = Cli::command().bin_name(bin_name);
+    let matches = command.clone().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
 
-    if cli.update {
-        crate::updater::run_update();
+    if (cli.update || cli.check_update) && cli.command.is_some() {
+        command
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--update/--check-update cannot be combined with a subcommand",
+            )
+            .exit();
+    }
+    if cli.update || cli.check_update {
+        crate::updater::run_update(cli.check_update);
         return;
     }
 
@@ -253,21 +289,11 @@ pub fn run_app() {
     let config_path = config_override.as_ref();
 
     match cli.command {
-        Some(Commands::Setup(args)) => {
-            crate::setup::run_setup(args, config_path);
-        }
-        Some(Commands::Clean(args)) => {
-            run_clean(args, config_path);
-        }
-        Some(Commands::Scan(args)) => {
-            run_scan(args, config_path);
-        }
-        Some(Commands::Settings(args)) => {
-            crate::settings::run_settings(args, config_path);
-        }
-        Some(Commands::Inspect(args)) => {
-            run_inspect(args);
-        }
+        Some(Commands::Setup(args)) => crate::setup::run_setup(args, config_path),
+        Some(Commands::Clean(args)) => run_clean(args, config_path),
+        Some(Commands::Scan(args)) => run_scan(args, config_path),
+        Some(Commands::Settings(args)) => crate::settings::run_settings(args, config_path),
+        Some(Commands::Inspect(args)) => run_inspect(args),
         None => {
             let config = load_config_or_default(config_path);
             if !effective_config_path(config_path).exists() {
@@ -277,18 +303,22 @@ pub fn run_app() {
                 eprintln!();
                 eprintln!("Running scan with defaults for now...\n");
             }
-            let projects = match crate::scanner::scan(&config) {
-                Ok(projects) => projects,
-                Err(error) => {
-                    eprintln!(
-                        "Scan failed for '{}' (config {}): {error}.",
-                        config.projects_dir,
-                        effective_config_path(config_path).display()
-                    );
-                    std::process::exit(1);
-                }
-            };
+            let projects = scan_or_exit(&config, config_path);
             crate::display::print_scan_results(&projects);
+        }
+    }
+}
+
+fn scan_or_exit(config: &Config, config_override: Option<&PathBuf>) -> Vec<DiscoveredProject> {
+    match crate::scanner::scan(config) {
+        Ok(projects) => projects,
+        Err(error) => {
+            eprintln!(
+                "Scan failed for '{}' (config {}): {error}.",
+                config.projects_dir,
+                effective_config_path(config_override).display()
+            );
+            std::process::exit(1);
         }
     }
 }
@@ -329,24 +359,34 @@ fn load_config_or_default(config_override: Option<&PathBuf>) -> Config {
 }
 
 fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
-    use crate::cleaner::{self, CleanMode};
+    use crate::cleaner::{self, CleanMode, CleanOptions, CleanResult};
     use crate::display;
-    use crate::scanner;
     use colored::Colorize;
     use humansize::{format_size, BINARY};
+    use std::io::IsTerminal;
 
     let mut config = load_config_strict(config_override);
-
     apply_scan_overrides(&mut config, args.path.as_ref(), args.min_size);
-
     let mode: CleanMode = args
         .mode
         .map(Into::into)
         .unwrap_or_else(|| config.default_mode.into());
+    let options = CleanOptions {
+        dry_run: args.dry_run,
+        keep_bundles: args.keep_bundles,
+    };
+    let human = !args.json;
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    if args.select && !interactive {
+        eprintln!("--select needs an interactive terminal; nothing was cleaned.");
+        std::process::exit(1);
+    }
 
-    println!("🔍 Scanning {}...", config.projects_dir);
-    let mut projects = match scanner::scan(&config) {
-        Ok(projects) => projects,
+    if human {
+        println!("🔍 Scanning {}...", config.projects_dir);
+    }
+    let report = match crate::scanner::scan_with_report(&config) {
+        Ok(report) => report,
         Err(error) => {
             eprintln!(
                 "Scan failed for '{}' (config {}): {error}.",
@@ -356,51 +396,141 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
             std::process::exit(1);
         }
     };
-
+    let mut projects = report.projects;
     if let Some(days) = args.older_than {
         retain_older_than(&mut projects, days);
     }
-
-    if projects.is_empty() {
+    if human {
         display::print_scan_results(&projects);
+    }
+
+    // Measure every project live (the same plan the clean executes). A
+    // project that cannot be analyzed or measured is reported and excluded;
+    // the rest still proceed, and the run exits 1.
+    let mut errors = report.analysis_failures;
+    let mut failures: Vec<serde_json::Value> = Vec::new();
+    let mut candidates: Vec<(DiscoveredProject, u64)> = Vec::new();
+    for project in projects {
+        match cleaner::estimate_with(&project, &mode, &options) {
+            Ok(bytes) => candidates.push((project, bytes)),
+            Err(error) => {
+                errors += 1;
+                eprintln!(
+                    "Cannot measure {} ({}): {error}. Skipping it.",
+                    project.name,
+                    display::display_path(&project.path)
+                );
+                failures.push(serde_json::json!({
+                    "name": project.name,
+                    "path": project.path,
+                    "result": "error",
+                    "bytes": 0,
+                    "message": error,
+                }));
+            }
+        }
+    }
+
+    if args.select && !candidates.is_empty() {
+        let items: Vec<String> = candidates
+            .iter()
+            .map(|(p, bytes)| {
+                format!(
+                    "{} — {} ({})",
+                    p.name,
+                    display::display_path(&p.path),
+                    format_size(*bytes, BINARY)
+                )
+            })
+            .collect();
+        let defaults = vec![true; items.len()];
+        let chosen = match dialoguer::MultiSelect::new()
+            .with_prompt("Select projects to clean (space toggles, enter confirms)")
+            .items(&items)
+            .defaults(&defaults)
+            .interact()
+        {
+            Ok(chosen) => chosen,
+            Err(error) => {
+                eprintln!("Selection failed: {error}.");
+                std::process::exit(1);
+            }
+        };
+        candidates = candidates
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| chosen.contains(index))
+            .map(|(_, candidate)| candidate)
+            .collect();
+    }
+
+    let total_estimate = candidates
+        .iter()
+        .fold(0u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
+
+    if human && mode == CleanMode::Full && !args.keep_bundles {
+        let with_bundles = candidates
+            .iter()
+            .filter(|(p, _)| !cleaner::bundle_dirs(&p.artifact_dir).is_empty())
+            .count();
+        if with_bundles > 0 {
+            let subject = if with_bundles == 1 {
+                "1 project contains".to_string()
+            } else {
+                format!("{with_bundles} projects contain")
+            };
+            println!(
+                "  {} {subject} Tauri installer bundles (target/*/release/bundle) that full mode deletes. Use --keep-bundles to preserve them.\n",
+                "⚠".yellow().bold(),
+            );
+        }
+    }
+
+    if human {
+        println!("  Mode: {}\n  Behavior: {}\n", mode, config.clean_behavior);
+    }
+
+    if args.dry_run {
+        if human {
+            println!(
+                "  {} Would free {} across {}.",
+                "[DRY RUN]".yellow().bold(),
+                format_size(total_estimate, BINARY).green().bold(),
+                project_count(candidates.len()),
+            );
+        } else {
+            let mut entries: Vec<serde_json::Value> = candidates
+                .iter()
+                .map(|(p, bytes)| {
+                    serde_json::json!({
+                        "name": p.name,
+                        "path": p.path,
+                        "result": "would-clean",
+                        "bytes": bytes,
+                    })
+                })
+                .collect();
+            entries.extend(failures);
+            print_clean_json(&mode, &config.clean_behavior, true, total_estimate, entries);
+        }
+        exit_if_errors(errors, human);
         return;
     }
 
-    display::print_scan_results(&projects);
-
-    let total_estimate: u64 = projects
-        .iter()
-        .map(|p| {
-            cleaner::estimate_freed(p, &mode).unwrap_or_else(|error| {
-                eprintln!(
-                    "Cannot estimate {} ({}) for mode {mode}: {error}.",
-                    p.name,
-                    p.path.display()
-                );
-                std::process::exit(1);
-            })
-        })
-        .fold(0u64, |acc, bytes| acc.saturating_add(bytes));
-
-    println!("  Mode: {}\n  Behavior: {}\n", mode, config.clean_behavior);
-
-    if args.dry_run {
-        println!(
-            "  {} Would free {} across {}.",
-            "[DRY RUN]".yellow().bold(),
-            format_size(total_estimate, BINARY).green().bold(),
-            project_count(projects.len()),
-        );
+    if candidates.is_empty() {
+        if !human {
+            print_clean_json(&mode, &config.clean_behavior, false, 0, failures);
+        }
+        exit_if_errors(errors, human);
         return;
     }
 
     if !args.yes {
-        use dialoguer::Confirm;
         // Declining (Ok(false)) cancels with exit 0; only I/O failure exits 1.
-        match Confirm::new()
+        match dialoguer::Confirm::new()
             .with_prompt(format!(
                 "Clean {} to reclaim ~{}?",
-                project_count(projects.len()),
+                project_count(candidates.len()),
                 format_size(total_estimate, BINARY),
             ))
             .default(true)
@@ -420,144 +550,163 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
 
     let mut total_freed = 0u64;
     let mut cleaned = 0usize;
-    let mut errors = 0usize;
-
-    for project in &projects {
-        let result = cleaner::clean_project(project, &mode, &config.clean_behavior, false);
-        display::print_clean_result(&project.name, &result, &mode);
-        match result {
-            cleaner::CleanResult::Cleaned { bytes_freed } => {
-                total_freed = total_freed.saturating_add(bytes_freed);
+    let mut entries = failures;
+    for (project, _) in &candidates {
+        let result = cleaner::clean_project_with(project, &mode, &config.clean_behavior, &options);
+        if human {
+            display::print_clean_result(project, &result);
+        }
+        let (label, bytes, message) = match &result {
+            CleanResult::Cleaned { bytes_freed } => {
+                total_freed = total_freed.saturating_add(*bytes_freed);
                 cleaned += 1;
+                ("cleaned", *bytes_freed, None)
             }
-            cleaner::CleanResult::Partial { bytes_freed, .. } => {
-                total_freed = total_freed.saturating_add(bytes_freed);
+            CleanResult::Partial {
+                bytes_freed,
+                message,
+            } => {
+                total_freed = total_freed.saturating_add(*bytes_freed);
                 cleaned += 1;
                 errors += 1;
+                ("partial", *bytes_freed, Some(message.clone()))
             }
-            cleaner::CleanResult::Error { .. } => errors += 1,
-            _ => {}
-        }
+            CleanResult::Skipped { reason } => ("skipped", 0, Some(reason.clone())),
+            CleanResult::Error { message } => {
+                errors += 1;
+                ("error", 0, Some(message.clone()))
+            }
+        };
+        entries.push(serde_json::json!({
+            "name": project.name,
+            "path": project.path,
+            "result": label,
+            "bytes": bytes,
+            "message": message,
+        }));
     }
 
-    display::print_clean_summary(total_freed, cleaned, errors, &mode);
+    if human {
+        display::print_clean_summary(
+            total_freed,
+            cleaned,
+            errors,
+            &mode,
+            config.clean_behavior == CleanBehavior::Trash,
+        );
+    } else {
+        print_clean_json(&mode, &config.clean_behavior, false, total_freed, entries);
+    }
+    exit_if_errors(errors, human);
+}
+
+fn print_clean_json(
+    mode: &crate::cleaner::CleanMode,
+    behavior: &CleanBehavior,
+    dry_run: bool,
+    bytes: u64,
+    projects: Vec<serde_json::Value>,
+) {
+    let value = serde_json::json!({
+        "mode": mode.to_string(),
+        "behavior": behavior.to_string(),
+        "dry_run": dry_run,
+        "bytes": bytes,
+        "projects": projects,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).unwrap_or_default()
+    );
+}
+
+fn exit_if_errors(errors: usize, human: bool) {
     if errors > 0 {
-        eprintln!("Clean completed with errors.");
+        if human {
+            eprintln!("Clean completed with errors.");
+        }
         std::process::exit(1);
     }
 }
 
 fn run_scan(args: ScanArgs, config_override: Option<&PathBuf>) {
-    use crate::display;
-    use crate::scanner;
-
     let mut config = load_config_or_default(config_override);
-
     apply_scan_overrides(&mut config, args.path.as_ref(), args.min_size);
-
-    println!("🔍 Scanning {}...\n", config.projects_dir);
-    let mut projects = match scanner::scan(&config) {
-        Ok(projects) => projects,
-        Err(error) => {
-            eprintln!(
-                "Scan failed for '{}' (config {}): {error}.",
-                config.projects_dir,
-                effective_config_path(config_override).display()
-            );
-            std::process::exit(1);
-        }
-    };
-
+    if !args.json {
+        println!("🔍 Scanning {}...\n", config.projects_dir);
+    }
+    let mut projects = scan_or_exit(&config, config_override);
     if let Some(days) = args.older_than {
         retain_older_than(&mut projects, days);
     }
-
-    display::print_scan_results(&projects);
+    if args.json {
+        crate::display::print_scan_json(&projects);
+    } else {
+        crate::display::print_scan_results(&projects);
+    }
 }
 
 fn run_inspect(args: InspectArgs) {
-    use crate::config::Scope;
-    use crate::display;
-    use crate::scanner::scan_dir;
+    use crate::scanner::{enclosing_project_root, scan_dir};
 
-    let project_path = args.project.as_path();
-    // Avoid TOCTOU (`exists()` then use): act on `canonicalize` directly and
-    // map `NotFound` to the user-facing missing-path error.
-    let requested_path = match project_path.canonicalize() {
+    let requested_path = match dunce::canonicalize(&args.project) {
         Ok(canonical) => canonical,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             eprintln!("Path does not exist: {}", args.project.display());
             std::process::exit(1);
         }
-        Err(_) => project_path.to_path_buf(),
-    };
-
-    // Explicit-path inspection bypasses the configured scope, min-size, and
-    // ignored-projects filters by design: the user named a concrete project,
-    // so it is inspected regardless of scan preferences. The broad
-    // TauriAndRust scope below only decides which project kinds are
-    // recognizable here, and `--scope` can narrow it. Clap validates
-    // `--scope` (exit 2) via `ValueEnum`; the tool writes kebab-case via
-    // `Display` and the config file requires kebab-case strict serde;
-    // `from_str_loose` in `config.rs` is only for CLI/settings input compat.
-    let scope = args.scope.unwrap_or(Scope::TauriAndRust);
-
-    let projects = match scan_dir(project_path, &scope) {
-        Ok(projects) => projects,
         Err(error) => {
-            eprintln!("Scan failed for '{}': {error}.", project_path.display());
+            eprintln!("Cannot resolve {}: {error}", args.project.display());
             std::process::exit(1);
         }
     };
-    let projects = if projects.is_empty() {
-        let parent = project_path.parent().unwrap_or(project_path);
-        match scan_dir(parent, &scope) {
-            Ok(projects) => projects,
-            Err(error) => {
-                eprintln!("Scan failed for '{}': {error}.", parent.display());
-                std::process::exit(1);
-            }
+
+    // Explicit-path inspection bypasses the configured scope, min-size, and
+    // ignored-projects filters by design. Only the enclosing project (or
+    // workspace) is scanned — never its parent folder.
+    let scope = args.scope.unwrap_or(Scope::TauriAndRust);
+    let Some(base) = enclosing_project_root(&requested_path) else {
+        eprintln!("No Rust/Tauri project found at: {}", args.project.display());
+        std::process::exit(1);
+    };
+    let projects = match scan_dir(&base, &scope) {
+        Ok(projects) => projects,
+        Err(error) => {
+            eprintln!("Scan failed for '{}': {error}.", base.display());
+            std::process::exit(1);
         }
-    } else {
-        projects
     };
 
     if let Some(project) = find_inspection_project(projects, &requested_path) {
-        display::print_inspection(&project);
+        crate::display::print_inspection(&project);
     } else {
-        eprintln!("No Rust/Tauri project found at: {}", args.project.display());
+        eprintln!(
+            "No Rust/Tauri project with build artifacts found at: {}",
+            args.project.display()
+        );
         std::process::exit(1);
     }
 }
 
 fn find_inspection_project(
-    projects: Vec<crate::project::DiscoveredProject>,
+    projects: Vec<DiscoveredProject>,
     requested_path: &std::path::Path,
-) -> Option<crate::project::DiscoveredProject> {
-    // Canonicalize both sides for comparison; keep exact match plus
-    // `starts_with` (inspecting a file inside a project). The old substring
-    // `contains` fallback is intentionally dropped: it could match unrelated
-    // siblings sharing a name fragment.
-    let requested = canonicalize_or_self(requested_path);
-    let mut projects = projects.into_iter();
+) -> Option<DiscoveredProject> {
+    // Most specific project root containing the requested path wins.
     projects
-        .find(|project| canonicalize_or_self(&project.path) == requested)
-        .or_else(|| {
-            projects.find(|project| {
-                let path = canonicalize_or_self(&project.path);
-                requested.starts_with(&path)
-            })
+        .into_iter()
+        .filter_map(|project| {
+            let path = dunce::canonicalize(&project.path).unwrap_or_else(|_| project.path.clone());
+            requested_path
+                .starts_with(&path)
+                .then(|| (path.components().count(), project))
         })
-}
-
-/// Canonicalize a path for comparison, falling back to the original path
-/// when resolution fails (e.g. removed or unreadable entries).
-fn canonicalize_or_self(path: &std::path::Path) -> std::path::PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, project)| project)
 }
 
 /// Keep only projects not modified in the last `days` days.
-fn retain_older_than(projects: &mut Vec<crate::project::DiscoveredProject>, days: u32) {
+fn retain_older_than(projects: &mut Vec<DiscoveredProject>, days: u32) {
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(u64::from(days) * 86400));
     let Some(cutoff) = cutoff else {
@@ -577,7 +726,7 @@ fn apply_scan_overrides(config: &mut Config, path: Option<&String>, min_size: Op
             eprintln!("Invalid --path: must not be empty.");
             std::process::exit(2);
         }
-        config.projects_dir = path.clone();
+        config.projects_dir = crate::config::normalize_projects_dir(path);
     }
     if let Some(min_mb) = min_size {
         config.min_size_mb = min_mb;
