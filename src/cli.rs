@@ -538,7 +538,8 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
         {
             Ok(true) => {}
             Ok(false) => {
-                println!("Cancelled.");
+                // stderr keeps `--json` stdout parseable.
+                eprintln!("Cancelled.");
                 return;
             }
             Err(error) => {
