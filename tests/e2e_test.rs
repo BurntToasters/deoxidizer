@@ -641,6 +641,14 @@ fn e2e_19_non_utf8_project_dir_cleans_and_serializes() {
     file(&plain.join("target/debug/x"), 1000);
     // Byte 0xE9 is Latin-1 `é`: not valid UTF-8, but a legal Unix file name.
     let latin = w.projects.join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+    // APFS (macOS) rejects non-UTF-8 names with EILSEQ; such paths cannot
+    // exist there, so the crash this guards against cannot happen.
+    if let Err(error) = fs::create_dir(&latin) {
+        w.note(&format!(
+            "SKIP: filesystem rejects non-UTF-8 directory names ({error})"
+        ));
+        return;
+    }
     crate_at(&latin, "latin", "");
     mark_cargo_target(&latin.join("target"));
     file(&latin.join("target/debug/x"), 1000);
