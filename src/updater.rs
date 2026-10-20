@@ -908,7 +908,10 @@ fn extract_zip(archive_bytes: &[u8], destination: &Path) -> Result<(), String> {
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("Failed to read zip entry: {error}"))?;
-        let raw_name = entry.name().to_string();
+        let raw_name = entry
+            .name()
+            .map_err(|error| format!("Invalid zip entry name: {error}"))?
+            .into_owned();
         if raw_name.contains('\\') {
             return Err(format!("archive contains unsafe path {raw_name}"));
         }
