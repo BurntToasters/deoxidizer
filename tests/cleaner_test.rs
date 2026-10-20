@@ -2,10 +2,20 @@ use deoxidizer_lib::cleaner::{clean_project, estimate_freed, CleanMode};
 use deoxidizer_lib::config::{CleanBehavior, Config, Scope};
 use deoxidizer_lib::project::{DiscoveredProject, ProjectKind, TargetBreakdown};
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
+
+/// The `CACHEDIR.TAG` Cargo writes into every target directory it builds.
+const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n";
+
+/// Create `target` the way Cargo does, with its `CACHEDIR.TAG` marker.
+fn mark_cargo_target(target: &Path) {
+    fs::create_dir_all(target).unwrap();
+    fs::write(target.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+}
 
 /// Create a mock project with a populated target directory.
 fn create_mock_project(root: &std::path::Path) -> DiscoveredProject {
@@ -28,6 +38,7 @@ edition = "2021"
     fs::create_dir_all(&debug_deps).unwrap();
     fs::create_dir_all(&debug_inc).unwrap();
     fs::create_dir_all(&release_deps).unwrap();
+    mark_cargo_target(&target);
 
     // Create files of known sizes
     fs::write(debug_deps.join("lib.rlib"), vec![0u8; 4096]).unwrap();
@@ -253,6 +264,7 @@ fn test_clean_removes_symlink_inside_target_without_following() {
         "[package]\nname = \"nested-symlink\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .unwrap();
+    mark_cargo_target(&project_root.path().join("target"));
     fs::create_dir_all(&target).unwrap();
     symlink(&outside_file, target.join("linked-file")).unwrap();
     let project = DiscoveredProject {
@@ -279,6 +291,7 @@ fn test_clean_removes_symlink_inside_target_without_following() {
 fn test_clean_rejects_forged_project_identity() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("target/debug");
+    mark_cargo_target(&root.path().join("target"));
     fs::create_dir_all(&target).unwrap();
     fs::write(
         root.path().join("Cargo.toml"),
@@ -394,7 +407,7 @@ fn test_clean_skipped_when_no_matching_dirs() {
         "[package]\nname = \"empty-target\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .unwrap();
-    fs::create_dir_all(root.path().join("target")).unwrap();
+    mark_cargo_target(&root.path().join("target"));
     let project = DiscoveredProject {
         name: "empty-target".to_string(),
         path: root.path().to_path_buf(),
@@ -426,6 +439,7 @@ fn test_clean_skipped_when_no_matching_dirs() {
     )
     .unwrap();
     let release_dir = release_only.path().join("target/release");
+    mark_cargo_target(&release_only.path().join("target"));
     fs::create_dir_all(&release_dir).unwrap();
     fs::write(release_dir.join("app"), b"artifact").unwrap();
     let release_project = DiscoveredProject {
@@ -712,7 +726,7 @@ fn test_estimate_without_breakdown_walks_filesystem() {
     // Without a cached breakdown the estimate must equal live file bytes.
     assert_eq!(
         estimate_freed(&project, &CleanMode::Full).unwrap(),
-        4096 + 2048 + 1024 + 512
+        4096 + 2048 + 1024 + 512 + CACHEDIR_TAG.len() as u64
     );
     assert_eq!(
         estimate_freed(&project, &CleanMode::IncrementalOnly).unwrap(),
@@ -742,7 +756,7 @@ fn test_estimate_empty_target_is_zero() {
         "[package]\nname = \"empty\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .unwrap();
-    fs::create_dir_all(root.path().join("target")).unwrap();
+    mark_cargo_target(&root.path().join("target"));
     let project = DiscoveredProject {
         name: "empty".to_string(),
         path: root.path().to_path_buf(),
@@ -754,7 +768,11 @@ fn test_estimate_empty_target_is_zero() {
         members: Vec::new(),
     };
 
-    assert_eq!(estimate_freed(&project, &CleanMode::Full).unwrap(), 0);
+    // Only Cargo's marker is inside: a full clean frees exactly that file.
+    assert_eq!(
+        estimate_freed(&project, &CleanMode::Full).unwrap(),
+        CACHEDIR_TAG.len() as u64
+    );
 }
 
 #[cfg(unix)]
@@ -771,6 +789,7 @@ fn test_selective_modes_remove_symlink_inside_target_without_following() {
     )
     .unwrap();
     let deps = project_root.path().join("target/debug/deps");
+    mark_cargo_target(&project_root.path().join("target"));
     fs::create_dir_all(&deps).unwrap();
     fs::write(deps.join("lib.rlib"), b"artifact").unwrap();
     symlink(&outside_file, deps.join("linked-file")).unwrap();
@@ -807,7 +826,7 @@ fn test_full_mode_on_empty_target() {
         "[package]\nname = \"empty-target\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .unwrap();
-    fs::create_dir_all(root.path().join("target")).unwrap();
+    mark_cargo_target(&root.path().join("target"));
     let project = DiscoveredProject {
         name: "empty-target".to_string(),
         path: root.path().to_path_buf(),
@@ -819,11 +838,12 @@ fn test_full_mode_on_empty_target() {
         members: Vec::new(),
     };
 
-    // Locked-in behavior: an existing but empty target/ still resolves to a
-    // Cleaned result with zero bytes (not Skipped, not Error).
+    // Locked-in behavior: a marked target/ holding only Cargo's CACHEDIR.TAG
+    // still resolves to a Cleaned result, freeing just that marker file
+    // (not Skipped, not Error).
     match clean_project(&project, &CleanMode::Full, &CleanBehavior::Delete, false) {
         deoxidizer_lib::cleaner::CleanResult::Cleaned { bytes_freed } => {
-            assert_eq!(bytes_freed, 0);
+            assert_eq!(bytes_freed, CACHEDIR_TAG.len() as u64);
         }
         other => panic!("expected Cleaned with zero bytes, got {other:?}"),
     }
@@ -921,4 +941,51 @@ fn test_windows_symlink_target_rejected() {
         "got {result:?}"
     );
     assert!(sentinel.exists());
+}
+
+#[test]
+fn test_clean_refuses_unmarked_target() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"ghost\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.path().join("target/specs")).unwrap();
+    fs::write(root.path().join("target/specs/x86_64-os.json"), b"spec").unwrap();
+    fs::write(root.path().join("target/README.md"), b"readme").unwrap();
+    // Forged record: as if a scan had reported this unmarked target.
+    let project = DiscoveredProject {
+        name: "ghost".to_string(),
+        path: root.path().to_path_buf(),
+        kind: ProjectKind::RustProject,
+        artifact_dir: root.path().join("target"),
+        artifact_size: 0,
+        last_modified: None,
+        breakdown: None,
+        members: vec!["ghost".to_string()],
+    };
+
+    for mode in [
+        CleanMode::Full,
+        CleanMode::DebugOnly,
+        CleanMode::IncrementalOnly,
+        CleanMode::DepsOnly,
+    ] {
+        assert!(
+            estimate_freed(&project, &mode).is_err(),
+            "estimate must refuse {mode:?}"
+        );
+        match clean_project(&project, &mode, &CleanBehavior::Delete, false) {
+            deoxidizer_lib::cleaner::CleanResult::Error { message } => {
+                assert!(
+                    message.contains("not a Cargo build directory"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected refusal for {mode:?}, got {other:?}"),
+        }
+    }
+    assert!(root.path().join("target/specs/x86_64-os.json").exists());
+    assert!(root.path().join("target/README.md").exists());
 }

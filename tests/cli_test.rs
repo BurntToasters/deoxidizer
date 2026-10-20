@@ -23,6 +23,12 @@ fn write_test_config(home: &Path, projects_dir: &Path) {
 fn create_clean_project(projects_dir: &Path) -> std::path::PathBuf {
     let root = projects_dir.join("test-project");
     std::fs::create_dir_all(root.join("target/debug")).unwrap();
+    // Cargo writes this marker into every target directory it builds.
+    std::fs::write(
+        root.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n",
+    )
+    .unwrap();
     std::fs::write(
         root.join("Cargo.toml"),
         "[package]\nname = \"test-project\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntauri = \"2\"\n",

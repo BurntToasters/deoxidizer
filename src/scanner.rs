@@ -1,9 +1,10 @@
 use crate::config::{Config, Scope};
 use crate::project::{DiscoveredProject, ProjectKind, TargetBreakdown};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use toml::Value;
@@ -11,6 +12,12 @@ use walkdir::WalkDir;
 
 /// Maximum number of skipped-folder paths printed individually.
 const MAX_SKIPPED_SHOWN: usize = 5;
+
+/// Signature line Cargo writes at the start of `CACHEDIR.TAG` in every target dir.
+const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Cargo writes `.rustc_info.json` into every target directory it builds.
+const RUSTC_INFO_FILE: &str = ".rustc_info.json";
 
 /// Errors encountered while scanning configured project roots.
 #[derive(Debug)]
@@ -105,6 +112,7 @@ pub fn scan_dir(root: &Path, scope: &Scope) -> Result<Vec<DiscoveredProject>, Sc
 pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanError> {
     let root = validate_scan_root(root)?;
     let mut manifest_cache: HashMap<PathBuf, Option<Value>> = HashMap::new();
+    let mut unmarked_warned: HashSet<PathBuf> = HashSet::new();
 
     // Collect candidate manifests first so grouping is deterministic.
     // NOTE: same_file_system(true) is deliberately not set; target dirs may
@@ -153,9 +161,13 @@ pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanErr
         if !has_package && manifest.get("workspace").is_none() {
             continue;
         }
-        let Some((owner, target_dir)) =
-            resolve_target_dir(project_dir, &manifest, &root, &mut manifest_cache)
-        else {
+        let Some((owner, target_dir)) = resolve_target_dir(
+            project_dir,
+            &manifest,
+            &root,
+            &mut manifest_cache,
+            &mut unmarked_warned,
+        ) else {
             continue;
         };
         let canonical = match dunce::canonicalize(&target_dir) {
@@ -362,13 +374,17 @@ fn cached_manifest(path: &Path, cache: &mut HashMap<PathBuf, Option<Value>>) -> 
 ///
 /// `CARGO_TARGET_DIR` and `build.target-dir` overrides are not honored: only
 /// `target/` directly under a project or workspace root is ever cleaned.
+///
+/// A `target/` without a Cargo marker (see [`is_cargo_target_dir`]) is not a
+/// build directory: it is reported once and treated as absent.
 fn resolve_target_dir(
     project_dir: &Path,
     manifest: &Value,
     scan_root: &Path,
     cache: &mut HashMap<PathBuf, Option<Value>>,
+    warned: &mut HashSet<PathBuf>,
 ) -> Option<(PathBuf, PathBuf)> {
-    if let Some(target) = real_directory(&project_dir.join("target")) {
+    if let Some(target) = real_build_dir(&project_dir.join("target"), warned) {
         return Some((project_dir.to_path_buf(), target));
     }
     if manifest.get("workspace").is_some() {
@@ -385,10 +401,53 @@ fn resolve_target_dir(
         if ancestor_manifest.get("workspace").is_none() {
             continue;
         }
-        return real_directory(&ancestor.join("target"))
+        return real_build_dir(&ancestor.join("target"), warned)
             .map(|target| (ancestor.to_path_buf(), target));
     }
     None
+}
+
+/// A real `target/` directory that carries a Cargo marker; anything else is
+/// warned about once per path and treated as if it did not exist.
+fn real_build_dir(path: &Path, warned: &mut HashSet<PathBuf>) -> Option<PathBuf> {
+    let target = real_directory(path)?;
+    if is_cargo_target_dir(&target) {
+        return Some(target);
+    }
+    if warned.insert(target.clone()) {
+        eprintln!(
+            "Warning: skipping {}: not a Cargo build directory (no CACHEDIR.TAG or .rustc_info.json)",
+            target.display()
+        );
+    }
+    None
+}
+
+/// Whether `path` is a Cargo build directory: a real (non-symlink) directory
+/// holding a regular `CACHEDIR.TAG` whose contents start with Cargo's
+/// signature, or a regular non-symlink `.rustc_info.json`.
+///
+/// This is the fail-closed gate that keeps a folder merely named `target`
+/// (with unrelated contents) from ever being removed.
+pub fn is_cargo_target_dir(path: &Path) -> bool {
+    let is_regular = |candidate: &Path| {
+        fs::symlink_metadata(candidate)
+            .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    };
+    let cachedir = path.join("CACHEDIR.TAG");
+    if is_regular(&cachedir) {
+        let mut prefix = Vec::with_capacity(CACHEDIR_SIGNATURE.len());
+        if let Ok(file) = fs::File::open(&cachedir) {
+            let _ = file
+                .take(CACHEDIR_SIGNATURE.len() as u64)
+                .read_to_end(&mut prefix);
+        }
+        if prefix.starts_with(CACHEDIR_SIGNATURE) {
+            return true;
+        }
+    }
+    is_regular(&path.join(RUSTC_INFO_FILE))
 }
 
 /// Nearest manifest at or above `project_dir` declaring `[workspace]`,
@@ -668,5 +727,4 @@ fn is_artifact_dir(entry: &walkdir::DirEntry) -> bool {
         || path
             .parent()
             .is_some_and(|parent| parent.join("Cargo.toml").exists())
-        || !path.join("Cargo.toml").exists()
 }

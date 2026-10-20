@@ -1,12 +1,21 @@
 use deoxidizer_lib::config::{Config, Scope};
 #[cfg(unix)]
 use deoxidizer_lib::scanner::ScanError;
-use deoxidizer_lib::scanner::{scan, scan_dir};
+use deoxidizer_lib::scanner::{is_cargo_target_dir, scan, scan_dir};
 use std::fs;
 use std::path::Path;
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
+
+/// The `CACHEDIR.TAG` Cargo writes into every target directory it builds.
+const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n";
+
+/// Create `target` the way Cargo does, with its `CACHEDIR.TAG` marker.
+fn mark_cargo_target(target: &Path) {
+    fs::create_dir_all(target).unwrap();
+    fs::write(target.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+}
 
 /// Create a minimal mock Tauri project structure.
 fn create_mock_tauri_project(root: &Path, name: &str) {
@@ -17,6 +26,7 @@ fn create_mock_tauri_project(root: &Path, name: &str) {
 
     fs::create_dir_all(&debug_dir).unwrap();
     fs::create_dir_all(&incremental_dir).unwrap();
+    mark_cargo_target(&target_dir);
 
     // Write a minimal Cargo.toml with tauri dependency
     fs::write(
@@ -46,6 +56,7 @@ fn create_mock_rust_project(root: &Path, name: &str) {
     let debug_dir = target_dir.join("debug");
 
     fs::create_dir_all(&debug_dir).unwrap();
+    mark_cargo_target(&target_dir);
 
     fs::write(
         project_dir.join("Cargo.toml"),
@@ -142,6 +153,7 @@ fn test_scan_respects_ignored_projects() {
 fn test_scan_detects_renamed_tauri_dependency() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("renamed-tauri");
+    mark_cargo_target(&project.join("target"));
     fs::create_dir_all(project.join("target/debug")).unwrap();
     fs::write(
         project.join("Cargo.toml"),
@@ -167,6 +179,7 @@ fn test_scan_detects_workspace_shared_target() {
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("workspace");
     let member = workspace.join("app");
+    mark_cargo_target(&workspace.join("target"));
     fs::create_dir_all(workspace.join("target/debug")).unwrap();
     fs::create_dir_all(&member).unwrap();
     fs::write(
@@ -197,10 +210,10 @@ tauri.workspace = true
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].name, "workspace");
     assert_eq!(projects[0].members, vec!["workspace-app".to_string()]);
-    assert_eq!(projects[0].path, workspace.canonicalize().unwrap());
+    assert_eq!(projects[0].path, dunce::canonicalize(&workspace).unwrap());
     assert_eq!(
         projects[0].artifact_dir,
-        workspace.join("target").canonicalize().unwrap()
+        dunce::canonicalize(workspace.join("target")).unwrap()
     );
 }
 
@@ -209,6 +222,7 @@ fn test_scan_detects_inherited_renamed_tauri_dependency() {
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("workspace");
     let member = workspace.join("app");
+    mark_cargo_target(&workspace.join("target"));
     fs::create_dir_all(workspace.join("target/debug")).unwrap();
     fs::create_dir_all(&member).unwrap();
     fs::write(
@@ -252,6 +266,7 @@ fn test_scan_invalid_root_returns_error() {
 fn test_scan_ignores_symlinked_target() {
     let tmp = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
+    mark_cargo_target(&outside.path().join("target"));
     fs::create_dir_all(outside.path().join("target/debug")).unwrap();
     fs::write(outside.path().join("target/debug/artifact"), b"outside").unwrap();
 
@@ -422,9 +437,10 @@ fn test_older_than_retains_stale_drops_fresh_and_unknown() {
     let tmp = tempfile::tempdir().unwrap();
     create_mock_tauri_project(tmp.path(), "stale-app");
     create_mock_tauri_project(tmp.path(), "fresh-app");
-    // Project with an empty target/: no file mtimes means unknown age.
+    // Project whose target/ holds only Cargo's marker: that file's mtime is
+    // fresh, so the project is dropped as too recent.
     let unknown = tmp.path().join("unknown-app");
-    fs::create_dir_all(unknown.join("target")).unwrap();
+    mark_cargo_target(&unknown.join("target"));
     fs::write(
         unknown.join("Cargo.toml"),
         "[package]\nname = \"unknown-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntauri = \"2\"\n",
@@ -432,7 +448,12 @@ fn test_older_than_retains_stale_drops_fresh_and_unknown() {
     .unwrap();
 
     // Wide margins only: 5-day-old fixtures against a 2-day cutoff.
-    for file in ["debug/deps/dummy.rlib", "debug/incremental/dummy.incr"] {
+    // The marker's mtime is part of the target's age, so backdate it too.
+    for file in [
+        "CACHEDIR.TAG",
+        "debug/deps/dummy.rlib",
+        "debug/incremental/dummy.incr",
+    ] {
         backdate_file(&tmp.path().join("stale-app/src-tauri/target").join(file), 5);
     }
 
@@ -466,6 +487,7 @@ fn test_older_than_retains_stale_drops_fresh_and_unknown() {
 fn test_scan_min_size_boundary_and_overflow() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("exact-app");
+    mark_cargo_target(&project.join("target"));
     fs::create_dir_all(project.join("target/debug")).unwrap();
     fs::write(
         project.join("Cargo.toml"),
@@ -544,6 +566,7 @@ fn test_scan_permission_denied_no_panic() {
     let tmp = tempfile::tempdir().unwrap();
     create_mock_rust_project(tmp.path(), "visible-app");
     let locked = tmp.path().join("locked");
+    mark_cargo_target(&locked.join("target"));
     fs::create_dir_all(locked.join("target/debug")).unwrap();
     fs::write(
         locked.join("Cargo.toml"),
@@ -564,5 +587,55 @@ fn test_scan_permission_denied_no_panic() {
         Ok(_) => {}
         Err(ScanError::Traversal(_)) => {}
         Err(other) => panic!("expected Ok or Traversal, got {other}"),
+    }
+}
+
+#[test]
+fn test_scan_skips_unmarked_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("ghost");
+    fs::create_dir_all(project.join("target/specs")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"ghost\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntauri = \"2\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("target/specs/x86_64-os.json"), b"{}").unwrap();
+    fs::write(project.join("target/README.md"), b"not cargo").unwrap();
+
+    assert!(scan_dir(tmp.path(), &Scope::TauriAndRust)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn test_is_cargo_target_dir_requires_positive_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("target");
+    fs::create_dir_all(&dir).unwrap();
+    assert!(!is_cargo_target_dir(&dir), "empty dir is not a build dir");
+
+    fs::write(dir.join("CACHEDIR.TAG"), b"Signature: 00000000\n").unwrap();
+    assert!(!is_cargo_target_dir(&dir), "wrong CACHEDIR.TAG signature");
+    fs::remove_file(dir.join("CACHEDIR.TAG")).unwrap();
+
+    fs::write(
+        dir.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    assert!(is_cargo_target_dir(&dir), "CACHEDIR.TAG marker");
+    fs::remove_file(dir.join("CACHEDIR.TAG")).unwrap();
+
+    fs::write(dir.join(".rustc_info.json"), b"{}").unwrap();
+    assert!(is_cargo_target_dir(&dir), ".rustc_info.json marker");
+    fs::remove_file(dir.join(".rustc_info.json")).unwrap();
+
+    #[cfg(unix)]
+    {
+        let outside = tmp.path().join("outside.tag");
+        fs::write(&outside, "Signature: 8a477f597d28d172789f06886806bc55\n").unwrap();
+        symlink(&outside, dir.join("CACHEDIR.TAG")).unwrap();
+        assert!(!is_cargo_target_dir(&dir), "symlinked marker is refused");
     }
 }

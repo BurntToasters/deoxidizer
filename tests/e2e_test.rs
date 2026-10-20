@@ -24,6 +24,9 @@
 //! 15. `clean --select` without a TTY must refuse, never fall through.
 //! 16. Nearest workspace wins: an outer workspace's target is never
 //!     attributed to an unrelated inner workspace.
+//! 17. A `target/` without Cargo's marker (CACHEDIR.TAG or .rustc_info.json)
+//!     is not a build directory: never scanned, never cleaned.
+//! 18. A crate nested in a plain folder named `target` is found and cleaned.
 
 use std::fs;
 use std::io::Write;
@@ -155,6 +158,15 @@ fn crate_at(dir: &Path, name: &str, deps: &str) {
     fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
 }
 
+/// The `CACHEDIR.TAG` Cargo writes into every target directory it builds.
+const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n";
+
+/// Create `target` the way Cargo does, with its `CACHEDIR.TAG` marker.
+fn mark_cargo_target(target: &Path) {
+    fs::create_dir_all(target).unwrap();
+    fs::write(target.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+}
+
 fn file(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, vec![0u8; bytes]).unwrap();
@@ -178,6 +190,7 @@ fn e2e_01_symlink_inside_target_does_not_block_clean() {
     let mut w = World::new("01-symlink-inside-target", "tauri-only");
     let app = w.projects.join("appimg/src-tauri");
     crate_at(&app, "appimg", "tauri = \"2\"");
+    mark_cargo_target(&app.join("target"));
     file(&app.join("target/debug/deps/libx.rlib"), 4096);
     let appdir = app.join("target/release/bundle/appimage/appimg.AppDir");
     file(&appdir.join("appimg.png"), 100);
@@ -202,6 +215,7 @@ fn e2e_02_unreadable_folder_does_not_abort_scan() {
     let mut w = World::new("02-unreadable-folder", "tauri-only");
     let app = w.projects.join("good/src-tauri");
     crate_at(&app, "good", "tauri = \"2\"");
+    mark_cargo_target(&app.join("target"));
     file(&app.join("target/debug/x"), 1000);
     let locked = w.projects.join("docker-data");
     fs::create_dir_all(locked.join("inner")).unwrap();
@@ -229,6 +243,7 @@ fn e2e_03_dry_run_matches_actual_clean() {
     crate_at(&a, "a", "");
     // Files with `debug`/`deps`/`incremental` deep in release paths are not
     // removed by the selective modes and must not be counted.
+    mark_cargo_target(&a.join("target"));
     file(
         &a.join("target/release/build/openssl-sys-1/out/debug/big.a"),
         50_000,
@@ -269,6 +284,7 @@ fn e2e_04_same_name_projects_are_distinguishable() {
     for dir in ["one", "two"] {
         let app = w.projects.join(dir).join("src-tauri");
         crate_at(&app, "app", "tauri = \"2\"");
+        mark_cargo_target(&app.join("target"));
         file(&app.join("target/debug/x"), 1000);
     }
     let out = w.run(&["scan"]);
@@ -298,6 +314,7 @@ fn e2e_05_workspace_is_one_quiet_named_project() {
     for member in ["a", "b", "c"] {
         crate_at(&ws.join("crates").join(member), member, "");
     }
+    mark_cargo_target(&ws.join("target"));
     file(&ws.join("target/debug/x"), 1000);
 
     let out = w.run(&["scan", "--json"]);
@@ -350,6 +367,7 @@ fn e2e_08_inspect_nested_path_finds_project() {
     let mut w = World::new("08-inspect-nested", "tauri-only");
     let app = w.projects.join("proj/src-tauri");
     crate_at(&app, "proj", "tauri = \"2\"");
+    mark_cargo_target(&app.join("target"));
     file(&app.join("target/debug/x"), 1000);
     let nested = app.join("src/bin/tool.rs");
     file(&nested, 10);
@@ -370,9 +388,11 @@ fn e2e_09_one_failing_project_does_not_abort_clean() {
     let mut w = World::new("09-partial-failure", "tauri-and-rust");
     let good = w.projects.join("good");
     crate_at(&good, "good", "");
+    mark_cargo_target(&good.join("target"));
     file(&good.join("target/debug/x"), 1000);
     let bad = w.projects.join("bad");
     crate_at(&bad, "bad", "");
+    mark_cargo_target(&bad.join("target"));
     file(&bad.join("target/debug/sub/x"), 1000);
     let sub = bad.join("target/debug/sub");
     fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
@@ -393,6 +413,7 @@ fn e2e_10_tauri_bundles_warned_and_keepable() {
     let mut w = World::new("10-keep-bundles", "tauri-only");
     let app = w.projects.join("app/src-tauri");
     crate_at(&app, "app", "tauri = \"2\"");
+    mark_cargo_target(&app.join("target"));
     file(&app.join("target/debug/x"), 1000);
     file(&app.join("target/release/app"), 1000);
     file(&app.join("target/release/bundle/dmg/app.dmg"), 500);
@@ -423,6 +444,7 @@ fn e2e_11_active_build_lock_skips_project() {
     let mut w = World::new("11-build-lock", "tauri-and-rust");
     let busy = w.projects.join("busy");
     crate_at(&busy, "busy", "");
+    mark_cargo_target(&busy.join("target"));
     file(&busy.join("target/debug/x"), 1000);
     let lock_path = busy.join("target/debug/.cargo-lock");
     fs::write(&lock_path, b"").unwrap();
@@ -434,6 +456,7 @@ fn e2e_11_active_build_lock_skips_project() {
     lock.lock().unwrap();
     let idle = w.projects.join("idle");
     crate_at(&idle, "idle", "");
+    mark_cargo_target(&idle.join("target"));
     file(&idle.join("target/debug/x"), 1000);
 
     let out = w.run(&["clean", "-y"]);
@@ -453,6 +476,7 @@ fn e2e_12_scan_json_is_machine_readable() {
     let mut w = World::new("12-json", "tauri-only");
     let app = w.projects.join("j/src-tauri");
     crate_at(&app, "j", "tauri = \"2\"");
+    mark_cargo_target(&app.join("target"));
     file(&app.join("target/debug/x"), 1234);
     let out = w.run(&["scan", "--json"]);
     assert_ok(&out, "scan --json");
@@ -460,8 +484,10 @@ fn e2e_12_scan_json_is_machine_readable() {
     let project = &value["projects"][0];
     assert_eq!(project["name"], "j");
     assert_eq!(project["kind"], "tauri");
-    assert_eq!(project["artifact_size"], 1234);
-    assert_eq!(value["total_bytes"], 1234);
+    // The CACHEDIR.TAG marker is part of the target and counts toward size.
+    let expected = 1234 + CACHEDIR_TAG.len() as u64;
+    assert_eq!(project["artifact_size"], expected);
+    assert_eq!(value["total_bytes"], expected);
     w.note("PASS: JSON scan output");
 }
 
@@ -470,6 +496,7 @@ fn e2e_13_nested_deps_dirs_clean_without_error() {
     let mut w = World::new("13-nested-deps", "tauri-and-rust");
     let a = w.projects.join("n");
     crate_at(&a, "n", "");
+    mark_cargo_target(&a.join("target"));
     file(&a.join("target/debug/deps/deps/x"), 100);
     file(&a.join("target/debug/deps/y"), 100);
     let out = w.run(&["clean", "-m", "deps-only", "-y"]);
@@ -483,6 +510,7 @@ fn e2e_14_crate_in_directory_named_target_is_found() {
     let mut w = World::new("14-target-named-crate", "tauri-and-rust");
     let tools = w.projects.join("tools/target");
     crate_at(&tools, "target-tool", "");
+    mark_cargo_target(&tools.join("target"));
     file(&tools.join("target/debug/x"), 100);
     let out = w.run(&["scan", "--json"]);
     assert_ok(&out, "scan");
@@ -501,6 +529,7 @@ fn e2e_15_select_without_tty_refuses() {
     let mut w = World::new("15-select-no-tty", "tauri-and-rust");
     let a = w.projects.join("s");
     crate_at(&a, "s", "");
+    mark_cargo_target(&a.join("target"));
     file(&a.join("target/debug/x"), 100);
     let out = w.run(&["clean", "--select", "-y"]);
     assert_eq!(out.status.code(), Some(1), "selection needs a terminal");
@@ -518,6 +547,7 @@ fn e2e_16_nearest_workspace_owns_member() {
         "[workspace]\nmembers = []\nexclude = [\"vendor/inner\"]\n",
     )
     .unwrap();
+    mark_cargo_target(&outer.join("target"));
     file(&outer.join("target/debug/x"), 100);
     let inner = outer.join("vendor/inner");
     fs::create_dir_all(&inner).unwrap();
@@ -529,4 +559,68 @@ fn e2e_16_nearest_workspace_owns_member() {
     assert_eq!(projects.len(), 1, "{projects:?}");
     assert_eq!(projects[0]["name"], "outer");
     w.note("PASS: inner workspace without target does not claim outer target");
+}
+
+#[test]
+fn e2e_17_unmarked_target_is_never_scanned_or_cleaned() {
+    let mut w = World::new("17-unmarked-target", "tauri-and-rust");
+    // Reproduces the audit bug: a crate whose target/ Cargo never created.
+    let ghost = w.projects.join("ghost");
+    crate_at(&ghost, "ghost", "");
+    file(&ghost.join("target/specs/x86_64-os.json"), 300);
+    file(&ghost.join("target/README.md"), 120);
+    // A marked sibling project is still found and cleaned.
+    let real = w.projects.join("real");
+    crate_at(&real, "real", "");
+    mark_cargo_target(&real.join("target"));
+    file(&real.join("target/debug/x"), 1000);
+
+    let scan = w.run(&["scan", "--json"]);
+    assert_ok(&scan, "scan");
+    let names: Vec<String> = json(&scan)["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["real".to_string()], "{}", stdout(&scan));
+    assert!(
+        stderr(&scan).contains("not a Cargo build directory"),
+        "unmarked target must be reported:\n{}",
+        stderr(&scan)
+    );
+
+    let clean = w.run(&["clean", "-y"]);
+    assert_ok(&clean, "clean -y");
+    assert!(ghost.join("target/specs/x86_64-os.json").exists());
+    assert!(ghost.join("target/README.md").exists());
+    assert!(!real.join("target").exists(), "marked target cleaned");
+    w.note("PASS: unmarked target skipped by scan and clean; marked sibling cleaned");
+}
+
+#[test]
+fn e2e_18_crate_nested_in_plain_target_folder_is_found() {
+    let mut w = World::new("18-nested-in-plain-target", "tauri-and-rust");
+    // `target/` here is a plain folder (no Cargo.toml, no marker); the crate
+    // inside it must still be discovered and its own marked target cleaned.
+    let app = w.projects.join("holder/target/app");
+    crate_at(&app, "app", "");
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/x"), 1000);
+
+    let scan = w.run(&["scan", "--json"]);
+    assert_ok(&scan, "scan");
+    let names: Vec<String> = json(&scan)["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["app".to_string()], "{}", stdout(&scan));
+
+    let clean = w.run(&["clean", "-y"]);
+    assert_ok(&clean, "clean -y");
+    assert!(!app.join("target").exists(), "nested app target cleaned");
+    assert!(app.join("Cargo.toml").exists(), "source tree untouched");
+    w.note("PASS: crate in plain target/ folder found and cleaned");
 }
