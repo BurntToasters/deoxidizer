@@ -9,6 +9,12 @@ updates:
       interval: weekly
     cooldown:
       default-days: 3
+    # A semver-major zip bump broke main, so Dependabot never opens major
+    # Cargo updates. Majors go through the guarded `npm run update:safe` path
+    # together with the code changes they require.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: /
     schedule:
