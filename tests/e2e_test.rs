@@ -27,6 +27,11 @@
 //! 17. A `target/` without Cargo's marker (CACHEDIR.TAG or .rustc_info.json)
 //!     is not a build directory: never scanned, never cleaned.
 //! 18. A crate nested in a plain folder named `target` is found and cleaned.
+//! 19. A project directory with non-UTF-8 bytes crashes `clean -y` and
+//!     `scan --json` (paths were serialized through `json!`).
+//! 20. Package names with ESC/BEL reach the terminal unescaped.
+//! 21. Scan and clean JSON carry no `schema_version`.
+//! 22. A failed confirmation prompt does not say how to skip it.
 
 use std::fs;
 use std::io::Write;
@@ -623,4 +628,118 @@ fn e2e_18_crate_nested_in_plain_target_folder_is_found() {
     assert!(!app.join("target").exists(), "nested app target cleaned");
     assert!(app.join("Cargo.toml").exists(), "source tree untouched");
     w.note("PASS: crate in plain target/ folder found and cleaned");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_19_non_utf8_project_dir_cleans_and_serializes() {
+    use std::os::unix::ffi::OsStrExt;
+    let mut w = World::new("19-non-utf8-path", "tauri-and-rust");
+    let plain = w.projects.join("plain");
+    crate_at(&plain, "plain", "");
+    mark_cargo_target(&plain.join("target"));
+    file(&plain.join("target/debug/x"), 1000);
+    // Byte 0xE9 is Latin-1 `é`: not valid UTF-8, but a legal Unix file name.
+    let latin = w.projects.join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+    crate_at(&latin, "latin", "");
+    mark_cargo_target(&latin.join("target"));
+    file(&latin.join("target/debug/x"), 1000);
+
+    let scan = w.run(&["scan", "--json"]);
+    assert_ok(&scan, "scan --json with non-UTF-8 path");
+    let value = json(&scan);
+    assert_eq!(value["projects"].as_array().unwrap().len(), 2);
+
+    let out = w.run(&["clean", "-y"]);
+    assert_ok(&out, "clean -y with non-UTF-8 path");
+    assert!(!plain.join("target").exists(), "plain cleaned");
+    assert!(!latin.join("target").exists(), "non-UTF-8 project cleaned");
+    w.note("PASS: non-UTF-8 project path cleaned in human mode and scanned as JSON");
+}
+
+#[test]
+fn e2e_20_terminal_escapes_in_names_are_neutralized() {
+    let mut w = World::new("20-terminal-escapes", "tauri-only");
+    let app = w.projects.join("evil/src-tauri");
+    fs::create_dir_all(app.join("src")).unwrap();
+    // TOML `\u` escapes decode to a real ESC and BEL in the package name.
+    fs::write(
+        app.join("Cargo.toml"),
+        "[package]\nname = \"evil\\u001b]0;pwned\\u0007\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntauri = \"2\"\n",
+    )
+    .unwrap();
+    fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/x"), 1000);
+
+    let human = w.run(&["scan"]);
+    assert_ok(&human, "scan");
+    for (label, bytes) in [("stdout", &human.stdout), ("stderr", &human.stderr)] {
+        assert!(!bytes.contains(&0x1b), "ESC byte in {label}");
+        assert!(!bytes.contains(&0x07), "BEL byte in {label}");
+    }
+    assert!(stdout(&human).contains("pwned"), "name still shown");
+
+    let dry = w.run(&["clean", "--dry-run"]);
+    assert_ok(&dry, "clean --dry-run");
+    assert!(!dry.stdout.contains(&0x1b), "ESC byte in clean output");
+    assert!(!dry.stdout.contains(&0x07), "BEL byte in clean output");
+
+    // JSON stays faithful: serde escapes control characters.
+    let out = w.run(&["scan", "--json"]);
+    assert_ok(&out, "scan --json");
+    assert_eq!(
+        json(&out)["projects"][0]["name"].as_str().unwrap(),
+        "evil\u{1b}]0;pwned\u{7}"
+    );
+    w.note("PASS: ESC/BEL stripped from human output; JSON keeps exact name");
+}
+
+#[test]
+fn e2e_21_json_outputs_carry_schema_version() {
+    let mut w = World::new("21-schema-version", "tauri-only");
+    let empty_scan = w.run(&["scan", "--json"]);
+    assert_ok(&empty_scan, "empty scan --json");
+    assert_eq!(json(&empty_scan)["schema_version"], 1);
+    let empty_clean = w.run(&["clean", "--json"]);
+    assert_ok(&empty_clean, "empty clean --json");
+    assert_eq!(json(&empty_clean)["schema_version"], 1);
+    let empty_dry = w.run(&["clean", "--dry-run", "--json"]);
+    assert_ok(&empty_dry, "empty dry-run --json");
+    assert_eq!(json(&empty_dry)["schema_version"], 1);
+
+    let app = w.projects.join("sv/src-tauri");
+    crate_at(&app, "sv", "tauri = \"2\"");
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/x"), 1000);
+    let scan = w.run(&["scan", "--json"]);
+    assert_eq!(json(&scan)["schema_version"], 1);
+    let dry = w.run(&["clean", "--dry-run", "--json"]);
+    assert_eq!(json(&dry)["schema_version"], 1);
+    let real = w.run(&["clean", "-y", "--json"]);
+    assert_ok(&real, "clean -y --json");
+    assert_eq!(json(&real)["schema_version"], 1);
+    assert_eq!(json(&real)["dry_run"], false);
+    w.note("PASS: schema_version 1 on scan and clean JSON, including empty results");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_22_confirmation_failure_names_the_yes_flag() {
+    let mut w = World::new("22-confirm-failure", "tauri-only");
+    let app = w.projects.join("cf/src-tauri");
+    crate_at(&app, "cf", "tauri = \"2\"");
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/x"), 1000);
+    // No terminal and no --yes: the prompt cannot be answered.
+    let out = w.run(&["clean"]);
+    assert_eq!(out.status.code(), Some(1), "prompt failure exits 1");
+    let err = stderr(&out);
+    assert!(
+        err.contains("Confirmation failed:")
+            && err.contains("Use --yes to clean without a prompt."),
+        "stderr: {err}"
+    );
+    assert!(app.join("target/debug/x").exists(), "nothing deleted");
+    w.note("PASS: prompt failure points at --yes and deletes nothing");
 }

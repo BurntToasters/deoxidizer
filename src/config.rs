@@ -190,6 +190,16 @@ impl Config {
         })
     }
 
+    /// Config file that a read-write command uses: the explicit `--config`
+    /// path when given, otherwise `~/.deox_config`. Never a cwd-relative
+    /// fallback, so a missing HOME is an error rather than a stray file.
+    pub fn resolve_path(config_override: Option<&PathBuf>) -> Result<PathBuf, ConfigError> {
+        match config_override {
+            Some(path) => Ok(path.clone()),
+            None => Self::try_config_path(),
+        }
+    }
+
     /// Path to the config file for display purposes: `~/.deox_config`, or
     /// `./.deox_config` when the home directory is unknown. Anything that
     /// reads or writes the file uses [`Config::try_config_path`] instead.
@@ -289,6 +299,10 @@ impl Config {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // Renaming over a symlink would replace the link with a regular file
+        // and break dotfile managers, so write to the file it names instead.
+        let resolved = resolve_symlinks(path)?;
+        let path = resolved.as_path();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
 
@@ -315,6 +329,39 @@ impl Config {
     pub fn projects_path(&self) -> PathBuf {
         expand_tilde(&self.projects_dir)
     }
+}
+
+/// Follow a chain of symlinks at `path` to the path it finally names. An
+/// existing target is canonicalized; a dangling link is resolved one hop at a
+/// time (relative targets against the link's own directory). A plain path is
+/// returned unchanged.
+fn resolve_symlinks(path: &Path) -> io::Result<PathBuf> {
+    const MAX_HOPS: usize = 40;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => return Ok(current),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(current),
+            Err(error) => return Err(error),
+        }
+        if let Ok(resolved) = fs::canonicalize(&current) {
+            return Ok(resolved);
+        }
+        let target = fs::read_link(&current)?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+    }
+    Err(io::Error::other(format!(
+        "too many levels of symbolic links resolving {}",
+        path.display()
+    )))
 }
 
 /// Expand a leading `~` to the home directory; other paths are unchanged.

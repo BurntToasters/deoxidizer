@@ -8,8 +8,25 @@ use std::time::UNIX_EPOCH;
 
 const NAME_WIDTH: usize = 20;
 
+/// Version of the `--json` output contract (`scan --json`, `clean --json`).
+/// Bump only when an existing field changes meaning or is removed.
+pub const JSON_SCHEMA_VERSION: u32 = 1;
+
+/// Replace every control character (ESC, BEL, newline, ...) with U+FFFD so
+/// names and paths from untrusted manifests cannot drive the terminal.
+/// Applies to human output only; JSON output keeps exact values.
+pub fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 /// Render a path for humans: home directory shown as `~`.
 pub fn display_path(path: &Path) -> String {
+    sanitize(&display_path_raw(path))
+}
+
+fn display_path_raw(path: &Path) -> String {
     if let Some(home) = dirs::home_dir() {
         if let Ok(rest) = path.strip_prefix(&home) {
             if rest.as_os_str().is_empty() {
@@ -101,7 +118,7 @@ pub fn print_scan_results(projects: &[DiscoveredProject]) {
         println!(
             "  {} {} {} {} {} {}  {}  {}",
             cell(&(i + 1).to_string(), 4, Alignment::Left).dimmed(),
-            cell(&project.name, NAME_WIDTH, Alignment::Left).cyan(),
+            cell(&sanitize(&project.name), NAME_WIDTH, Alignment::Left).cyan(),
             kind,
             cell(
                 &format_size(project.artifact_size, BINARY),
@@ -140,12 +157,12 @@ pub fn project_json(project: &DiscoveredProject) -> serde_json::Value {
     });
     serde_json::json!({
         "name": project.name,
-        "path": project.path,
+        "path": project.path.to_string_lossy(),
         "kind": match project.kind {
             ProjectKind::TauriApp => "tauri",
             ProjectKind::RustProject => "rust",
         },
-        "artifact_dir": project.artifact_dir,
+        "artifact_dir": project.artifact_dir.to_string_lossy(),
         "artifact_size": project.artifact_size,
         "last_modified_unix": project
             .last_modified
@@ -162,6 +179,7 @@ pub fn print_scan_json(projects: &[DiscoveredProject]) {
         .iter()
         .fold(0u64, |acc, p| acc.saturating_add(p.artifact_size));
     let value = serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
         "projects": projects.iter().map(project_json).collect::<Vec<_>>(),
         "total_bytes": total,
     });
@@ -173,7 +191,11 @@ pub fn print_scan_json(projects: &[DiscoveredProject]) {
 
 /// Print a single clean result.
 pub fn print_clean_result(project: &DiscoveredProject, result: &CleanResult) {
-    let label = format!("{} ({})", project.name, display_path(&project.path));
+    let label = format!(
+        "{} ({})",
+        sanitize(&project.name),
+        display_path(&project.path)
+    );
     match result {
         CleanResult::Cleaned { bytes_freed } => {
             println!(
@@ -192,7 +214,7 @@ pub fn print_clean_result(project: &DiscoveredProject, result: &CleanResult) {
                 "⚠".yellow().bold(),
                 label.cyan(),
                 format_size(*bytes_freed, BINARY).yellow(),
-                message,
+                sanitize(message),
             );
         }
         CleanResult::Skipped { reason } => {
@@ -200,7 +222,7 @@ pub fn print_clean_result(project: &DiscoveredProject, result: &CleanResult) {
                 "  {} {} — skipped: {}",
                 "–".yellow(),
                 label,
-                reason.dimmed()
+                sanitize(reason).dimmed()
             );
         }
         CleanResult::Error { message } => {
@@ -209,7 +231,7 @@ pub fn print_clean_result(project: &DiscoveredProject, result: &CleanResult) {
                 "✗".red().bold(),
                 label,
                 "error".red(),
-                message
+                sanitize(message)
             );
         }
     }
@@ -253,11 +275,16 @@ pub fn print_clean_summary(
 /// Print a detailed inspection of a single project.
 pub fn print_inspection(project: &DiscoveredProject) {
     println!();
-    println!("  {} {}", "Project:".bold(), project.name.cyan().bold());
+    println!(
+        "  {} {}",
+        "Project:".bold(),
+        sanitize(&project.name).cyan().bold()
+    );
     println!("  {} {}", "Path:".bold(), display_path(&project.path));
     println!("  {} {}", "Type:".bold(), project.kind);
     if project.members.len() > 1 || project.members.first() != Some(&project.name) {
-        println!("  {} {}", "Packages:".bold(), project.members.join(", "));
+        let members: Vec<String> = project.members.iter().map(|m| sanitize(m)).collect();
+        println!("  {} {}", "Packages:".bold(), members.join(", "));
     }
     println!(
         "  {} {}",

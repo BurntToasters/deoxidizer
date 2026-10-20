@@ -153,7 +153,7 @@ pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanErr
         let Some(manifest) = cached_manifest(path, &mut manifest_cache) else {
             eprintln!(
                 "Warning: ignoring unreadable or invalid manifest {}",
-                path.display()
+                crate::display::sanitize(&path.display().to_string())
             );
             continue;
         };
@@ -175,7 +175,7 @@ pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanErr
             Err(error) => {
                 eprintln!(
                     "Warning: cannot resolve target directory {}: {error}",
-                    target_dir.display()
+                    crate::display::sanitize(&target_dir.display().to_string())
                 );
                 continue;
             }
@@ -225,8 +225,9 @@ pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanErr
             Ok(result) => result,
             Err(error) => {
                 eprintln!(
-                    "Warning: cannot analyze target directory {}: {error}; skipping project {name}",
-                    group.target.display(),
+                    "Warning: cannot analyze target directory {}: {error}; skipping project {}",
+                    crate::display::sanitize(&group.target.display().to_string()),
+                    crate::display::sanitize(&name),
                 );
                 analyze_warnings += 1;
                 continue;
@@ -275,7 +276,7 @@ fn report_skipped(skipped: &[String]) {
         skipped.len()
     );
     for path in skipped.iter().take(MAX_SKIPPED_SHOWN) {
-        eprintln!("  - {path}");
+        eprintln!("  - {}", crate::display::sanitize(path));
     }
     if skipped.len() > MAX_SKIPPED_SHOWN {
         eprintln!("  ... and {} more", skipped.len() - MAX_SKIPPED_SHOWN);
@@ -317,7 +318,7 @@ fn read_manifest(path: &Path) -> Option<Value> {
         Err(error) => {
             eprintln!(
                 "Warning: cannot read manifest {}: {}",
-                path.display(),
+                crate::display::sanitize(&path.display().to_string()),
                 error
             );
             return None;
@@ -330,8 +331,8 @@ fn read_manifest(path: &Path) -> Option<Value> {
         Err(error) => {
             eprintln!(
                 "Warning: cannot parse manifest {}: {}",
-                path.display(),
-                error
+                crate::display::sanitize(&path.display().to_string()),
+                crate::display::sanitize(&error.to_string())
             );
             None
         }
@@ -343,7 +344,11 @@ fn real_directory(path: &Path) -> Option<PathBuf> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
-            eprintln!("Warning: cannot inspect {}: {}", path.display(), error);
+            eprintln!(
+                "Warning: cannot inspect {}: {}",
+                crate::display::sanitize(&path.display().to_string()),
+                error
+            );
             return None;
         }
     };
@@ -417,7 +422,7 @@ fn real_build_dir(path: &Path, warned: &mut HashSet<PathBuf>) -> Option<PathBuf>
     if warned.insert(target.clone()) {
         eprintln!(
             "Warning: skipping {}: not a Cargo build directory (no CACHEDIR.TAG or .rustc_info.json)",
-            target.display()
+            crate::display::sanitize(&target.display().to_string())
         );
     }
     None

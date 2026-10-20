@@ -3,8 +3,13 @@ use crate::config::{Config, ConfigError};
 use colored::Colorize;
 
 pub fn run_settings(args: SettingsArgs, config_override: Option<&std::path::PathBuf>) {
-    let config_path: std::path::PathBuf =
-        config_override.cloned().unwrap_or_else(Config::config_path);
+    let config_path: std::path::PathBuf = match Config::resolve_path(config_override) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("  {} {error}.", "✗".red().bold());
+            std::process::exit(1);
+        }
+    };
     match args.action {
         SettingsAction::Show => show_settings(&config_path),
         SettingsAction::Config(config_args) => update_settings(config_args, &config_path),
@@ -36,12 +41,16 @@ fn show_settings(config_path: &std::path::Path) {
     println!("  {} deoxidizer settings", "⚙".bold());
     println!("  {}", "─".repeat(40).dimmed());
     println!();
-    println!("  {:<20} {}", "Config file:".bold(), config_path.display());
+    println!(
+        "  {:<20} {}",
+        "Config file:".bold(),
+        crate::display::sanitize(&config_path.display().to_string())
+    );
     println!("  {:<20} {}", "Config version:".bold(), config.version);
     println!(
         "  {:<20} {}",
         "Projects dir:".bold(),
-        config.projects_dir.cyan()
+        crate::display::sanitize(&config.projects_dir).cyan()
     );
     println!(
         "  {:<20} {}",
@@ -67,10 +76,15 @@ fn show_settings(config_path: &std::path::Path) {
     if config.ignored_projects.is_empty() {
         println!("  {:<20} {}", "Ignored projects:".bold(), "(none)".dimmed());
     } else {
+        let ignored: Vec<String> = config
+            .ignored_projects
+            .iter()
+            .map(|name| crate::display::sanitize(name))
+            .collect();
         println!(
             "  {:<20} {}",
             "Ignored projects:".bold(),
-            config.ignored_projects.join(", ")
+            ignored.join(", ")
         );
     }
     println!();
@@ -102,12 +116,16 @@ fn update_settings(args: SettingsConfigArgs, config_path: &std::path::Path) {
                 eprintln!(
                     "  {} Note: {} does not exist yet; saving it anyway.",
                     "⚠".yellow(),
-                    dir
+                    crate::display::sanitize(&dir)
                 );
             }
             config.projects_dir = dir.clone();
             changed = true;
-            pending.push(format!("  {} projects-dir = {}", "✓".green(), dir.cyan()));
+            pending.push(format!(
+                "  {} projects-dir = {}",
+                "✓".green(),
+                crate::display::sanitize(&dir).cyan()
+            ));
         }
     }
 

@@ -353,3 +353,30 @@ fn config_override_missing_file_refuses_clean_but_scans_with_defaults() {
         .unwrap();
     assert!(scan.status.success());
 }
+
+#[test]
+fn min_size_flags_document_mib_not_mb() {
+    for args in [["scan", "--help"], ["clean", "--help"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_deox"))
+            .args(args)
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(text.contains("in MiB"), "{args:?} help: {text}");
+        assert!(!text.contains("in MB"), "{args:?} help: {text}");
+        assert!(
+            text.contains("--min-size-mb <MB>"),
+            "flag name kept: {text}"
+        );
+    }
+}
+
+#[test]
+fn sanitize_replaces_control_characters_only() {
+    use deoxidizer_lib::display::sanitize;
+    assert_eq!(sanitize("plain-name_1.0"), "plain-name_1.0");
+    assert_eq!(sanitize("a\u{1b}]0;x\u{7}b"), "a\u{FFFD}]0;x\u{FFFD}b");
+    assert_eq!(sanitize("tab\there\nnl"), "tab\u{FFFD}here\u{FFFD}nl");
+    assert_eq!(sanitize("café ✓"), "café ✓");
+}

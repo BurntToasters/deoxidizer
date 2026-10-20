@@ -11,7 +11,13 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
     use std::path::PathBuf;
 
     let use_defaults = args.use_defaults;
-    let config_path: PathBuf = config_override.cloned().unwrap_or_else(Config::config_path);
+    let config_path: PathBuf = match Config::resolve_path(config_override) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("  {} {error}.", "✗".red().bold());
+            std::process::exit(1);
+        }
+    };
     println!();
     println!("  {} deoxidizer setup", "🔧".bold());
     println!("  {}", "─".repeat(40).dimmed());
@@ -264,7 +270,10 @@ fn backup_existing_config(path: &std::path::Path) {
 
 fn print_config_summary(config: &Config) {
     println!("  {}", "Current settings:".bold());
-    println!("    Projects dir:    {}", config.projects_dir.cyan());
+    println!(
+        "    Projects dir:    {}",
+        crate::display::sanitize(&config.projects_dir).cyan()
+    );
     println!("    Scope:           {}", config.scope.to_string().cyan());
     println!(
         "    Clean behavior:  {}",
@@ -281,10 +290,12 @@ fn print_config_summary(config: &Config) {
     if config.ignored_projects.is_empty() {
         println!("    Ignored:         {}", "(none)".dimmed());
     } else {
-        println!(
-            "    Ignored:         {}",
-            config.ignored_projects.join(", ").cyan()
-        );
+        let ignored: Vec<String> = config
+            .ignored_projects
+            .iter()
+            .map(|name| crate::display::sanitize(name))
+            .collect();
+        println!("    Ignored:         {}", ignored.join(", ").cyan());
     }
     println!();
     println!(
