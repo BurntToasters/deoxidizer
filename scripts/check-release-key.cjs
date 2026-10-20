@@ -28,7 +28,7 @@ function main() {
     );
   }
 
-  for (const relativePath of ['install.sh', 'install.ps1']) {
+  for (const relativePath of ['install.sh', 'install.ps1', 'src/updater.rs']) {
     if (!read(relativePath).toUpperCase().includes(expectedFingerprint)) {
       throw new Error(`${relativePath} does not pin the release key fingerprint`);
     }
