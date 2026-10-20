@@ -48,6 +48,18 @@ jobs:
     environment: release
     timeout-minutes: 60
     steps:
+      - name: Reject GitHub-hosted macOS runners
+        # Notarization needs a pre-provisioned notarytool keychain profile
+        # (APPLE_KEYCHAIN_PROFILE) and a Developer ID certificate in the
+        # keychain. GitHub-hosted macOS runners have neither. Run macOS
+        # releases on a dedicated macOS release VM with `npm run release:macos`.
+        if: ${{ inputs.os == 'macos' && startsWith(inputs.runner, 'macos-') }}
+        shell: bash
+        env:
+          RUNNER_LABEL: ${{ inputs.runner }}
+        run: |
+          echo "::error::macOS releases cannot run on GitHub-hosted runners ('$RUNNER_LABEL'). Notarization needs a pre-provisioned notarytool keychain profile (APPLE_KEYCHAIN_PROFILE) and a Developer ID certificate in the keychain. Use a dedicated macOS release VM with 'npm run release:macos'." >&2
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -86,6 +98,10 @@ jobs:
           AZURE_ARTIFACT_SIGNING_PROFILE: ${{ inputs.os == 'windows' && secrets.AZURE_ARTIFACT_SIGNING_PROFILE || '' }}
           AZURE_ARTIFACT_SIGNING_PUBLISHER: ${{ inputs.os == 'windows' && secrets.AZURE_ARTIFACT_SIGNING_PUBLISHER || '' }}
           AZURE_ARTIFACT_SIGNING_PUBLISHER_DN: ${{ inputs.os == 'windows' && secrets.AZURE_ARTIFACT_SIGNING_PUBLISHER_DN || '' }}
+          # macOS notarization requires a dedicated release VM (not a hosted
+          # runner): a Developer ID certificate in the keychain and a
+          # pre-provisioned notarytool keychain profile named by
+          # APPLE_KEYCHAIN_PROFILE. See the early step above and AGENTS.md.
           APPLE_SIGNING_IDENTITY: ${{ inputs.os == 'macos' && secrets.APPLE_SIGNING_IDENTITY || '' }}
           APPLE_KEYCHAIN_PROFILE: ${{ inputs.os == 'macos' && secrets.APPLE_KEYCHAIN_PROFILE || '' }}
         run: |

@@ -53,6 +53,12 @@ These rules are non-negotiable. Do not violate them for convenience.
    resolving directly under a valid `target/` subdirectory of a detected Rust/Tauri
    project may ever be removed. Never touch source code, `src/`, `src-tauri/src/`,
    `Cargo.toml`, `.git/`, or parent directories.
+   A `target/` folder counts as a Cargo build directory only when it holds
+   Cargo's `CACHEDIR.TAG` (contents start with
+   `Signature: 8a477f597d28d172789f06886806bc55`) or a regular, non-symlink
+   `.rustc_info.json`. Any other `target/` is warned about as
+   `not a Cargo build directory`, is never deleted, and is re-checked at clean
+   time (`scanner::is_cargo_target_dir`, `cleaner::validate_target_path`).
 2. **Never follow symlinks when scanning or deleting.** Traversal must strictly
    use `.follow_links(false)`. Never allow symlink escapes to delete files outside
    the project tree. A symlinked project root, `target/`, or intermediate
@@ -86,6 +92,10 @@ These rules are non-negotiable. Do not violate them for convenience.
    Never widen the accepted profile (other algorithms, SHA-1, text signatures,
    subkeys) without failure-mode tests first. Key rotation: add the new key to
    `PINNED_KEYS`, ship a release signed by the old key, then switch signing.
+   `deox --update` replaces the sibling binary atomically: it writes a
+   `.deox-sibling-*` temp file in the destination directory, then renames it
+   into place. `scripts/verify-release.cjs` runs the same in-process verifier
+   at release time (see the release pipeline section below).
 8. **Never use predictable fixed paths in `/tmp` for updates.** Updates must use
    `tempfile::Builder::new().prefix("deoxidizer-update-").tempdir()` to prevent
    symlink and pre-creation attacks on multi-user systems.
@@ -179,6 +189,8 @@ deoxidizer/
 │   ├── check-release-key.cjs    # Pinned GPG release key verification
 │   ├── check-toolchain.cjs      # Rust/Node toolchain pin verification
 │   └── check-version.cjs        # Cargo/package version consistency check
+├── examples/
+│   └── verify_release_manifest.rs # Calls doc-hidden updater::verify_release_manifest (used by scripts/verify-release.cjs)
 └── tests/
     ├── e2e_test.rs             # E2E: fixture trees + real `deox` binary; transcripts in target/e2e-artifacts/
     ├── fixtures/openpgp/       # gpg-generated keys/signatures for verifier failure-mode tests
@@ -227,7 +239,7 @@ The configuration file is stored in the user's home directory as JSON:
   - `"debug-only"`: Removes `debug/` directories while preserving `release/`.
   - `"incremental-only"`: Removes incremental compiler cache directories (`*/incremental`).
   - `"deps-only"`: Removes dependency compilation units (`*/deps`).
-- `min_size_mb` (`u64`): Minimum artifact size in megabytes to include in scan/clean (0 = all).
+- `min_size_mb` (`u64`): Minimum artifact size in mebibytes (MiB) to include in scan/clean (0 = all). The `--min-size-mb` / `--min-size` flags use the same unit.
 - `ignored_projects` (`Vec<String>`): Names to always exclude from scan and clean. A name matches a
   project's name or any package in its `members` list (case-insensitive), so ignoring one
   workspace member protects the shared `target/`.
@@ -235,6 +247,18 @@ The configuration file is stored in the user's home directory as JSON:
 `projects_dir` is stored absolute (`config::normalize_projects_dir`); a leading `~` is kept
 verbatim and expanded at use (`config::expand_tilde`, also `~\` on Windows). Underscore
 spellings (`tauri_only`) are rejected everywhere; there is no loose parser.
+
+Saving settings through a symlinked `~/.deox_config` writes the link's target
+and keeps the symlink in place.
+
+### Scripting contract (`--json` and exit codes)
+- `scan --json` and `clean --json` emit a top-level `"schema_version": 1`.
+  Paths in JSON are strings decoded as lossy UTF-8.
+- Exit codes: `0` = success or user cancelled; `1` = runtime error, partial
+  clean, or `analysis_failures`; `2` = usage error (invalid flag, mode, scope,
+  or value).
+- From 1.0 these, the JSON schema version, and documented flags are covered by
+  semver. Changing them requires updating README "Scripting and stability".
 
 ---
 
@@ -277,9 +301,19 @@ regular files (symlinks count as 0).
 - Unreadable folders below the scan root are skipped with a warning (the root
   itself must be readable). Projects whose `target/` cannot be analyzed are
   counted in `ScanReport::analysis_failures`; `clean` exits 1 if any exist.
-- `scanner::is_artifact_dir` skips `node_modules` and `target` dirs that are
-  build outputs (sibling `Cargo.toml` or `CACHEDIR.TAG`); a crate inside a
-  folder named `target` is still scanned.
+- `scanner::is_artifact_dir` skips `node_modules` directories and `target`
+  directories that are build outputs (a `CACHEDIR.TAG` is present, or the
+  parent holds a `Cargo.toml`). A plain folder named `target` (no
+  `CACHEDIR.TAG`, no `Cargo.toml` in its parent) is descended into, so crates
+  nested inside it are found.
+- Only Cargo build directories become projects: `scanner::is_cargo_target_dir`
+  (see Hard Do-Nots #1). Other `target/` folders produce a
+  `not a Cargo build directory` warning and no project; `cleaner::plan` and
+  `clean_project_with` call `cleaner::validate_target_path` again before any
+  removal.
+- Human output sanitizes project names, member names, and paths: control
+  characters are replaced with U+FFFD so names from cloned repositories cannot
+  inject terminal escape sequences. JSON output carries the raw names.
 - `cleaner::plan` validates the root and target once, builds the path list
   for the mode (plus `--keep-bundles`, which preserves `*/release/bundle`),
   drops nested duplicates, and validates each path. `estimate_with` and
@@ -399,6 +433,17 @@ APPLE_KEYCHAIN_PROFILE=
     in Node without requiring an external `unzip` command.
   - Manual release workflow OS choices use `linux`, `macos`, and `windows`; `macos`
     maps to the package scripts while Rust target triples use `darwin`.
+  - macOS notarization needs a pre-provisioned `notarytool` keychain profile
+    (`APPLE_KEYCHAIN_PROFILE`) and a Developer ID certificate in the keychain.
+    GitHub-hosted macOS runners have neither, so macOS releases run on a
+    dedicated VM via `npm run release:macos`. `.github/workflows/release.yml`
+    fails early when `os` is `macos` and the runner label starts with `macos-`.
+  - `scripts/verify-release.cjs` verifies every `SHA256SUMS-*.txt` manifest with
+    the same in-process verifier `deox --update` uses, via
+    `cargo run --locked --example verify_release_manifest -- <manifest> <manifest>.asc`
+    (`examples/verify_release_manifest.rs`, calling the doc-hidden
+    `updater::verify_release_manifest`). `scripts/check-release-key.cjs` also
+    requires the pinned fingerprint in `src/updater.rs`.
   - `CHANGELOG.md` is the BCLS-formatted release body; draft creation fails if it is missing or empty.
 
 ---
@@ -447,7 +492,12 @@ CI additionally parse-checks and lints every PowerShell script
 (PSScriptAnalyzer errors fail), compiles `installer.nsi` with `makensis`,
 builds static musl binaries natively on x86_64 and arm64 runners, and uploads
 `target/e2e-artifacts/` (E2E transcripts) from every OS. Dependabot uses a
-3-day cooldown matching the safe-updater age gates.
+3-day cooldown matching the safe-updater age gates. Dependabot ignores
+semver-major Cargo updates (`.github/dependabot.yml`): a major `zip` bump broke
+`main`, so majors go through `npm run update:safe` with the code changes.
+
+CI (`.github/workflows/ci.yml`) must be a required status check on `main`
+(branch protection). `main` stayed red for weeks while it was not enforced.
 
 ### Test Coverage Highlights
 - `tests/e2e_test.rs`: Drives the real `deox` binary against fixture trees (Tauri AppImage symlinks, unreadable folders, workspaces, nested paths, build locks, bundles) and writes a transcript per scenario to `target/e2e-artifacts/` (override with `DEOX_E2E_ARTIFACTS`). Permission scenarios skip when run as root; run them as an unprivileged user to exercise them.

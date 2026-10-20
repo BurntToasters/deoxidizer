@@ -77,6 +77,7 @@ Useful options:
 --path <dir>               Per-run projects directory override for this run only (scan, clean).
                            Stored default is set via `settings config --projects-dir`. `~/` expansion works.
 --min-size-mb <mb>         Only show projects at least this large for this run (scan, clean).
+                           Size is in MiB (1 MiB = 1048576 bytes).
                            Alias: --min-size. Overrides config. Boundary is >= (equal sizes included).
 --older-than <days>        Only keep projects not modified in N days (scan: display filter only;
                            clean: pre-estimate filter). Projects with unknown modification time are dropped.
@@ -155,6 +156,9 @@ Defaults are `tauri-only` / `delete` / `full` / `0` / `[]`.
 `settings config` accepts the CLI aliases above; the file stores canonical
 kebab-case values.
 
+Saving settings (`deox settings config ...`) through a symlinked config file
+writes the link's target and keeps the symlink.
+
 Version-1 configuration files migrate automatically to version 2. Malformed or
 unsupported-version configuration fails closed. Read-only scans may use defaults
 when no configuration exists; `clean` requires setup.
@@ -169,6 +173,13 @@ when no configuration exists; `clean` requires setup.
 A workspace whose members share one `target/` appears once, named after the
 workspace (its root package name, or its folder name for a virtual
 workspace). The nearest workspace owns a package, as in Cargo.
+
+Only Cargo build directories are cleaned. A `target/` folder qualifies only if
+it contains Cargo's `CACHEDIR.TAG` or a regular `.rustc_info.json`. Any other
+`target/` folder is reported with a `not a Cargo build directory` warning and is
+never deleted. The same check runs again at clean time. A plain folder named
+`target` that is not a build output is still scanned, so crates inside it are
+found.
 
 Cleanup supports cross-compilation triples: any non-`debug`/non-`release`
 subdirectory of `target/` is treated as a triple candidate, and `debug-only`
@@ -207,10 +218,25 @@ in between. Each breakdown row in `inspect` equals what the matching mode
 frees; the `incremental/` and `deps/` rows overlap the `debug/`/`release/`
 rows, so do not sum them.
 
+## Scripting and stability
+
+- `scan --json` and `clean --json` print a top-level `"schema_version": 1`.
+  Paths in JSON output are strings decoded as lossy UTF-8.
+- Exit codes:
+  - `0`: success, or the user cancelled a confirmation.
+  - `1`: runtime error, a partial clean (some projects failed), or analysis
+    failures reported by `clean`.
+  - `2`: usage error (unknown flag, invalid mode, scope, or value).
+- From version 1.0, the JSON schema version, these exit codes, and the
+  documented flags follow semantic versioning. Before 1.0 they can change
+  between releases; check the CHANGELOG.
+
 ## Troubleshooting
 
 | Symptom | Meaning | Fix |
 | --- | --- | --- |
+| `Warning: skipping <path>: not a Cargo build directory (no CACHEDIR.TAG or .rustc_info.json)` | A folder named `target` lacks Cargo's build markers, so it is not a build output | Nothing is deleted. If it is a real Cargo target directory, rebuilding the project with Cargo recreates the markers |
+| Names or paths show `U+FFFD` (�) characters | Control characters in a project, package, or path name were replaced so cloned repositories cannot inject terminal escape sequences | Expected behavior; `--json` output carries the raw names |
 | `No projects with build artifacts found.` (scan, bare `deox`) | No in-scope projects passed filters | Run `settings show` to check scope, min-size, and ignored list; `inspect <path>` bypasses those filters |
 | `No projects with build artifacts found.` (clean) | No in-scope projects passed filters (same shared message as scan) | Same as above; use `clean --dry-run` to preview |
 | `Configuration error: invalid configuration JSON: ...` / `unsupported configuration version ...` | Malformed or future-version config | Delete `~/.deox_config` or run `deox setup --default` to recreate |
@@ -256,6 +282,16 @@ npm run release:upload
 npm run release:verify:draft
 DEOX_RELEASE_CONFIRM=YES npm run release:publish -- --yes  # irreversible; see scripts/publish-release.cjs
 ```
+
+macOS releases must run on a dedicated macOS release VM with `npm run release:macos`,
+not on a GitHub-hosted macOS runner. Notarization needs a pre-provisioned
+`notarytool` keychain profile (`APPLE_KEYCHAIN_PROFILE`) and a Developer ID
+certificate in the keychain; hosted runners have neither.
+
+CI (`.github/workflows/ci.yml`) must be a required status check on `main` in
+branch protection. `main` stayed red for weeks while the check was not enforced.
+Dependabot ignores semver-major Cargo updates; major bumps go through
+`npm run update:safe` together with the code changes that they need.
 
 Release publication requires `gh auth login` on each release VM. The Windows
 VM creates the single draft; Linux and macOS commands wait for that draft before

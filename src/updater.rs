@@ -632,6 +632,14 @@ fn verify_signed_manifest(manifest: &[u8], signature: &[u8]) -> Result<(), Strin
     crate::openpgp::verify_detached(manifest, signature, PINNED_KEYS, now)
 }
 
+/// Cross-check hook for release tooling (`examples/verify_release_manifest.rs`):
+/// runs the same in-process verifier `deox --update` uses, so release-time
+/// acceptance matches runtime acceptance. Not part of the public API.
+#[doc(hidden)]
+pub fn verify_release_manifest(manifest: &[u8], signature: &[u8]) -> Result<(), String> {
+    verify_signed_manifest(manifest, signature)
+}
+
 /// Extract the update and replace the current binary.
 ///
 /// Note: the secure tempdir is removed when `temp_dir` drops, but with
@@ -743,11 +751,13 @@ fn install_update(archive_bytes: &[u8], asset_name: &str) -> Result<(), InstallF
                                 })
                                 .unwrap_or(false)
                             {
-                                fs::copy(&new_sibling, &sibling_dest).map_err(|e| {
-                                    InstallFailure::MainUpdatedSiblingFailed(map_temp(format!(
-                                        "Failed to replace {sibling_name}: {e}"
-                                    )))
-                                })?;
+                                replace_file_atomically(&new_sibling, &sibling_dest).map_err(
+                                    |e| {
+                                        InstallFailure::MainUpdatedSiblingFailed(map_temp(format!(
+                                            "Failed to replace {sibling_name}: {e}"
+                                        )))
+                                    },
+                                )?;
                             }
                         }
                     }
@@ -756,6 +766,33 @@ fn install_update(archive_bytes: &[u8], asset_name: &str) -> Result<(), InstallF
         }
     }
 
+    Ok(())
+}
+
+/// Replace `dest` with the bytes of `src` via a temp file in `dest`'s parent
+/// directory followed by an atomic rename. In-place overwrite is avoided: on
+/// macOS it can get a previously-executed signed binary killed, and on Linux
+/// it fails with ETXTBSY while the file is running. The destination keeps its
+/// existing permissions (fallback 0o755 on unix).
+fn replace_file_atomically(src: &Path, dest: &Path) -> io::Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| io::Error::other("destination has no parent directory"))?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".deox-sibling-")
+        .tempfile_in(parent)?;
+    let mut input = fs::File::open(src)?;
+    io::copy(&mut input, temp.as_file_mut())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dest)
+            .map(|metadata| metadata.permissions().mode() & 0o7777)
+            .unwrap_or(0o755);
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(mode))?;
+    }
+    temp.as_file().sync_all()?;
+    temp.persist(dest).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -908,7 +945,10 @@ fn extract_zip(archive_bytes: &[u8], destination: &Path) -> Result<(), String> {
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("Failed to read zip entry: {error}"))?;
-        let raw_name = entry.name().to_string();
+        let raw_name = entry
+            .name()
+            .map_err(|error| format!("Invalid zip entry name: {error}"))?
+            .into_owned();
         if raw_name.contains('\\') {
             return Err(format!("archive contains unsafe path {raw_name}"));
         }
@@ -931,8 +971,10 @@ fn extract_zip(archive_bytes: &[u8], destination: &Path) -> Result<(), String> {
             continue;
         }
         // Mirror `extract_tar`: setuid/setgid entries reject the whole
-        // archive fail-closed instead of landing on disk stripped.
-        if unix_mode.is_some_and(|mode| mode & 0o6000 != 0) {
+        // archive fail-closed instead of landing on disk stripped. zip 9's
+        // `unix_mode()` already clears these bits, so inspect the raw
+        // external attributes (unix mode lives in the high 16 bits).
+        if (entry.external_attributes() >> 16) & 0o6000 != 0 {
             return Err(format!("archive contains setuid/setgid entry {raw_name}"));
         }
         // Declared-size precheck; authoritative accounting uses the actual
@@ -1227,5 +1269,62 @@ mod tests {
         assert_eq!(sibling_binary_name("deoxidizer.exe"), Some("deox.exe"));
         assert_eq!(sibling_binary_name("deox.exe"), Some("deoxidizer.exe"));
         assert_eq!(sibling_binary_name("unexpected"), None);
+    }
+
+    // Failure modes for `replace_file_atomically`, written before the helper:
+    // - missing source must error and leave the destination byte-identical;
+    // - a failed attempt must not leave temp residue beside the destination;
+    // - success must replace content, keep the destination's mode, and on
+    //   unix swap in a new inode (never overwrite the old file in place).
+    #[test]
+    fn replace_file_atomically_missing_source_leaves_destination_intact() {
+        let dir = tempfile::Builder::new()
+            .prefix("deoxidizer-test-")
+            .tempdir()
+            .unwrap();
+        let dest = dir.path().join("deox");
+        fs::write(&dest, b"old-bytes").unwrap();
+        let result = replace_file_atomically(&dir.path().join("missing"), &dest);
+        assert!(result.is_err());
+        assert_eq!(fs::read(&dest).unwrap(), b"old-bytes");
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["deox".to_string()], "temp residue: {names:?}");
+    }
+
+    #[test]
+    fn replace_file_atomically_replaces_content_and_keeps_mode() {
+        let dir = tempfile::Builder::new()
+            .prefix("deoxidizer-test-")
+            .tempdir()
+            .unwrap();
+        let src = dir.path().join("new-deox");
+        let dest = dir.path().join("deox");
+        fs::write(&src, b"new-binary-bytes").unwrap();
+        fs::write(&dest, b"old-bytes").unwrap();
+        #[cfg(unix)]
+        let old_inode = {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::metadata(&dest).unwrap().ino()
+        };
+
+        replace_file_atomically(&src, &dest).expect("atomic replace must succeed");
+
+        assert_eq!(fs::read(&dest).unwrap(), b"new-binary-bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let meta = fs::metadata(&dest).unwrap();
+            assert_ne!(meta.ino(), old_inode, "destination must be a new inode");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "unexpected residue: {names:?}");
     }
 }

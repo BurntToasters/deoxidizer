@@ -466,6 +466,7 @@ test('check-release-key main rejects a fixture missing the pinned fingerprint', 
     'release-signing-key.asc': 'fixture key\n',
     'install.sh': `KEY="${expectedFingerprint}"\n`,
     'install.ps1': `KEY="${expectedFingerprint}"\n`,
+    'src/updater.rs': `const KEY: &str = "${expectedFingerprint}";\n`,
     'bin/gpg': gpgStub,
   };
   const goodDir = stageScript('check-release-key.cjs', goodFiles);
@@ -493,6 +494,22 @@ test('check-release-key main rejects a fixture missing the pinned fingerprint', 
     }
   } finally {
     fs.rmSync(badDir, { recursive: true, force: true });
+  }
+
+  const badUpdaterDir = stageScript('check-release-key.cjs', {
+    ...goodFiles,
+    'src/updater.rs': 'const KEY: &str = "none";\n',
+  });
+  try {
+    const stagedBadUpdater = require(path.join(badUpdaterDir, 'scripts/check-release-key.cjs'));
+    process.env.PATH = `${path.join(badUpdaterDir, 'bin')}${path.delimiter}${previousPath}`;
+    try {
+      assert.throws(() => stagedBadUpdater.main(), /src\/updater\.rs does not pin/);
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  } finally {
+    fs.rmSync(badUpdaterDir, { recursive: true, force: true });
   }
 });
 

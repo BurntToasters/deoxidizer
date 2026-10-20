@@ -1,6 +1,6 @@
 use crate::config::CleanBehavior;
 use crate::project::DiscoveredProject;
-use crate::scanner::validate_project_root;
+use crate::scanner::{self, validate_project_root};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -234,6 +234,12 @@ fn validate_target_path(project: &DiscoveredProject) -> Result<PathBuf, String> 
             "target directory {} is not directly under project root {}",
             project.artifact_dir.display(),
             project.path.display()
+        ));
+    }
+    if !scanner::is_cargo_target_dir(&target) {
+        return Err(format!(
+            "target directory {} is not a Cargo build directory (no CACHEDIR.TAG or .rustc_info.json)",
+            project.artifact_dir.display()
         ));
     }
     Ok(target)

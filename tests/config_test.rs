@@ -429,3 +429,61 @@ fn test_tilde_user_and_relative_passthrough() {
         std::path::PathBuf::from("relative/path")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn test_save_through_symlink_updates_target_and_keeps_link() {
+    let directory = tempfile::tempdir().unwrap();
+    let real = directory.path().join("dotfiles-config.json");
+    let link = directory.path().join(".deox_config");
+    let original = Config {
+        projects_dir: "/tmp/original".to_string(),
+        ..Default::default()
+    };
+    original.save_to(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let updated = Config {
+        projects_dir: "/tmp/updated".to_string(),
+        ..Default::default()
+    };
+    updated.save_to(&link).expect("save through symlink");
+
+    let metadata = std::fs::symlink_metadata(&link).unwrap();
+    assert!(metadata.file_type().is_symlink(), "link must survive save");
+    let loaded = Config::load_from(&real).unwrap();
+    assert_eq!(loaded.projects_dir, "/tmp/updated");
+    assert_eq!(
+        Config::load_from(&link).unwrap().projects_dir,
+        "/tmp/updated"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_save_through_dangling_symlink_creates_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let subdir = directory.path().join("dotfiles");
+    std::fs::create_dir_all(&subdir).unwrap();
+    let link = directory.path().join(".deox_config");
+    std::os::unix::fs::symlink("dotfiles/deox.json", &link).unwrap();
+
+    let config = Config {
+        projects_dir: "/tmp/fresh".to_string(),
+        ..Default::default()
+    };
+    config
+        .save_to(&link)
+        .expect("save through dangling symlink");
+
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        Config::load_from(&subdir.join("deox.json"))
+            .unwrap()
+            .projects_dir,
+        "/tmp/fresh"
+    );
+}

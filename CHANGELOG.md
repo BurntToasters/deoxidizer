@@ -40,7 +40,16 @@
 - **Testing:** Added an end-to-end suite that drives the real binary against realistic project trees and records a transcript per scenario, plus scanner, cleaner, configuration, CLI parity, updater, signature, checksum, release-session, and release-draft coverage.
 - **Licenses:** Standardized project metadata and distributed documentation on GPL-3.0-or-later.
 - **PKG:** Pinned Rust `1.98.1` and Node.js `24.20.0` release tooling.
-- **PKG:** Updated dependencies (`dirs 7`, `dialoguer 0.12`, `sha2 0.11`, `toml 1.x`, `zip 8`).
+- **PKG:** Updated dependencies (`dirs 7`, `dialoguer 0.12`, `sha2 0.11`, `toml 1.x`, `zip 9`, `rustls 0.23.46`).
+- **PKG:** Cargo dependency updates that are semver-major are ignored by Dependabot; they go through the guarded `npm run update:safe` path with code changes.
+- **Safety:** Only a `target/` holding Cargo's `CACHEDIR.TAG` or a regular `.rustc_info.json` is treated as a build directory. Other `target/` folders are reported as `not a Cargo build directory`, never deleted, and re-checked at clean time.
+- **Scanning:** Plain folders named `target` that are not build outputs are scanned, so crates nested inside them are found.
+- **Scripting:** `scan --json` and `clean --json` include a top-level `"schema_version": 1`; exit codes are `0` (success or cancelled), `1` (runtime error, partial clean, or analysis failures), and `2` (usage error). These follow semver from 1.0.
+- **Output:** Project names, member names, and paths in human output replace control characters with U+FFFD, so names from cloned repositories cannot inject terminal escape sequences.
+- **Settings:** Saving settings through a symlinked config file writes the link's target and keeps the symlink.
+- **Units:** `--min-size-mb`, `--min-size`, and `min_size_mb` are documented and measured in MiB.
+- **Updater:** `deox --update` replaces the sibling binary atomically (temp file, then rename).
+- **Release:** `scripts/verify-release.cjs` verifies every `SHA256SUMS` manifest with the same in-process verifier `deox --update` uses; the release-key check also requires the pinned fingerprint in `src/updater.rs`.
 
 ## ℹ️ Release Info
 

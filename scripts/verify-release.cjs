@@ -106,6 +106,33 @@ function verifyDetachedSignature(filePath) {
   }
 }
 
+// Cross-check a SHA256SUMS manifest with the in-process verifier that
+// `deox --update` uses (src/openpgp.rs via examples/verify_release_manifest.rs),
+// so release-time acceptance matches runtime acceptance. Only manifests.
+function verifyInProcessManifest(manifestPath) {
+  const result = spawnSync(
+    'cargo',
+    [
+      'run',
+      '--quiet',
+      '--locked',
+      '--example',
+      'verify_release_manifest',
+      '--',
+      manifestPath,
+      `${manifestPath}.asc`,
+    ],
+    { cwd: root, encoding: 'utf8' },
+  );
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `In-process manifest verification failed: ${path.basename(manifestPath)}` +
+        `${result.error ? `: ${result.error.message}` : ''}` +
+        `${result.stderr ? `\n${String(result.stderr).trim()}` : ''}`,
+    );
+  }
+}
+
 function zipEntries(filePath) {
   const bytes = fs.readFileSync(filePath);
   const endOfCentralDirectorySignature = 0x06054b50;
@@ -401,6 +428,7 @@ function verifyLocal() {
         throw new Error(`Missing detached signature: ${path.basename(checksumPath)}.asc`);
       }
       verifyDetachedSignature(checksumPath);
+      verifyInProcessManifest(checksumPath);
     }
   }
   return archives;
@@ -533,6 +561,7 @@ function verifyRemoteManifests(remoteAssets) {
       fs.writeFileSync(manifestPath, manifestBytes);
       fs.writeFileSync(signaturePath, signatureBytes);
       verifyDetachedSignature(manifestPath);
+      verifyInProcessManifest(manifestPath);
       const errors = validateRemoteManifestEntries(
         manifestAsset.name,
         manifestBytes.toString('utf8'),

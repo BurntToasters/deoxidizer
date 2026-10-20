@@ -93,7 +93,7 @@ pub struct CleanArgs {
     #[arg(long = "dry-run")]
     pub dry_run: bool,
 
-    /// Only include projects at least this large for this run (in MB, overrides config).
+    /// Only include projects at least this large for this run (in MiB, overrides config).
     #[arg(
         long = "min-size-mb",
         visible_alias = "min-size",
@@ -159,7 +159,7 @@ pub struct ScanArgs {
     #[arg(long = "path", value_name = "PATH", value_hint = clap::ValueHint::DirPath)]
     pub path: Option<String>,
 
-    /// Only show projects at least this large for this run (in MB, overrides config).
+    /// Only show projects at least this large for this run (in MiB, overrides config).
     #[arg(
         long = "min-size-mb",
         visible_alias = "min-size",
@@ -217,7 +217,7 @@ pub struct SettingsConfigArgs {
     #[arg(long = "default-mode", value_enum, ignore_case = true)]
     pub default_mode: Option<DefaultMode>,
 
-    /// Set the minimum artifact size in MB to include (0 = show all).
+    /// Set the minimum artifact size in MiB to include (0 = show all).
     #[arg(
         long = "min-size-mb",
         value_name = "MB",
@@ -315,8 +315,10 @@ fn scan_or_exit(config: &Config, config_override: Option<&PathBuf>) -> Vec<Disco
         Err(error) => {
             eprintln!(
                 "Scan failed for '{}' (config {}): {error}.",
-                config.projects_dir,
-                effective_config_path(config_override).display()
+                crate::display::sanitize(&config.projects_dir),
+                crate::display::sanitize(
+                    &effective_config_path(config_override).display().to_string()
+                )
             );
             std::process::exit(1);
         }
@@ -383,15 +385,20 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
     }
 
     if human {
-        println!("🔍 Scanning {}...", config.projects_dir);
+        println!(
+            "🔍 Scanning {}...",
+            crate::display::sanitize(&config.projects_dir)
+        );
     }
     let report = match crate::scanner::scan_with_report(&config) {
         Ok(report) => report,
         Err(error) => {
             eprintln!(
                 "Scan failed for '{}' (config {}): {error}.",
-                config.projects_dir,
-                effective_config_path(config_override).display()
+                crate::display::sanitize(&config.projects_dir),
+                crate::display::sanitize(
+                    &effective_config_path(config_override).display().to_string()
+                )
             );
             std::process::exit(1);
         }
@@ -417,12 +424,12 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
                 errors += 1;
                 eprintln!(
                     "Cannot measure {} ({}): {error}. Skipping it.",
-                    project.name,
+                    display::sanitize(&project.name),
                     display::display_path(&project.path)
                 );
                 failures.push(serde_json::json!({
                     "name": project.name,
-                    "path": project.path,
+                    "path": project.path.to_string_lossy(),
                     "result": "error",
                     "bytes": 0,
                     "message": error,
@@ -437,7 +444,7 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
             .map(|(p, bytes)| {
                 format!(
                     "{} — {} ({})",
-                    p.name,
+                    display::sanitize(&p.name),
                     display::display_path(&p.path),
                     format_size(*bytes, BINARY)
                 )
@@ -462,6 +469,11 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
             .filter(|(index, _)| chosen.contains(index))
             .map(|(_, candidate)| candidate)
             .collect();
+        if candidates.is_empty() && human {
+            println!("Nothing selected; nothing was cleaned.");
+            exit_if_errors(errors, human);
+            return;
+        }
     }
 
     let total_estimate = candidates
@@ -504,7 +516,7 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
                 .map(|(p, bytes)| {
                     serde_json::json!({
                         "name": p.name,
-                        "path": p.path,
+                        "path": p.path.to_string_lossy(),
                         "result": "would-clean",
                         "bytes": bytes,
                     })
@@ -543,7 +555,7 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
                 return;
             }
             Err(error) => {
-                eprintln!("Confirmation failed: {error}.");
+                eprintln!("Confirmation failed: {error}. Use --yes to clean without a prompt.");
                 std::process::exit(1);
             }
         }
@@ -580,7 +592,7 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
         };
         entries.push(serde_json::json!({
             "name": project.name,
-            "path": project.path,
+            "path": project.path.to_string_lossy(),
             "result": label,
             "bytes": bytes,
             "message": message,
@@ -609,6 +621,7 @@ fn print_clean_json(
     projects: Vec<serde_json::Value>,
 ) {
     let value = serde_json::json!({
+        "schema_version": crate::display::JSON_SCHEMA_VERSION,
         "mode": mode.to_string(),
         "behavior": behavior.to_string(),
         "dry_run": dry_run,
@@ -634,7 +647,10 @@ fn run_scan(args: ScanArgs, config_override: Option<&PathBuf>) {
     let mut config = load_config_or_default(config_override);
     apply_scan_overrides(&mut config, args.path.as_ref(), args.min_size);
     if !args.json {
-        println!("🔍 Scanning {}...\n", config.projects_dir);
+        println!(
+            "🔍 Scanning {}...\n",
+            crate::display::sanitize(&config.projects_dir)
+        );
     }
     let mut projects = scan_or_exit(&config, config_override);
     if let Some(days) = args.older_than {
@@ -653,11 +669,17 @@ fn run_inspect(args: InspectArgs) {
     let requested_path = match dunce::canonicalize(&args.project) {
         Ok(canonical) => canonical,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("Path does not exist: {}", args.project.display());
+            eprintln!(
+                "Path does not exist: {}",
+                crate::display::sanitize(&args.project.display().to_string())
+            );
             std::process::exit(1);
         }
         Err(error) => {
-            eprintln!("Cannot resolve {}: {error}", args.project.display());
+            eprintln!(
+                "Cannot resolve {}: {error}",
+                crate::display::sanitize(&args.project.display().to_string())
+            );
             std::process::exit(1);
         }
     };
@@ -667,13 +689,19 @@ fn run_inspect(args: InspectArgs) {
     // workspace) is scanned — never its parent folder.
     let scope = args.scope.unwrap_or(Scope::TauriAndRust);
     let Some(base) = enclosing_project_root(&requested_path) else {
-        eprintln!("No Rust/Tauri project found at: {}", args.project.display());
+        eprintln!(
+            "No Rust/Tauri project found at: {}",
+            crate::display::sanitize(&args.project.display().to_string())
+        );
         std::process::exit(1);
     };
     let projects = match scan_dir(&base, &scope) {
         Ok(projects) => projects,
         Err(error) => {
-            eprintln!("Scan failed for '{}': {error}.", base.display());
+            eprintln!(
+                "Scan failed for '{}': {error}.",
+                crate::display::sanitize(&base.display().to_string())
+            );
             std::process::exit(1);
         }
     };
@@ -683,7 +711,7 @@ fn run_inspect(args: InspectArgs) {
     } else {
         eprintln!(
             "No Rust/Tauri project with build artifacts found at: {}",
-            args.project.display()
+            crate::display::sanitize(&args.project.display().to_string())
         );
         std::process::exit(1);
     }
