@@ -7,6 +7,10 @@ use std::path::{Component, Path, PathBuf};
 /// Cargo's per-profile build lock file name.
 const CARGO_LOCK_FILE: &str = ".cargo-lock";
 
+/// Files that mark a directory as a Cargo build directory
+/// (see `scanner::is_cargo_target_dir`).
+const CARGO_MARKERS: [&str; 2] = ["CACHEDIR.TAG", ".rustc_info.json"];
+
 /// The clean mode determines what gets removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanMode {
@@ -80,7 +84,10 @@ pub fn plan(
     let target = validate_target_path(project)?;
     let mut paths = match mode {
         CleanMode::Full if options.keep_bundles => {
-            let preserved = bundle_dirs(&target);
+            // Keep Cargo's markers with the bundles so the remaining
+            // `target/` still passes `scanner::is_cargo_target_dir`.
+            let mut preserved = bundle_dirs(&target);
+            preserved.extend(CARGO_MARKERS.iter().map(|name| target.join(name)));
             let mut paths = Vec::new();
             collect_except(&target, &preserved, &mut paths)?;
             paths
@@ -473,6 +480,7 @@ fn remove_path(path: &Path, behavior: &CleanBehavior) -> Result<(), String> {
             let metadata =
                 fs::symlink_metadata(path).map_err(|error| format!("delete failed: {error}"))?;
             if metadata.is_dir() {
+                remove_markers_last(path)?;
                 fs::remove_dir_all(path)
             } else {
                 fs::remove_file(path)
@@ -483,6 +491,35 @@ fn remove_path(path: &Path, behavior: &CleanBehavior) -> Result<(), String> {
             .delete(path)
             .map_err(|error| format!("trash failed: {error}")),
     }
+}
+
+/// For a whole `target/` (one that carries Cargo's markers), delete every
+/// child except the markers first, so an interrupted or failed delete still
+/// leaves a directory `scanner::is_cargo_target_dir` accepts and a re-run can
+/// finish it. Other directories are left to `remove_dir_all` unchanged.
+fn remove_markers_last(path: &Path) -> Result<(), String> {
+    if !scanner::is_cargo_target_dir(path) {
+        return Ok(());
+    }
+    let entries = fs::read_dir(path).map_err(|error| format!("delete failed: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("delete failed: {error}"))?;
+        if CARGO_MARKERS.iter().any(|name| entry.file_name() == *name) {
+            continue;
+        }
+        let child = entry.path();
+        let is_dir = entry
+            .file_type()
+            .map_err(|error| format!("delete failed: {error}"))?
+            .is_dir();
+        if is_dir {
+            fs::remove_dir_all(&child)
+        } else {
+            fs::remove_file(&child)
+        }
+        .map_err(|error| format!("delete failed: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Trash context; on macOS uses `NSFileManager` instead of scripting

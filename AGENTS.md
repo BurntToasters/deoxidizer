@@ -310,7 +310,10 @@ regular files (symlinks count as 0).
   (see Hard Do-Nots #1). Other `target/` folders produce a
   `not a Cargo build directory` warning and no project; `cleaner::plan` and
   `clean_project_with` call `cleaner::validate_target_path` again before any
-  removal.
+  removal. The markers must survive partial cleans: `--keep-bundles` preserves
+  `CACHEDIR.TAG`/`.rustc_info.json` alongside the bundles, and deleting a whole
+  `target/` removes every other child first (`cleaner::remove_markers_last`),
+  so an interrupted or failed clean can be finished by re-running it.
 - Human output sanitizes project names, member names, and paths: control
   characters are replaced with U+FFFD so names from cloned repositories cannot
   inject terminal escape sequences. JSON output carries the raw names.
