@@ -751,3 +751,36 @@ fn e2e_22_confirmation_failure_names_the_yes_flag() {
     assert!(app.join("target/debug/x").exists(), "nothing deleted");
     w.note("PASS: prompt failure points at --yes and deletes nothing");
 }
+
+#[test]
+fn e2e_23_keep_bundles_target_stays_a_cargo_build_dir() {
+    // Failure modes: --keep-bundles deletes CACHEDIR.TAG, so the kept bundles
+    // become an "unverified" target that is warned about on every scan and
+    // can never be cleaned afterwards.
+    let mut w = World::new("23-keep-bundles-keeps-marker", "tauri-only");
+    let app = w.projects.join("app/src-tauri");
+    crate_at(&app, "app", "tauri = \"2\"");
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/x"), 1000);
+    file(&app.join("target/release/bundle/dmg/app.dmg"), 500);
+
+    let out = w.run(&["clean", "-y", "--keep-bundles"]);
+    assert_ok(&out, "clean --keep-bundles");
+    assert!(app.join("target/release/bundle/dmg/app.dmg").exists());
+    assert!(app.join("target/CACHEDIR.TAG").exists(), "marker kept");
+
+    let out = w.run(&["scan"]);
+    assert_ok(&out, "scan after keep-bundles");
+    assert!(
+        !stderr(&out).contains("not a Cargo build directory"),
+        "no unverified-target warning: {}",
+        stderr(&out)
+    );
+    let out = w.run(&["clean", "-y"]);
+    assert_ok(&out, "full clean of kept bundles");
+    assert!(
+        !app.join("target").exists(),
+        "bundles removed by full clean"
+    );
+    w.note("PASS: --keep-bundles keeps the Cargo marker; bundles stay cleanable");
+}
