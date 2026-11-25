@@ -270,9 +270,18 @@ impl Config {
         if self.version != CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion(self.version));
         }
-        if self.projects_dir.trim().is_empty() {
+        if self.projects_dir.is_empty() {
             return Err(ConfigError::Invalid(
                 "projects_dir must not be empty".to_string(),
+            ));
+        }
+        let projects_path = Path::new(&self.projects_dir);
+        let portable_home_path = self.projects_dir == "~"
+            || self.projects_dir.starts_with("~/")
+            || (cfg!(windows) && self.projects_dir.starts_with("~\\"));
+        if !projects_path.is_absolute() && !portable_home_path {
+            return Err(ConfigError::Invalid(
+                "projects_dir must be absolute or begin with ~/".to_string(),
             ));
         }
         if self.min_size_mb.checked_mul(1024 * 1024).is_none() {
@@ -384,14 +393,12 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 /// made absolute against the current directory so it never depends on
 /// where `deox` is run later.
 pub fn normalize_projects_dir(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed == "~" || trimmed.starts_with("~/") || (cfg!(windows) && trimmed.starts_with("~\\"))
-    {
-        return trimmed.to_string();
+    if input == "~" || input.starts_with("~/") || (cfg!(windows) && input.starts_with("~\\")) {
+        return input.to_string();
     }
-    std::path::absolute(trimmed)
+    std::path::absolute(Path::new(input))
         .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| trimmed.to_string())
+        .unwrap_or_else(|_| input.to_string())
 }
 
 /// Try to auto-detect a sensible default projects directory.

@@ -32,6 +32,21 @@
 //! 20. Package names with ESC/BEL reach the terminal unescaped.
 //! 21. Scan and clean JSON carry no `schema_version`.
 //! 22. A failed confirmation prompt does not say how to skip it.
+//! 23. Explicit paths with significant whitespace and relative stored roots
+//!     can select a different tree than the user intended.
+//! 24. A failed config backup does not stop setup from overwriting the config.
+//! 25. Workspace ignores include hidden and stale-local-target members.
+//! 26. Workspace excludes do not claim package ownership.
+//! 27. Symlinked ancestor manifests cannot establish workspace ownership.
+//! 28. Indeterminate Cargo lock entries fail closed, including during dry-run.
+//! 29. Filesystem errors are sanitized at terminal sinks while JSON names stay raw.
+//! 30. Cargo target markers must be regular files, not links.
+//! 31. Windows directory-link leaves are removed without following them.
+//! 32. Trash must fail closed when the backend cannot bind the request to a verified directory identity.
+//! 33. Unresolved declared workspace members cannot bypass ignore protection.
+//! 34. Linux Trash stages a verified entry and preserves its original restore path.
+//! 35. Linux Trash failures restore the original entry without leaving staged data behind.
+//! 36. Windows directory-link leaves are removed without following them.
 
 use std::fs;
 use std::io::Write;
@@ -112,6 +127,8 @@ impl World {
         command.env("USERPROFILE", &self.home);
         #[cfg(not(windows))]
         command.env("HOME", &self.home);
+        #[cfg(target_os = "linux")]
+        command.env("XDG_DATA_HOME", self.home.join(".local/share"));
         let output = command.output().expect("run deox");
         writeln!(
             self.log,
@@ -783,4 +800,380 @@ fn e2e_23_keep_bundles_target_stays_a_cargo_build_dir() {
         "bundles removed by full clean"
     );
     w.note("PASS: --keep-bundles keeps the Cargo marker; bundles stay cleanable");
+}
+
+#[test]
+fn e2e_24_explicit_paths_preserve_whitespace_and_relative_configs_fail_closed() {
+    let mut w = World::new("24-path-identity", "tauri-and-rust");
+    let spaced = w.root.join(" projects ");
+    fs::create_dir_all(&spaced).unwrap();
+    let app = spaced.join("space-app");
+    crate_at(&app, "space-app", "");
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/x"), 100);
+
+    let path_arg = spaced.to_str().unwrap();
+    let dry = w.run(&["clean", "--dry-run", "--json", "--path", path_arg]);
+    assert_ok(&dry, "clean with a whitespace-sensitive --path");
+    assert_eq!(json(&dry)["projects"].as_array().unwrap().len(), 1);
+
+    let settings = w.run(&["settings", "config", "--projects-dir", path_arg]);
+    assert_ok(
+        &settings,
+        "settings config with a whitespace-sensitive path",
+    );
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&w.config).unwrap()).unwrap();
+    assert_eq!(saved["projects_dir"], path_arg);
+
+    w.set_config("projects_dir", serde_json::json!("./projects"));
+    let rejected = w.run(&["clean", "-y"]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(stderr(&rejected).contains("projects_dir must be absolute"));
+    assert!(app.join("target/debug/x").exists());
+    w.note("PASS: explicit whitespace preserved; relative stored root rejected before clean");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_25_setup_backup_collision_preserves_backup_and_original_config() {
+    let mut w = World::new("25-setup-backup-collision", "tauri-only");
+    let original_config = fs::read(&w.config).unwrap();
+    let sentinel = w.root.join("backup-sentinel");
+    fs::write(&sentinel, b"backup destination must survive").unwrap();
+    let mut backup_name = w.config.as_os_str().to_os_string();
+    backup_name.push(".bak");
+    let backup = PathBuf::from(backup_name);
+    std::os::unix::fs::symlink(&sentinel, &backup).unwrap();
+
+    let out = w.run(&["setup", "--default", "--yes"]);
+    assert_eq!(out.status.code(), Some(1), "backup failure must stop setup");
+    assert_eq!(fs::read(&w.config).unwrap(), original_config);
+    assert_eq!(
+        fs::read(&sentinel).unwrap(),
+        b"backup destination must survive"
+    );
+    assert!(fs::symlink_metadata(&backup)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    w.note("PASS: backup collision stops setup without following or overwriting destination");
+}
+
+#[test]
+fn e2e_26_hidden_workspace_member_and_stale_local_target_are_ignored() {
+    let mut w = World::new("26-hidden-workspace-member", "tauri-and-rust");
+    let workspace = w.projects.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\".hidden-member\", \"visible\"]\n",
+    )
+    .unwrap();
+    crate_at(&workspace.join(".hidden-member"), "protected-hidden", "");
+    crate_at(&workspace.join("visible"), "visible", "");
+    // This marked local target can make the hidden package appear to own a
+    // separate target even though the workspace target also contains builds.
+    mark_cargo_target(&workspace.join(".hidden-member/target"));
+    file(&workspace.join(".hidden-member/target/debug/local"), 100);
+    mark_cargo_target(&workspace.join("target"));
+    file(&workspace.join("target/debug/shared"), 200);
+    w.set_config("ignored_projects", serde_json::json!(["protected-hidden"]));
+
+    let out = w.run(&["clean", "-y"]);
+    assert_ok(&out, "clean with ignored hidden workspace member");
+    assert!(workspace.join("target/debug/shared").exists());
+    assert!(workspace.join(".hidden-member/target/debug/local").exists());
+    w.note("PASS: hidden member protects shared target and its marked local target");
+}
+
+#[test]
+fn e2e_27_workspace_excludes_do_not_claim_package_ownership() {
+    let mut w = World::new("27-workspace-excludes", "tauri-and-rust");
+    let workspace = w.projects.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/excluded\"]\n",
+    )
+    .unwrap();
+    crate_at(&workspace.join("crates/included"), "included", "");
+    crate_at(&workspace.join("crates/excluded"), "excluded", "");
+    mark_cargo_target(&workspace.join("target"));
+    file(&workspace.join("target/debug/shared"), 200);
+    w.set_config("ignored_projects", serde_json::json!(["excluded"]));
+
+    let out = w.run(&["clean", "-y"]);
+    assert_ok(&out, "clean with ignored excluded package");
+    assert!(!workspace.join("target").exists());
+    w.note("PASS: excluded package does not protect the workspace target");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_28_symlinked_ancestor_manifest_cannot_establish_workspace() {
+    let mut w = World::new("28-symlinked-manifest", "tauri-and-rust");
+    let external = w.root.join("external");
+    fs::create_dir_all(&external).unwrap();
+    fs::write(
+        external.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\n",
+    )
+    .unwrap();
+    let project = w.projects.join("linked-workspace");
+    fs::create_dir_all(&project).unwrap();
+    std::os::unix::fs::symlink(external.join("Cargo.toml"), project.join("Cargo.toml")).unwrap();
+    crate_at(&project.join("member"), "member", "");
+    mark_cargo_target(&project.join("target"));
+    file(&project.join("target/debug/x"), 100);
+
+    let scan = w.run(&["scan", "--json"]);
+    assert_ok(&scan, "scan with symlinked ancestor manifest");
+    assert!(json(&scan)["projects"].as_array().unwrap().is_empty());
+    let clean = w.run(&["clean", "-y"]);
+    assert_ok(&clean, "clean with symlinked ancestor manifest");
+    assert!(project.join("target/debug/x").exists());
+    w.note("PASS: symlinked Cargo.toml cannot establish clean eligibility");
+}
+
+#[test]
+fn e2e_29_dry_run_and_clean_fail_closed_on_indeterminate_cargo_lock() {
+    let mut w = World::new("29-cargo-lock-parity", "tauri-and-rust");
+    let app = w.projects.join("locked");
+    crate_at(&app, "locked", "");
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/x"), 100);
+    let lock_path = app.join("target/debug/.cargo-lock");
+    // Cargo expects a regular lock file. A directory at the same name is an
+    // indeterminate state and must not be mistaken for an idle build.
+    fs::create_dir(&lock_path).unwrap();
+
+    let dry = w.run(&["clean", "--dry-run", "--json"]);
+    assert_eq!(
+        dry.status.code(),
+        Some(1),
+        "indeterminate lock state is an error"
+    );
+    let dry_json = json(&dry);
+    assert_eq!(dry_json["bytes"], 0);
+    assert_eq!(dry_json["projects"][0]["result"], "error");
+    assert!(app.join("target/debug/x").exists());
+
+    let clean = w.run(&["clean", "-y", "--json"]);
+    assert_eq!(clean.status.code(), Some(1));
+    assert_eq!(json(&clean)["projects"][0]["result"], "error");
+    assert!(app.join("target/debug/x").exists());
+    w.note("PASS: unknown Cargo lock state is never estimated or cleaned");
+}
+
+#[test]
+fn e2e_30_terminal_error_paths_are_sanitized() {
+    let mut w = World::new("30-error-sanitization", "tauri-and-rust");
+    let unsafe_root = w.root.join("missing\n\u{1b}projects");
+    w.set_config(
+        "projects_dir",
+        serde_json::json!(unsafe_root.to_string_lossy()),
+    );
+
+    let scan = w.run(&["scan"]);
+    assert_eq!(scan.status.code(), Some(1));
+    assert!(!scan.stdout.contains(&0x1b));
+    assert!(!scan.stderr.contains(&0x1b));
+    assert!(stderr(&scan).contains('\u{fffd}'));
+
+    let clean = w.run(&["clean", "-y"]);
+    assert_eq!(clean.status.code(), Some(1));
+    assert!(!clean.stderr.contains(&0x1b));
+    assert!(stderr(&clean).contains('\u{fffd}'));
+    w.note("PASS: filesystem error paths are terminal-safe");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_31_cargo_marker_symlink_does_not_authorize_clean() {
+    let mut w = World::new("31-marker-symlink", "tauri-and-rust");
+    let app = w.projects.join("unmarked");
+    crate_at(&app, "unmarked", "");
+    fs::create_dir_all(app.join("target/debug")).unwrap();
+    file(&app.join("target/debug/keep"), 100);
+    let outside_marker = w.root.join("valid-marker");
+    fs::write(&outside_marker, CACHEDIR_TAG).unwrap();
+    std::os::unix::fs::symlink(&outside_marker, app.join("target/CACHEDIR.TAG")).unwrap();
+
+    let scan = w.run(&["scan", "--json"]);
+    assert_ok(&scan, "scan with linked Cargo marker");
+    assert!(json(&scan)["projects"].as_array().unwrap().is_empty());
+    let clean = w.run(&["clean", "-y"]);
+    assert_ok(&clean, "clean with linked Cargo marker");
+    assert!(app.join("target/debug/keep").exists());
+    assert_eq!(fs::read(&outside_marker).unwrap(), CACHEDIR_TAG.as_bytes());
+    w.note("PASS: symlinked marker cannot authorize a target for cleanup");
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn e2e_32_trash_backend_fails_closed_without_mutating_the_target() {
+    let mut w = World::new("32-trash-fail-closed", "tauri-and-rust");
+    let app = w.projects.join("trash-app");
+    crate_at(&app, "trash-app", "");
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/keep"), 100);
+    w.set_config("clean_behavior", serde_json::json!("trash"));
+
+    let dry = w.run(&["clean", "--dry-run", "--json"]);
+    assert_eq!(
+        dry.status.code(),
+        Some(1),
+        "unsupported Trash backend must fail closed in dry-run"
+    );
+    assert_eq!(json(&dry)["bytes"], 0);
+    assert_eq!(json(&dry)["projects"][0]["result"], "error");
+    assert!(app.join("target/debug/keep").exists());
+
+    let clean = w.run(&["clean", "-y", "--json"]);
+    assert_eq!(
+        clean.status.code(),
+        Some(1),
+        "unsupported Trash identity backend must fail closed"
+    );
+    let result = &json(&clean)["projects"][0];
+    assert_eq!(result["result"], "error");
+    assert!(result["message"].as_str().unwrap().contains("Trash cannot"));
+    assert_eq!(json(&clean)["bytes"], 0);
+    assert!(app.join("target/debug/keep").exists());
+    w.note("PASS: Trash backend refuses path-only deletion and leaves the target untouched");
+}
+
+#[test]
+fn e2e_33_unresolved_workspace_member_preserves_ignored_shared_target() {
+    let mut w = World::new("33-unresolved-workspace-member", "tauri-and-rust");
+    let workspace = w.projects.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\".hidden-member\", \"visible\"]\n",
+    )
+    .unwrap();
+    let hidden = workspace.join(".hidden-member");
+    fs::create_dir_all(hidden.join("src")).unwrap();
+    fs::write(hidden.join("Cargo.toml"), "[package\ninvalid = true\n").unwrap();
+    crate_at(&workspace.join("visible"), "visible", "");
+    mark_cargo_target(&workspace.join("target"));
+    file(&workspace.join("target/debug/shared"), 100);
+    w.set_config(
+        "ignored_projects",
+        serde_json::json!(["possibly-protected-member"]),
+    );
+
+    let clean = w.run(&["clean", "-y"]);
+    assert_ok(&clean, "clean with unresolved declared workspace member");
+    assert!(workspace.join("target/debug/shared").exists());
+    w.note("PASS: unresolved member cannot make ignored-project protection disappear");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_34_linux_trash_preserves_original_restore_path() {
+    let mut w = World::new("34-linux-trash-restore-path", "tauri-and-rust");
+    let app = w.projects.join("trash-app");
+    crate_at(&app, "trash-app", "");
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/keep"), 100);
+    let outside = w.root.join("outside-sentinel");
+    fs::write(&outside, b"must survive").unwrap();
+    std::os::unix::fs::symlink(&outside, app.join("target/debug/link")).unwrap();
+    w.set_config("clean_behavior", serde_json::json!("trash"));
+
+    let dry = w.run(&["clean", "--dry-run", "--json"]);
+    assert_ok(&dry, "Linux Trash dry-run");
+    assert_eq!(json(&dry)["projects"][0]["result"], "would-clean");
+    assert!(app.join("target").exists());
+    assert!(!w.home.join(".local/share/Trash").exists());
+
+    let clean = w.run(&["clean", "-y", "--json"]);
+    assert_ok(&clean, "Linux Trash clean");
+    assert_eq!(json(&clean)["projects"][0]["result"], "cleaned");
+    assert!(!app.join("target").exists());
+    assert_eq!(fs::read(&outside).unwrap(), b"must survive");
+
+    let trash_info = w.home.join(".local/share/Trash/info");
+    let infos = fs::read_dir(&trash_info)
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    let original_path = app.join("target").to_string_lossy().into_owned();
+    assert!(
+        infos
+            .iter()
+            .any(|info| info.contains(&format!("Path={original_path}\n"))),
+        "Trash metadata must retain the original artifact path: {infos:?}"
+    );
+    w.note("PASS: staged Trash entry preserves original path metadata and external link target");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_35_linux_trash_failure_restores_original_target() {
+    let mut w = World::new("35-linux-trash-rollback", "tauri-and-rust");
+    let app = w.projects.join("trash-app");
+    crate_at(&app, "trash-app", "");
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/keep"), 100);
+    let trash_root = w.home.join(".local/share/Trash");
+    fs::create_dir_all(&trash_root).unwrap();
+    fs::write(
+        trash_root.join("info"),
+        b"fixture blocks Trash metadata directory",
+    )
+    .unwrap();
+    w.set_config("clean_behavior", serde_json::json!("trash"));
+
+    let clean = w.run(&["clean", "-y", "--json"]);
+    assert_eq!(
+        clean.status.code(),
+        Some(1),
+        "Trash failure must be reported"
+    );
+    assert_eq!(json(&clean)["projects"][0]["result"], "error");
+    assert!(app.join("target/debug/keep").exists());
+    assert!(!fs::read_dir(&app).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".deoxidizer-trash-")));
+    w.note("PASS: failed Trash move restores original target and removes empty staging directory");
+}
+
+#[cfg(windows)]
+#[test]
+fn e2e_36_windows_directory_link_leaf_is_removed_without_following() {
+    let mut w = World::new("36-windows-directory-link", "tauri-and-rust");
+    let app = w.projects.join("linked");
+    crate_at(&app, "linked", "");
+    mark_cargo_target(&app.join("target"));
+    file(&app.join("target/debug/x"), 100);
+    let outside = w.root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("sentinel"), b"must survive").unwrap();
+    let link = app.join("target/directory-link");
+    let link_text = link.to_string_lossy();
+    let outside_text = outside.to_string_lossy();
+    let status = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            link_text.as_ref(),
+            outside_text.as_ref(),
+        ])
+        .status();
+    if status.map(|status| !status.success()).unwrap_or(true) {
+        w.note("SKIP: this Windows account cannot create a junction");
+        return;
+    }
+
+    let clean = w.run(&["clean", "-y"]);
+    assert_ok(&clean, "clean with direct directory-link child");
+    assert!(!app.join("target").exists());
+    assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"must survive");
+    w.note("PASS: directory-link child removed and external sentinel preserved");
 }

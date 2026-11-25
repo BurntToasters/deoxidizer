@@ -2,6 +2,7 @@
 
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
+const { npmInvocation } = require('./npm-safe-update.cjs');
 
 const root = path.resolve(__dirname, '..');
 
@@ -18,10 +19,13 @@ function parseArgs(argv = process.argv.slice(2)) {
   };
 }
 
-function run(command, args) {
+function run(command, args, { cwd = root, env = process.env } = {}) {
   const result = spawnSync(command, args, {
-    cwd: root,
+    cwd,
+    env,
     encoding: 'utf8',
+    shell: false,
+    windowsHide: true,
     stdio: 'inherit',
   });
   if (result.error) throw result.error;
@@ -30,12 +34,57 @@ function run(command, args) {
   }
 }
 
-function requireConfirmation() {
-  if (process.env.DEOX_RELEASE_CONFIRM !== 'YES') {
+function requireConfirmation(env = process.env) {
+  if (env.DEOX_RELEASE_CONFIRM !== 'YES') {
     throw new Error(
       'Refusing destructive branch synchronization. Set DEOX_RELEASE_CONFIRM=YES explicitly.',
     );
   }
+}
+
+function requireRemoteBranch(branch, { cwd = root, env = process.env } = {}) {
+  const ref = `refs/remotes/origin/${branch}^{commit}`;
+  const result = spawnSync('git', ['rev-parse', '--verify', '--quiet', ref], {
+    cwd,
+    env,
+    encoding: 'utf8',
+    shell: false,
+    windowsHide: true,
+    stdio: 'pipe',
+  });
+  if (result.error) throw result.error;
+  const commit = String(result.stdout || '').trim();
+  if (result.status !== 0 || !/^[0-9a-f]{40}$/i.test(commit)) {
+    throw new Error(
+      `Remote branch origin/${branch} is missing or does not resolve to a commit; refusing to reset or clean`,
+    );
+  }
+  return commit;
+}
+
+function synchronizeBranch(branch, { cwd = root, env = process.env, execute = run } = {}) {
+  if (!['main', 'beta'].includes(branch)) {
+    throw new Error('branch must be main or beta');
+  }
+  const childEnv = { ...process.env, ...env };
+  requireConfirmation(childEnv);
+
+  execute('git', ['fetch', 'origin'], { cwd, env: childEnv });
+  // Check the requested branch while the worktree is still untouched. A bad
+  // branch name or missing origin ref must never reach reset/clean.
+  requireRemoteBranch(branch, { cwd, env: childEnv });
+  // Resolve npm through npm_execpath on Windows before destructive cleanup.
+  // npm.cmd needs a shell, which is intentionally avoided by these scripts.
+  const npm = npmInvocation({ env: childEnv, platform: process.platform, execPath: process.execPath });
+  const runNpm = (args) => execute(npm.command, [...npm.prefixArgs, ...args], { cwd, env: childEnv });
+
+  execute('git', ['reset', '--hard'], { cwd, env: childEnv });
+  execute('git', ['clean', '-fd'], { cwd, env: childEnv });
+  execute('git', ['switch', '-C', branch, `origin/${branch}`], { cwd, env: childEnv });
+  execute('git', ['reset', '--hard', `origin/${branch}`], { cwd, env: childEnv });
+  execute('git', ['clean', '-fd'], { cwd, env: childEnv });
+  runNpm(['run', 'vi']);
+  if (branch === 'main') runNpm(['run', 'gitprune:force']);
 }
 
 function main() {
@@ -49,17 +98,7 @@ function main() {
     );
     process.env.DEOX_RELEASE_CONFIRM = 'YES';
   }
-  requireConfirmation();
-  run('git', ['fetch', 'origin']);
-  run('git', ['reset', '--hard']);
-  run('git', ['clean', '-fd']);
-  run('git', ['switch', '-C', branch, `origin/${branch}`]);
-  run('git', ['reset', '--hard', `origin/${branch}`]);
-  run('git', ['clean', '-fd']);
-  run('npm', ['run', 'vi']);
-  if (branch === 'main') {
-    run('npm', ['run', 'gitprune:force']);
-  }
+  synchronizeBranch(branch);
 }
 
 if (require.main === module) {
@@ -71,4 +110,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { requireConfirmation, parseArgs };
+module.exports = { requireConfirmation, requireRemoteBranch, synchronizeBranch, parseArgs };

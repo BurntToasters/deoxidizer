@@ -6,7 +6,11 @@ pub fn run_settings(args: SettingsArgs, config_override: Option<&std::path::Path
     let config_path: std::path::PathBuf = match Config::resolve_path(config_override) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("  {} {error}.", "✗".red().bold());
+            eprintln!(
+                "  {} {}.",
+                "✗".red().bold(),
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         }
     };
@@ -25,14 +29,18 @@ fn show_settings(config_path: &std::path::Path) {
             println!(
                 "  {} No configuration file found at {}",
                 "ℹ".blue(),
-                config_path.display()
+                crate::display::sanitize(&config_path.display().to_string())
             );
             println!("  Run {} to create one.", "deox setup".green());
             println!();
             return;
         }
         Err(error) => {
-            eprintln!("  {} Failed to load settings: {error}.", "✗".red().bold());
+            eprintln!(
+                "  {} Failed to load settings: {}.",
+                "✗".red().bold(),
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         }
     };
@@ -95,7 +103,11 @@ fn update_settings(args: SettingsConfigArgs, config_path: &std::path::Path) {
         Ok(config) => config,
         Err(ConfigError::Missing(_)) => Config::default(),
         Err(error) => {
-            eprintln!("  {} Failed to load settings: {error}.", "✗".red().bold());
+            eprintln!(
+                "  {} Failed to load settings: {}.",
+                "✗".red().bold(),
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         }
     };
@@ -107,7 +119,7 @@ fn update_settings(args: SettingsConfigArgs, config_path: &std::path::Path) {
     let mut pending: Vec<String> = Vec::new();
 
     if let Some(dir) = args.projects_dir {
-        if dir.trim().is_empty() {
+        if dir.is_empty() {
             invalid = true;
             eprintln!("  {} Invalid projects-dir: must not be empty.", "✗".red());
         } else {
@@ -197,7 +209,11 @@ fn update_settings(args: SettingsConfigArgs, config_path: &std::path::Path) {
     if changed && !invalid {
         if let Err(error) = config.validate() {
             invalid = true;
-            eprintln!("  {} Invalid settings: {error}.", "✗".red());
+            eprintln!(
+                "  {} Invalid settings: {}.",
+                "✗".red(),
+                crate::display::sanitize(&error.to_string())
+            );
         }
     }
 
@@ -213,7 +229,11 @@ fn update_settings(args: SettingsConfigArgs, config_path: &std::path::Path) {
                 println!("  {} Settings saved.", "✓".green().bold());
             }
             Err(error) => {
-                eprintln!("  {} Failed to save: {error}.", "✗".red().bold());
+                eprintln!(
+                    "  {} Failed to save: {}.",
+                    "✗".red().bold(),
+                    crate::display::sanitize(&error.to_string())
+                );
                 std::process::exit(1);
             }
         }
@@ -239,7 +259,10 @@ fn reset_settings(args: SettingsResetArgs, config_path: &std::path::Path) {
                 return;
             }
             Err(error) => {
-                eprintln!("Reset cancelled: {error} (use --yes to skip confirmation).");
+                eprintln!(
+                    "Reset cancelled: {} (use --yes to skip confirmation).",
+                    crate::display::sanitize(&error.to_string())
+                );
                 std::process::exit(1);
             }
         }
@@ -251,7 +274,11 @@ fn reset_settings(args: SettingsResetArgs, config_path: &std::path::Path) {
             println!("  {} Settings reset to defaults.", "✓".green().bold());
         }
         Err(error) => {
-            eprintln!("  {} Failed to reset: {error}.", "✗".red().bold());
+            eprintln!(
+                "  {} Failed to reset: {}.",
+                "✗".red().bold(),
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         }
     }

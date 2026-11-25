@@ -8,25 +8,201 @@ const { spawnSync } = require('node:child_process');
 const zlib = require('node:zlib');
 const {
   assertGitHubCliAuthenticated,
+  downloadGitHubAsset,
   findReleaseByTag,
   githubApiWithRetry,
+  listReleaseAssets: listAssetsByRelease,
   repository,
-  runGitHub,
 } = require('./github-cli.cjs');
-const { expectedReleaseAssets } = require('./verify-release-draft.cjs');
+const {
+  expectedReleaseAssets,
+  resolveTagCommit,
+  validateDraft,
+} = require('./verify-release-draft.cjs');
+const { buildEnvironment, signaturePath, verifyReleaseSignature } = require('./minisign-sign.cjs');
 const { cargoVersion } = require('./sync-version.cjs');
 
 const root = path.resolve(__dirname, '..');
-const releaseDir = path.join(root, 'release');
+const releaseRoot = path.join(root, 'release');
+const releaseDir = process.env.DEOX_RELEASE_STAGE_DIR
+  ? path.resolve(process.env.DEOX_RELEASE_STAGE_DIR)
+  : releaseRoot;
 const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES = 512 * 1024 * 1024;
 const MAX_REMOTE_MANIFEST_BYTES = 4 * 1024 * 1024;
+const MAX_REMOTE_SIGNATURE_BYTES = 64 * 1024;
+const MAX_REMOTE_ASSET_BYTES = MAX_ARCHIVE_BYTES;
 const manifest = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
 const version = cargoVersion(manifest);
 const tag = `v${version}`;
 
+function assertReleaseDirectory() {
+  if (releaseDir !== releaseRoot) {
+    const stagingRoot = path.join(releaseRoot, 'staging');
+    const relative = path.relative(stagingRoot, releaseDir);
+    const target = path.basename(releaseDir);
+    const supportedTargets = new Set([
+      'x86_64-unknown-linux-musl',
+      'aarch64-unknown-linux-musl',
+      'x86_64-apple-darwin',
+      'aarch64-apple-darwin',
+      'x86_64-pc-windows-msvc',
+      'aarch64-pc-windows-msvc',
+    ]);
+    if (
+      relative.startsWith(`..${path.sep}`) ||
+      relative === '..' ||
+      path.isAbsolute(relative) ||
+      !supportedTargets.has(target) ||
+      relative !== target ||
+      (process.env.DEOX_RELEASE_TARGET && process.env.DEOX_RELEASE_TARGET !== target)
+    ) {
+      throw new Error('Release verification stage is not a supported isolated target directory');
+    }
+  }
+  if (fs.existsSync(releaseDir)) {
+    const stats = fs.lstatSync(releaseDir);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+      throw new Error(`Release verification directory is not a real directory: ${releaseDir}`);
+    }
+  }
+}
+
 function sha256(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function normalizeDigest(value) {
+  const digest = String(value || '').toLowerCase().replace(/^sha256:/, '');
+  return /^[0-9a-f]{64}$/.test(digest) ? digest : null;
+}
+
+function normalizedBinaryDigests(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be a binary digest map`);
+  }
+  const result = new Map();
+  for (const [name, digestValue] of Object.entries(value)) {
+    const basename = path.parse(name).name.toLowerCase();
+    const digest = normalizeDigest(digestValue);
+    if (!['deoxidizer', 'deox'].includes(basename) || !digest || result.has(basename)) {
+      throw new Error(`${label} contains an invalid or ambiguous binary digest`);
+    }
+    result.set(basename, digest);
+  }
+  if (result.size !== 2 || !result.has('deoxidizer') || !result.has('deox')) {
+    throw new Error(`${label} must contain exactly both release binaries`);
+  }
+  return result;
+}
+
+function validateNativeProof(proof, expected) {
+  if (!proof || typeof proof !== 'object' || proof.schema_version !== 1) {
+    throw new Error('Native release proof is missing or has an unsupported schema');
+  }
+  if (proof.target !== expected.target) throw new Error('Native proof target does not match the archive target');
+  if (!/^[0-9a-f]{40}$/i.test(String(proof.commit || ''))) {
+    throw new Error('Native proof has no valid candidate commit');
+  }
+  if (proof.commit.toLowerCase() !== String(expected.commit || '').toLowerCase()) {
+    throw new Error('Native proof commit does not match the release tag or build session');
+  }
+  if (proof.platform !== expected.platform) throw new Error('Native proof platform does not match the archive target');
+
+  const proofBinaries = normalizedBinaryDigests(proof.artifacts, 'Native proof artifacts');
+  const extractedBinaries = normalizedBinaryDigests(expected.binaries, 'Extracted archive binaries');
+  for (const [name, digest] of extractedBinaries) {
+    if (proofBinaries.get(name) !== digest) {
+      throw new Error(`Native proof digest does not match extracted ${name} binary`);
+    }
+  }
+
+  const native = proof.native;
+  if (!native || typeof native !== 'object') throw new Error('Native proof has no platform verification record');
+  if (expected.platform === 'darwin') {
+    if (native.mechanism !== 'codesign' || native.signature_verified !== true) {
+      throw new Error('macOS native proof does not confirm a verified code signature');
+    }
+    if (native.timestamp_verified !== true) throw new Error('macOS native proof lacks a verified signature timestamp');
+    if (typeof native.team_id !== 'string' || !native.team_id.trim()) {
+      throw new Error('macOS native proof lacks the verified Team ID');
+    }
+    const notarization = native.notarization;
+    if (notarization?.status !== 'Accepted' || !Array.isArray(notarization.submissions)) {
+      throw new Error('macOS native proof lacks accepted notarization records');
+    }
+    const submissions = new Map();
+    for (const submission of notarization.submissions) {
+      if (
+        !submission ||
+        !['deoxidizer', 'deox'].includes(String(submission.asset || '').toLowerCase()) ||
+        typeof submission.submission_id !== 'string' ||
+        !submission.submission_id.trim() ||
+        submissions.has(String(submission.asset).toLowerCase())
+      ) {
+        throw new Error('macOS native proof has an invalid notarization submission record');
+      }
+      submissions.set(String(submission.asset).toLowerCase(), submission.submission_id);
+    }
+    if (submissions.size !== 2) throw new Error('macOS native proof must notarize both release binaries');
+  } else if (expected.platform === 'windows') {
+    if (native.mechanism !== 'authenticode' || native.signature_verified !== true) {
+      throw new Error('Windows native proof does not confirm a verified Authenticode signature');
+    }
+    if (native.timestamp_verified !== true) throw new Error('Windows native proof lacks an RFC3161 timestamp');
+    if (typeof native.publisher !== 'string' || !native.publisher.trim()) {
+      throw new Error('Windows native proof lacks the verified publisher');
+    }
+    if (typeof native.subject !== 'string' || !native.subject.trim()) {
+      throw new Error('Windows native proof lacks the verified certificate subject');
+    }
+    const installer = proof.installer;
+    const installerDigest = normalizeDigest(installer?.sha256);
+    const actualInstaller = expected.associatedAssets?.get(installer?.name);
+    if (
+      !installer ||
+      typeof installer.name !== 'string' ||
+      !installer.name.endsWith('-setup.exe') ||
+      !installerDigest ||
+      normalizeDigest(actualInstaller) !== installerDigest
+    ) {
+      throw new Error('Windows native proof installer digest does not match the signed setup asset');
+    }
+  } else if (expected.platform === 'linux') {
+    if (native.mechanism !== 'none' || native.status !== 'not-required') {
+      throw new Error('Linux proof must explicitly mark native signing as not required');
+    }
+  } else {
+    throw new Error(`Unsupported native proof platform: ${expected.platform}`);
+  }
+  return true;
+}
+
+function makeReleaseSnapshot(release, assets, tagCommit) {
+  return {
+    releaseId: release?.id,
+    tag: release?.tag_name,
+    targetCommitish: String(release?.target_commitish || '').toLowerCase(),
+    draft: Boolean(release?.draft),
+    prerelease: Boolean(release?.prerelease),
+    tagCommit: String(tagCommit || '').toLowerCase(),
+    assets: [...assets]
+      .map((asset) => ({
+        id: asset?.id,
+        name: asset?.name,
+        size: asset?.size,
+        digest: String(asset?.digest || '').toLowerCase(),
+        browserDownloadUrl: asset?.browser_download_url || '',
+      }))
+      .sort((left, right) => String(left.name).localeCompare(String(right.name))),
+  };
+}
+
+function assertSameReleaseSnapshot(expected, actual) {
+  if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+    throw new Error('Remote release ID, tag commit, or asset snapshot changed during verification');
+  }
+  return true;
 }
 
 function parseChecksumManifest(text) {
@@ -47,68 +223,7 @@ function verifyChecksum(filePath, expected) {
   return sha256(filePath).toLowerCase() === expected.toLowerCase();
 }
 
-function verifyDetachedSignature(filePath) {
-  const signaturePath = `${filePath}.asc`;
-  const keyWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-release-key-'));
-  const keyPath = path.join(keyWorkspace, 'release-signing-key.asc');
-  const keyringPath = path.join(keyWorkspace, 'release-keyring.gpg');
-  // Pinned release signing key fingerprint (fail-closed; see check:release-key).
-  const expectedFingerprint = 'CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F';
-  fs.copyFileSync(path.join(root, 'release-signing-key.asc'), keyPath);
-  const dearmor = spawnSync(
-    'gpg',
-    ['--batch', '--yes', '--dearmor', '--output', keyringPath, keyPath],
-    { encoding: 'utf8' },
-  );
-  if (dearmor.error || dearmor.status !== 0) {
-    fs.rmSync(keyWorkspace, { recursive: true, force: true });
-    throw new Error('Cannot load pinned release signing key');
-  }
-  const fingerprintResult = spawnSync(
-    'gpg',
-    ['--batch', '--show-keys', '--with-colons', keyPath],
-    { encoding: 'utf8' },
-  );
-  const fingerprint = String(fingerprintResult.stdout || '')
-    .split(/\r?\n/)
-    .map((line) => line.split(':'))
-    .find((fields) => fields[0] === 'fpr')?.[9]
-    ?.toUpperCase();
-  if (
-    fingerprintResult.error ||
-    fingerprintResult.status !== 0 ||
-    fingerprint !== expectedFingerprint
-  ) {
-    fs.rmSync(keyWorkspace, { recursive: true, force: true });
-    throw new Error(
-      `Pinned release signing key fingerprint mismatch: ${fingerprint || '<missing>'}`,
-    );
-  }
-  const result = spawnSync(
-    'gpg',
-    [
-      '--batch',
-      '--no-options',
-      '--no-default-keyring',
-      '--keyring',
-      keyringPath,
-      '--status-fd',
-      '1',
-      '--verify',
-      signaturePath,
-      filePath,
-    ],
-    { encoding: 'utf8' },
-  );
-  fs.rmSync(keyWorkspace, { recursive: true, force: true });
-  if (result.error || result.status !== 0 || !/^\[GNUPG:\] VALIDSIG /m.test(result.stdout || '')) {
-    throw new Error(`Invalid detached signature: ${path.basename(signaturePath)}`);
-  }
-}
-
-// Cross-check a SHA256SUMS manifest with the in-process verifier that
-// `deox --update` uses (src/openpgp.rs via examples/verify_release_manifest.rs),
-// so release-time acceptance matches runtime acceptance. Only manifests.
+// Cross-check a SHA256SUMS manifest using the pinned verifier runtime uses.
 function verifyInProcessManifest(manifestPath) {
   const result = spawnSync(
     'cargo',
@@ -120,9 +235,9 @@ function verifyInProcessManifest(manifestPath) {
       'verify_release_manifest',
       '--',
       manifestPath,
-      `${manifestPath}.asc`,
+      `${manifestPath}.minisig`,
     ],
-    { cwd: root, encoding: 'utf8' },
+    { cwd: root, env: buildEnvironment(process.env), encoding: 'utf8' },
   );
   if (result.error || result.status !== 0) {
     throw new Error(
@@ -131,6 +246,42 @@ function verifyInProcessManifest(manifestPath) {
         `${result.stderr ? `\n${String(result.stderr).trim()}` : ''}`,
     );
   }
+}
+
+function verifyInProcessArchive(archivePath) {
+  const result = spawnSync(
+    'cargo',
+    [
+      'run',
+      '--quiet',
+      '--locked',
+      '--example',
+      'verify_release_archive',
+      '--',
+      '--json',
+      '--require-proof',
+      archivePath,
+    ],
+    { cwd: root, env: buildEnvironment(process.env), encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 },
+  );
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `Production archive verification failed: ${path.basename(archivePath)}` +
+        `${result.error ? `: ${result.error.message}` : ''}` +
+        `${result.stderr ? `\n${String(result.stderr).trim()}` : ''}`,
+    );
+  }
+  let report;
+  try {
+    report = JSON.parse(String(result.stdout || ''));
+  } catch (error) {
+    throw new Error(`Production archive verifier returned invalid JSON: ${error.message}`);
+  }
+  const proof = report?.proof_json ?? report?.proof;
+  if (!proof || typeof proof !== 'object' || !report?.binaries) {
+    throw new Error(`Production archive verifier returned no native proof: ${path.basename(archivePath)}`);
+  }
+  return { binaries: report.binaries, proof };
 }
 
 function zipEntries(filePath) {
@@ -343,6 +494,7 @@ function verifyZipIntegrity(filePath) {
 }
 
 function expectedArchives() {
+  assertReleaseDirectory();
   if (!fs.existsSync(releaseDir)) return [];
   return fs
     .readdirSync(releaseDir)
@@ -355,11 +507,57 @@ function expectedArchives() {
 }
 
 function allReleaseFiles() {
+  assertReleaseDirectory();
   if (!fs.existsSync(releaseDir)) return [];
   return fs
     .readdirSync(releaseDir)
-    .filter((name) => !name.startsWith('.') && fs.statSync(path.join(releaseDir, name)).isFile())
-    .map((name) => path.join(releaseDir, name));
+    .filter((name) => !name.startsWith('.'))
+    .flatMap((name) => {
+      const filePath = path.join(releaseDir, name);
+      const stats = fs.lstatSync(filePath);
+      if (releaseDir === releaseRoot && name === 'staging' && stats.isDirectory()) return [];
+      if (!stats.isFile() || stats.isSymbolicLink()) {
+        throw new Error(`Staged release entry is not a regular file: ${name}`);
+      }
+      return [filePath];
+    });
+}
+
+function targetForAsset(name) {
+  const pattern = new RegExp(
+    `^deoxidizer-v${version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-(linux|darwin|windows)-(x86_64|aarch64)(?:\\.(?:tar\\.gz|zip)|-setup\\.exe)$`,
+    'i',
+  );
+  const match = name.match(pattern);
+  if (!match) return null;
+  const [, osName, arch] = match;
+  const os = osName.toLowerCase();
+  const target = {
+    linux: {
+      x86_64: 'x86_64-unknown-linux-musl',
+      aarch64: 'aarch64-unknown-linux-musl',
+    },
+    darwin: {
+      x86_64: 'x86_64-apple-darwin',
+      aarch64: 'aarch64-apple-darwin',
+    },
+    windows: {
+      x86_64: 'x86_64-pc-windows-msvc',
+      aarch64: 'aarch64-pc-windows-msvc',
+    },
+  }[os][arch];
+  return { os, arch, target, platform: os };
+}
+
+function candidateCommit() {
+  const commit = String(process.env.DEOX_RELEASE_COMMIT || '').trim();
+  if (/^[0-9a-f]{40}$/i.test(commit)) return commit.toLowerCase();
+  const result = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' });
+  const head = String(result.stdout || '').trim();
+  if (result.error || result.status !== 0 || !/^[0-9a-f]{40}$/i.test(head)) {
+    throw new Error('Cannot determine candidate commit for native archive proof');
+  }
+  return head.toLowerCase();
 }
 
 function verifyLocal() {
@@ -369,82 +567,93 @@ function verifyLocal() {
   ) {
     throw new Error('DEOX_ALLOW_UNSIGNED_RELEASE=1 requires DEOX_RELEASE_CONFIRM=YES explicitly');
   }
+  const files = allReleaseFiles();
   const archives = expectedArchives();
   if (archives.length === 0) throw new Error(`No release archives found in ${releaseDir}`);
-  const checksumPaths = allReleaseFiles().filter((filePath) =>
-    /^SHA256SUMS(?:-[a-z0-9_-]+)?\.txt$/i.test(path.basename(filePath)),
+  const checksumPaths = files.filter((filePath) =>
+    /^SHA256SUMS-(?:linux|darwin|windows)-(?:x86_64|aarch64)\.txt$/i.test(path.basename(filePath)),
   );
   if (checksumPaths.length === 0) throw new Error('No SHA256SUMS*.txt manifest found');
   const entries = new Map();
+  const localAssets = new Map(files.map((filePath) => [path.basename(filePath), filePath]));
+  const manifestTargets = new Set();
+  const availableDigests = new Map(
+    files.filter((filePath) => !path.basename(filePath).endsWith('.minisig'))
+      .map((filePath) => [path.basename(filePath), sha256(filePath)]),
+  );
   for (const checksumPath of checksumPaths) {
-    for (const [name, digest] of parseChecksumManifest(fs.readFileSync(checksumPath, 'utf8'))) {
+    const manifestName = path.basename(checksumPath);
+    const manifestMatch = manifestName.match(/^SHA256SUMS-(linux|darwin|windows)-(x86_64|aarch64)\.txt$/i);
+    const manifestTarget = `${manifestMatch[1].toLowerCase()}-${manifestMatch[2].toLowerCase()}`;
+    if (manifestTargets.has(manifestTarget)) throw new Error(`Duplicate checksum manifest: ${manifestName}`);
+    manifestTargets.add(manifestTarget);
+    const manifestEntries = parseChecksumManifest(fs.readFileSync(checksumPath, 'utf8'));
+    const assetMetadata = new Map(
+      [...localAssets].map(([name]) => [name, { name, digest: availableDigests.has(name) ? `sha256:${availableDigests.get(name)}` : undefined }]),
+    );
+    const manifestErrors = validateRemoteManifestEntries(
+      manifestName,
+      fs.readFileSync(checksumPath, 'utf8'),
+      assetMetadata,
+      availableDigests,
+    );
+    if (manifestErrors.length > 0) throw new Error(manifestErrors.join('\n'));
+    for (const [name, digest] of manifestEntries) {
       if (entries.has(name) && entries.get(name) !== digest) {
         throw new Error(`Conflicting checksum entries for ${name}`);
       }
       entries.set(name, digest);
     }
   }
-
-  const signedAssets = allReleaseFiles().filter(
-    (filePath) =>
-      !checksumPaths.some((checksumPath) => path.basename(checksumPath) === path.basename(filePath)) &&
-      !path.basename(filePath).endsWith('.asc'),
+  const nameErrors = validateRemoteAssetNames(files.map((filePath) => ({ name: path.basename(filePath) })));
+  if (nameErrors.length > 0) throw new Error(nameErrors.join('\n'));
+  const unsigned = process.env.DEOX_ALLOW_UNSIGNED_RELEASE === '1';
+  const pairErrors = validateRemoteSignaturePairs(
+    files.map((filePath) => ({ name: path.basename(filePath) })),
+    { requireAll: !unsigned },
   );
-  const localNames = new Set(allReleaseFiles().map((filePath) => path.basename(filePath)));
+  if (pairErrors.length > 0) throw new Error(pairErrors.join('\n'));
+  const localNames = new Set(files.map((filePath) => path.basename(filePath)));
   for (const name of entries.keys()) {
     if (!localNames.has(name)) throw new Error(`Checksum manifest lists missing asset: ${name}`);
   }
-  for (const filePath of signedAssets) {
+  const payloads = files.filter((filePath) => !path.basename(filePath).endsWith('.minisig'));
+  for (const filePath of payloads) {
     const name = path.basename(filePath);
+    const descriptor = targetForAsset(name);
+    const isManifest = checksumPaths.includes(filePath);
+    if (!descriptor && !isManifest) throw new Error(`Unexpected release payload ${name}`);
+    if (descriptor && releaseDir !== releaseRoot && descriptor.target !== path.basename(releaseDir)) {
+      throw new Error(`Asset ${name} does not match isolated target ${path.basename(releaseDir)}`);
+    }
     const expected = entries.get(name);
     if (!expected || !verifyChecksum(filePath, expected)) {
       throw new Error(`Checksum mismatch or missing entry: ${name}`);
     }
-    if (filePath.endsWith('.tar.gz') || filePath.endsWith('.zip')) {
-      verifyArchiveIntegrity(filePath);
-      const names = archiveEntries(filePath);
-      const windows = /-windows-/.test(name);
-      const expectedNames = windows
-        ? new Set(['deoxidizer.exe', 'deox.exe', 'LICENSE'])
-        : new Set(['deoxidizer', 'deox', 'LICENSE']);
-      for (const required of expectedNames) {
-        if (!names.has(required)) throw new Error(`${name} is missing ${required}`);
-      }
-      for (const entry of names) {
-        if (!expectedNames.has(entry)) throw new Error(`${name} contains unexpected entry ${entry}`);
-      }
+    const sidecar = signaturePath(filePath);
+    if (localNames.has(path.basename(sidecar))) {
+      verifyReleaseSignature(filePath, sidecar);
+    } else if (!unsigned) {
+      throw new Error(`Missing detached signature: ${path.basename(sidecar)}`);
     }
-    if (
-      process.env.DEOX_ALLOW_UNSIGNED_RELEASE !== '1' &&
-      !fs.existsSync(`${filePath}.asc`)
-    ) {
-      throw new Error(`Missing detached signature: ${path.basename(filePath)}.asc`);
-    }
-    if (process.env.DEOX_ALLOW_UNSIGNED_RELEASE !== '1') verifyDetachedSignature(filePath);
-  }
-  if (process.env.DEOX_ALLOW_UNSIGNED_RELEASE !== '1') {
-    for (const checksumPath of checksumPaths) {
-      if (!fs.existsSync(`${checksumPath}.asc`)) {
-        throw new Error(`Missing detached signature: ${path.basename(checksumPath)}.asc`);
+    if (isManifest && localNames.has(path.basename(sidecar))) verifyInProcessManifest(filePath);
+    if (name.endsWith('.tar.gz') || name.endsWith('.zip')) {
+      const archiveReport = verifyInProcessArchive(filePath);
+      const associatedAssets = new Map();
+      for (const [assetName] of entries) {
+        const assetPath = localAssets.get(assetName);
+        if (assetPath) associatedAssets.set(assetName, sha256(assetPath));
       }
-      verifyDetachedSignature(checksumPath);
-      verifyInProcessManifest(checksumPath);
+      validateNativeProof(archiveReport.proof, {
+        target: descriptor.target,
+        commit: candidateCommit(),
+        platform: descriptor.platform,
+        binaries: archiveReport.binaries,
+        associatedAssets,
+      });
     }
   }
   return archives;
-}
-
-function listRemoteAssets(releaseId) {
-  const assets = [];
-  for (let page = 1; ; page += 1) {
-    const batch = githubApiWithRetry(
-      'GET',
-      `/repos/${repository()}/releases/${releaseId}/assets?per_page=100&page=${page}`,
-    );
-    if (!Array.isArray(batch)) throw new Error('GitHub returned invalid asset list');
-    assets.push(...batch);
-    if (batch.length < 100) return assets;
-  }
 }
 
 function validateRemoteAssetNames(assets) {
@@ -465,6 +674,44 @@ function validateRemoteAssetNames(assets) {
   return errors;
 }
 
+function validateRemoteSignaturePairs(assets, { requireAll = true } = {}) {
+  const names = new Set(assets.map((asset) => asset?.name).filter(Boolean));
+  const errors = [];
+  for (const name of names) {
+    if (name.endsWith('.minisig')) {
+      const payload = name.slice(0, -'.minisig'.length);
+      if (!names.has(payload)) errors.push(`remote release has orphan signature ${name}`);
+      continue;
+    }
+    const signature = `${name}.minisig`;
+    if (requireAll && !names.has(signature)) {
+      errors.push(`remote release is missing detached signature ${signature}`);
+    }
+  }
+  return errors;
+}
+
+function validateRemoteAssetDigests(assets, downloadedDigests) {
+  const errors = [];
+  for (const asset of assets) {
+    const name = asset?.name || '<unknown>';
+    const computed = normalizeDigest(downloadedDigests.get(name));
+    if (!computed) {
+      errors.push(`remote asset ${name} has no streamed SHA-256 hash`);
+      continue;
+    }
+    if (!Number.isInteger(asset?.size) || asset.size <= 0) {
+      errors.push(`remote asset ${name} has invalid size metadata`);
+    }
+    if (asset.digest !== undefined && asset.digest !== null && asset.digest !== '') {
+      const metadata = normalizeDigest(asset.digest);
+      if (!metadata) errors.push(`remote asset ${name} has invalid SHA-256 digest metadata`);
+      else if (metadata !== computed) errors.push(`remote asset ${name} digest does not match streamed bytes`);
+    }
+  }
+  return errors;
+}
+
 function expectedManifestEntries(name) {
   const match = name.match(/^SHA256SUMS-(linux|darwin|windows)-(x86_64|aarch64)\.txt$/i);
   if (!match) throw new Error(`Unsupported remote checksum manifest ${name}`);
@@ -478,41 +725,7 @@ function expectedManifestEntries(name) {
   return new Set(expected);
 }
 
-function downloadRemoteAsset(asset) {
-  if (!Number.isInteger(asset?.id)) throw new Error(`Remote asset ${asset?.name || '<unknown>'} has no ID`);
-  const result = runGitHub([
-    'api',
-    '-H',
-    'Accept: application/octet-stream',
-    `/repos/${repository()}/releases/assets/${asset.id}`,
-  ]);
-  const bytes = Buffer.from(result.stdout || '', 'utf8');
-  if (bytes.length > MAX_REMOTE_MANIFEST_BYTES) {
-    throw new Error(`Remote checksum asset exceeds size limit: ${asset.name}`);
-  }
-  const computed = `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
-  const remoteDigest = String(asset.digest || '').toLowerCase();
-  if (remoteDigest) {
-    if (remoteDigest !== computed) {
-      throw new Error(`Remote digest changed while reading ${asset.name}`);
-    }
-    return bytes;
-  }
-  // Fail-closed fallback: gh release-asset objects may omit digest. Never
-  // pass on a missing digest alone; require size equality here and rely on
-  // downstream GPG signature verification (verifyDetachedSignature) to
-  // authenticate these manifest/signature bytes.
-  if (!Number.isFinite(asset?.size) || asset.size !== bytes.length) {
-    throw new Error(
-      `Remote asset ${asset.name} has no digest and size mismatch ` +
-        `(expected ${asset?.size ?? '<unknown>'}, got ${bytes.length}); ` +
-        `check gh version on the release VM and re-upload`,
-    );
-  }
-  return bytes;
-}
-
-function validateRemoteManifestEntries(manifestName, manifestText, assets) {
+function validateRemoteManifestEntries(manifestName, manifestText, assets, downloadedDigests = new Map()) {
   const entries = parseChecksumManifest(manifestText);
   const expected = expectedManifestEntries(manifestName);
   const errors = [];
@@ -526,123 +739,206 @@ function validateRemoteManifestEntries(manifestName, manifestText, assets) {
   for (const [name, digest] of entries) {
     const asset = assets.get(name);
     if (!asset) continue;
-    // Fail-closed: gh may omit asset.digest. Missing digests skip this
-    // comparison here; verifyRemote enforces the binding via size equality
-    // plus manifest-entry sha256 against locally computed bytes. Never pass
-    // blindly on a missing digest alone.
-    if (!asset.digest) continue;
-    if (String(asset.digest || '').toLowerCase() !== `sha256:${digest}`) {
+    const streamed = normalizeDigest(downloadedDigests.get(name));
+    const metadata = normalizeDigest(asset.digest);
+    const actual = streamed || metadata;
+    if (asset.digest && !metadata) {
+      errors.push(`${manifestName} has invalid SHA-256 metadata for ${name}`);
+    } else if (!actual) {
+      errors.push(`${manifestName} has no verified SHA-256 hash for ${name}`);
+    } else if (actual !== digest) {
       errors.push(`${manifestName} digest mismatch for ${name}`);
     }
   }
   return errors;
 }
 
-function verifyRemoteManifests(remoteAssets) {
-  const assets = new Map(remoteAssets.map((asset) => [asset.name, asset]));
-  const manifests = remoteAssets.filter((asset) =>
-    /^SHA256SUMS-(?:linux|darwin|windows)-(?:x86_64|aarch64)\.txt$/i.test(asset.name),
-  );
-  if (manifests.length === 0) throw new Error('Remote release has no platform checksum manifest');
-
-  const verifiedEntries = new Map();
-  const remoteManifestBytes = new Map();
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-remote-manifest-'));
-  try {
-    for (const manifestAsset of manifests) {
-      const signatureAsset = assets.get(`${manifestAsset.name}.asc`);
-      if (!signatureAsset) {
-        throw new Error(`Remote release is missing ${manifestAsset.name}.asc`);
-      }
-      const manifestPath = path.join(workspace, manifestAsset.name);
-      const signaturePath = `${manifestPath}.asc`;
-      const manifestBytes = downloadRemoteAsset(manifestAsset);
-      const signatureBytes = downloadRemoteAsset(signatureAsset);
-      fs.writeFileSync(manifestPath, manifestBytes);
-      fs.writeFileSync(signaturePath, signatureBytes);
-      verifyDetachedSignature(manifestPath);
-      verifyInProcessManifest(manifestPath);
-      const errors = validateRemoteManifestEntries(
-        manifestAsset.name,
-        manifestBytes.toString('utf8'),
-        assets,
-      );
-      if (errors.length > 0) throw new Error(errors.join('\n'));
-      remoteManifestBytes.set(manifestAsset.name, Buffer.from(manifestBytes));
-      for (const [name, digest] of parseChecksumManifest(manifestBytes.toString('utf8'))) {
-        if (verifiedEntries.has(name) && verifiedEntries.get(name) !== digest) {
-          throw new Error(`Conflicting remote manifest entries for ${name}`);
-        }
-        verifiedEntries.set(name, digest);
-      }
-    }
-  } finally {
-    fs.rmSync(workspace, { recursive: true, force: true });
-  }
-  return { verifiedEntries, remoteManifestBytes };
+function remoteAssetLimit(name) {
+  if (name.endsWith('.minisig')) return MAX_REMOTE_SIGNATURE_BYTES;
+  if (/^SHA256SUMS-/.test(name)) return MAX_REMOTE_MANIFEST_BYTES;
+  return MAX_REMOTE_ASSET_BYTES;
 }
 
-function verifyRemote(localFiles) {
+function downloadRemoteAssets(remoteAssets, workspace) {
+  const localAssets = new Map();
+  const downloadedDigests = new Map();
+  for (const asset of remoteAssets) {
+    if (!Number.isInteger(asset?.id) || asset.id <= 0) {
+      throw new Error(`Remote asset ${asset?.name || '<unknown>'} has no valid ID`);
+    }
+    const filePath = path.join(workspace, asset.name);
+    downloadGitHubAsset(asset.id, filePath, { maxBytes: remoteAssetLimit(asset.name) });
+    const stats = fs.statSync(filePath);
+    if (!Number.isInteger(asset.size) || asset.size !== stats.size) {
+      throw new Error(`Remote size mismatch for ${asset.name}`);
+    }
+    localAssets.set(asset.name, filePath);
+    downloadedDigests.set(asset.name, sha256(filePath));
+  }
+  const digestErrors = validateRemoteAssetDigests(remoteAssets, downloadedDigests);
+  if (digestErrors.length > 0) throw new Error(digestErrors.join('\n'));
+  return { localAssets, downloadedDigests };
+}
+
+function gitHeadCommit() {
+  const result = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' });
+  const commit = String(result.stdout || '').trim().toLowerCase();
+  if (result.error || result.status !== 0 || !/^[0-9a-f]{40}$/.test(commit)) {
+    throw new Error('Cannot determine current Git commit for remote release verification');
+  }
+  return commit;
+}
+
+function makeRemoteVerification(release, assets, tagCommit, downloadedDigests, commit) {
+  const snapshotAssets = assets.map((asset) => ({
+    ...asset,
+    digest: `sha256:${normalizeDigest(downloadedDigests.get(asset.name))}`,
+  }));
+  return {
+    release,
+    commit,
+    tagCommit,
+    snapshot: makeReleaseSnapshot(release, snapshotAssets, tagCommit),
+    assets: snapshotAssets,
+  };
+}
+
+function verifyRemote(localFiles = [], { requireComplete = false } = {}) {
   assertGitHubCliAuthenticated();
-  // Shared paginated lookup with tag-endpoint fallback (see github-cli.cjs).
   const release = findReleaseByTag(tag);
   if (!release) throw new Error(`Release ${tag} not found`);
   if (!release.draft) throw new Error(`Release ${tag} is published; refusing remote mutation check`);
-  const commitResult = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' });
-  const commit = String(commitResult.stdout || '').trim();
-  if (commitResult.error || commitResult.status !== 0 || !/^[0-9a-f]{40}$/i.test(commit)) {
-    throw new Error('Cannot determine current Git commit for remote release verification');
-  }
+  if (release.tag_name !== tag) throw new Error(`Remote release tag does not match ${tag}`);
+  const commit = gitHeadCommit();
   if (release.target_commitish?.toLowerCase() !== commit.toLowerCase()) {
     throw new Error(`Remote release target commit does not match current HEAD ${commit}`);
   }
-  const remoteAssets = listRemoteAssets(release.id);
+  if (process.env.DEOX_RELEASE_COMMIT && process.env.DEOX_RELEASE_COMMIT.toLowerCase() !== commit) {
+    throw new Error('Build session commit does not match current Git HEAD');
+  }
+  const tagCommit = resolveTagCommit(tag);
+  if (tagCommit.toLowerCase() !== commit) {
+    throw new Error(`Git tag ${tag} resolves to ${tagCommit}, not current HEAD ${commit}`);
+  }
+  const remoteAssets = listAssetsByRelease(release.id);
   const nameErrors = validateRemoteAssetNames(remoteAssets);
   if (nameErrors.length > 0) throw new Error(nameErrors.join('\n'));
+  if (remoteAssets.length === 0) throw new Error('Remote release has no assets to verify');
+  const pairErrors = validateRemoteSignaturePairs(remoteAssets);
+  if (pairErrors.length > 0) throw new Error(pairErrors.join('\n'));
+  if (requireComplete) {
+    const errors = validateDraft(release, remoteAssets, commit, tagCommit);
+    if (errors.length > 0) throw new Error(errors.join('\n'));
+  }
   const assets = new Map(remoteAssets.map((asset) => [asset.name, asset]));
-  const missingDigest = [];
-  for (const filePath of localFiles) {
-    const name = path.basename(filePath);
-    const asset = assets.get(name);
-    if (!asset) throw new Error(`Remote release missing ${name}`);
-    if (asset.size !== fs.statSync(filePath).size) {
-      throw new Error(`Remote size mismatch for ${name}`);
-    }
-    const expectedDigest = `sha256:${sha256(filePath)}`;
-    if (asset.digest) {
-      if (String(asset.digest).toLowerCase() !== expectedDigest) {
-        throw new Error(`Remote digest missing or mismatched for ${name}`);
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-remote-release-'));
+  try {
+    const { localAssets, downloadedDigests } = downloadRemoteAssets(remoteAssets, workspace);
+    const payloads = remoteAssets.filter((asset) => !asset.name.endsWith('.minisig'));
+    const manifests = payloads.filter((asset) => /^SHA256SUMS-/.test(asset.name));
+    if (manifests.length === 0) throw new Error('Remote release has no platform checksum manifest');
+    const allManifestEntries = new Map();
+    const coveredAssets = new Set();
+    for (const manifestAsset of manifests) {
+      const manifestPath = localAssets.get(manifestAsset.name);
+      const sidecarPath = `${manifestPath}.minisig`;
+      verifyReleaseSignature(manifestPath, sidecarPath);
+      verifyInProcessManifest(manifestPath);
+      const errors = validateRemoteManifestEntries(
+        manifestAsset.name,
+        fs.readFileSync(manifestPath, 'utf8'),
+        assets,
+        downloadedDigests,
+      );
+      if (errors.length > 0) throw new Error(errors.join('\n'));
+      for (const [name, digest] of parseChecksumManifest(fs.readFileSync(manifestPath, 'utf8'))) {
+        if (allManifestEntries.has(name) && allManifestEntries.get(name) !== digest) {
+          throw new Error(`Conflicting remote manifest entries for ${name}`);
+        }
+        allManifestEntries.set(name, digest);
+        coveredAssets.add(name);
       }
-      continue;
     }
-    // Fail-closed fallback: gh may omit asset.digest. Size equality above is
-    // necessary but not sufficient; manifest-entry binding is enforced below
-    // after GPG-verified manifests load. Never pass blindly here.
-    missingDigest.push({ filePath, name, expectedDigest });
-  }
-  const { verifiedEntries, remoteManifestBytes } = verifyRemoteManifests(remoteAssets);
-  for (const { filePath, name, expectedDigest } of missingDigest) {
-    const entryDigest = verifiedEntries.get(name);
-    if (entryDigest && `sha256:${entryDigest}`.toLowerCase() === expectedDigest.toLowerCase()) {
-      continue;
-    }
-    const remoteBytes = remoteManifestBytes.get(name);
-    if (remoteBytes) {
-      const remoteDigest = `sha256:${crypto.createHash('sha256').update(remoteBytes).digest('hex')}`;
-      if (remoteDigest.toLowerCase() === expectedDigest.toLowerCase()) continue;
-    }
-    throw new Error(
-      `Remote asset ${name} has no digest; cannot prove binding ` +
-        `(size matched but no signed manifest entry matches local sha256). ` +
-        `Check gh version on the release VM, re-upload ${name}, and re-run release:verify:remote`,
+    const associatedAssets = new Map(
+      [...downloadedDigests].map(([name, digest]) => [name, digest]),
     );
+    for (const payload of payloads) {
+      const name = payload.name;
+      const filePath = localAssets.get(name);
+      if (!/^SHA256SUMS-/.test(name) && !coveredAssets.has(name)) {
+        throw new Error(`No signed checksum manifest covers remote payload ${name}`);
+      }
+      if (/^SHA256SUMS-/.test(name)) continue;
+      verifyReleaseSignature(filePath, `${filePath}.minisig`);
+      if (name.endsWith('.tar.gz') || name.endsWith('.zip')) {
+        const descriptor = targetForAsset(name);
+        if (!descriptor) throw new Error(`Unsupported remote archive ${name}`);
+        const archiveReport = verifyInProcessArchive(filePath);
+        validateNativeProof(archiveReport.proof, {
+          target: descriptor.target,
+          commit,
+          platform: descriptor.platform,
+          binaries: archiveReport.binaries,
+          associatedAssets,
+        });
+      }
+    }
+    for (const localPath of localFiles) {
+      const name = path.basename(localPath);
+      const remoteDigest = downloadedDigests.get(name);
+      if (!remoteDigest) throw new Error(`Remote release missing local staged asset ${name}`);
+      if (sha256(localPath) !== remoteDigest) {
+        throw new Error(`Remote bytes differ from staged ${name}`);
+      }
+    }
+    return makeRemoteVerification(release, remoteAssets, tagCommit, downloadedDigests, commit);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
   }
+}
+
+function assertRemoteSnapshotUnchanged(verification) {
+  if (!verification?.release?.id || !verification.snapshot) {
+    throw new Error('A remote verification snapshot is required');
+  }
+  const release = githubApiWithRetry(
+    'GET',
+    `/repos/${repository()}/releases/${verification.release.id}`,
+  );
+  if (!release?.draft || release.id !== verification.release.id || release.tag_name !== tag) {
+    throw new Error('Verified draft release identity changed before mutation');
+  }
+  const tagCommit = resolveTagCommit(tag);
+  const assets = listAssetsByRelease(release.id);
+  const names = validateRemoteAssetNames(assets);
+  if (names.length > 0) throw new Error(names.join('\n'));
+  let downloadedDigests = new Map();
+  if (assets.some((asset) => !normalizeDigest(asset.digest))) {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-remote-snapshot-'));
+    try {
+      ({ downloadedDigests } = downloadRemoteAssets(assets, workspace));
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  } else {
+    downloadedDigests = new Map(assets.map((asset) => [asset.name, normalizeDigest(asset.digest)]));
+  }
+  const actual = makeReleaseSnapshot(
+    release,
+    assets.map((asset) => ({
+      ...asset,
+      digest: `sha256:${downloadedDigests.get(asset.name)}`,
+    })),
+    tagCommit,
+  );
+  return assertSameReleaseSnapshot(verification.snapshot, actual);
 }
 
 function main() {
   const localFiles = verifyLocal();
   if (process.argv.includes('--remote')) {
-    verifyRemote(allReleaseFiles());
+    const verification = verifyRemote(allReleaseFiles());
+    assertRemoteSnapshotUnchanged(verification);
   }
   console.log(`Release ${tag} verified (${localFiles.length} archive(s))`);
 }
@@ -661,8 +957,15 @@ module.exports = {
   verifyZipIntegrity,
   parseChecksumManifest,
   verifyChecksum,
+  validateNativeProof,
+  signaturePath,
+  makeReleaseSnapshot,
+  assertSameReleaseSnapshot,
   verifyRemote,
   validateRemoteAssetNames,
   validateRemoteManifestEntries,
+  validateRemoteAssetDigests,
+  validateRemoteSignaturePairs,
+  assertRemoteSnapshotUnchanged,
   allReleaseFiles,
 };

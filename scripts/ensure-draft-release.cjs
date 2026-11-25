@@ -9,6 +9,7 @@ const {
   githubApi,
   repository,
 } = require('./github-cli.cjs');
+const { resolveTagCommit } = require('./verify-release-draft.cjs');
 const { cargoVersion, isPrerelease } = require('./sync-version.cjs');
 
 const root = path.resolve(__dirname, '..');
@@ -78,6 +79,10 @@ function checkBinding(release) {
       `Release ${tag} is bound to ${release.target_commitish}, not current HEAD ${commit}`,
     );
   }
+  const tagCommit = resolveTagCommit(tag);
+  if (tagCommit.toLowerCase() !== commit.toLowerCase()) {
+    throw new Error(`Git tag ${tag} resolves to ${tagCommit}, not candidate HEAD ${commit}`);
+  }
   return release;
 }
 
@@ -88,7 +93,7 @@ async function ensureDraft() {
     return syncNotes(bound);
   }
   try {
-    return githubApi('POST', `/repos/${repository()}/releases`, {
+    const created = githubApi('POST', `/repos/${repository()}/releases`, {
       tag_name: tag,
       target_commitish: currentCommit(),
       name: `deoxidizer ${version}`,
@@ -96,6 +101,7 @@ async function ensureDraft() {
       draft: true,
       prerelease,
     });
+    return syncNotes(checkBinding(created));
   } catch (error) {
     // Another concurrent builder may have created the draft (422 validation
     // failed / already_exists): sleep 2s then re-fetch up to 3 attempts and
@@ -124,6 +130,10 @@ async function waitForDraft() {
         throw new Error(
           `Release ${tag} is bound to ${release.target_commitish || '<missing>'}, not current HEAD ${commit}`,
         );
+      }
+      const tagCommit = resolveTagCommit(tag);
+      if (tagCommit.toLowerCase() !== commit.toLowerCase()) {
+        throw new Error(`Git tag ${tag} resolves to ${tagCommit}, not candidate HEAD ${commit}`);
       }
       return release;
     }

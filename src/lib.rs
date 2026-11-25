@@ -2,7 +2,7 @@ pub mod cleaner;
 pub mod cli;
 pub mod config;
 pub mod display;
-mod openpgp;
+mod minisign;
 pub mod project;
 pub mod scanner;
 pub mod settings;

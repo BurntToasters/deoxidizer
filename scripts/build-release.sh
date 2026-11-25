@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Build release binaries for one explicit Rust target.
-# Usage: ./scripts/build-release.sh [--target <triple>] [--output-dir <dir>]
+# Usage: ./scripts/build-release.sh [--target <triple>] [--output-dir <dir>] [--proof-file <path>]
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -24,6 +24,7 @@ echo "Building deoxidizer v$VERSION..."
 
 TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 OUTPUT_DIR="$ROOT_DIR/release"
+PROOF_FILE=""
 SKIP_BUILD=0
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -35,6 +36,11 @@ while [[ $# -gt 0 ]]; do
         --output-dir)
             [[ $# -ge 2 ]] || { echo "--output-dir requires a value" >&2; exit 2; }
             OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --proof-file)
+            [[ $# -ge 2 ]] || { echo "--proof-file requires a value" >&2; exit 2; }
+            PROOF_FILE="$2"
             shift 2
             ;;
         --skip-build)
@@ -85,6 +91,10 @@ esac
     echo "Missing release binary: $OUT_DIR/deox$BIN_EXT" >&2
     exit 1
 }
+[[ -n "$PROOF_FILE" && -f "$PROOF_FILE" && ! -L "$PROOF_FILE" ]] || {
+    echo "A regular native proof file is required: ${PROOF_FILE:-<missing>}" >&2
+    exit 1
+}
 
 mkdir -p "$OUTPUT_DIR"
 ARCHIVE="$OUTPUT_DIR/deoxidizer-v${VERSION}-${OS}-${ARCH}.${FORMAT}"
@@ -94,6 +104,7 @@ trap 'rm -rf "$STAGE_DIR"' EXIT
 cp "$OUT_DIR/deoxidizer$BIN_EXT" "$STAGE_DIR/"
 cp "$OUT_DIR/deox$BIN_EXT" "$STAGE_DIR/"
 cp "$ROOT_DIR/LICENSE" "$STAGE_DIR/"
+cp "$PROOF_FILE" "$STAGE_DIR/DEOX-RELEASE-PROOF.json"
 touch -t 198001010000 "$STAGE_DIR"/*
 
 echo "Packaging $ARCHIVE..."
@@ -103,17 +114,17 @@ if [[ "$FORMAT" == "tar.gz" ]]; then
         tar -cf "$TAR_PATH" \
             --sort=name --owner=0 --group=0 --numeric-owner \
             --mtime="@${SOURCE_DATE_EPOCH:-0}" -C "$STAGE_DIR" \
-            "deoxidizer$BIN_EXT" "deox$BIN_EXT" LICENSE
+            "deoxidizer$BIN_EXT" "deox$BIN_EXT" LICENSE DEOX-RELEASE-PROOF.json
     else
         # BSD-tar fallback skips --mtime/--owner/--sort (nondeterministic
         # macOS bytes). Accepted: single-producer staging keeps this harmless;
         # COPYFILE_DISABLE + touch -t above still normalize xattrs/mtimes.
         COPYFILE_DISABLE=1 tar -cf "$TAR_PATH" -C "$STAGE_DIR" \
-            "deoxidizer$BIN_EXT" "deox$BIN_EXT" LICENSE
+            "deoxidizer$BIN_EXT" "deox$BIN_EXT" LICENSE DEOX-RELEASE-PROOF.json
     fi
     gzip -n -c "$TAR_PATH" > "$ARCHIVE"
 else
-    (cd "$STAGE_DIR" && zip -X -q "$ARCHIVE" "deoxidizer$BIN_EXT" "deox$BIN_EXT" LICENSE)
+    (cd "$STAGE_DIR" && zip -X -q "$ARCHIVE" "deoxidizer$BIN_EXT" "deox$BIN_EXT" LICENSE DEOX-RELEASE-PROOF.json)
 fi
 
 echo "  Created $ARCHIVE"

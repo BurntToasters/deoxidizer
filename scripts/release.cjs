@@ -1,16 +1,18 @@
 'use strict';
 
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
-const { uploadReleaseAsset } = require('./github-cli.cjs');
+const { uploadReleaseAsset, withReleaseMutationLock } = require('./github-cli.cjs');
 const { cargoVersion, validateVersion } = require('./sync-version.cjs');
 
 const root = path.resolve(__dirname, '..');
 const releaseDir = path.join(root, 'release');
+const stagingRoot = path.join(releaseDir, 'staging');
 const SIGNING_ENV_KEYS = [
-  'GPG_KEY_ID',
-  'GPG_PASSPHRASE',
+  'TAURI_SIGNING_PRIVATE_KEY_PATH',
+  'TAURI_SIGNING_PRIVATE_KEY_PASSWORD',
   'AZURE_CLIENT_ID',
   'AZURE_TENANT_ID',
   'AZURE_SUBSCRIPTION_ID',
@@ -113,11 +115,96 @@ function windowsFileVersion(version) {
   return `${version.split('-', 1)[0]}.0`;
 }
 
+function releaseStageDirectory(target, baseDir = releaseDir) {
+  if (!Object.values(TARGETS).some((arches) => Object.values(arches).includes(target))) {
+    throw new Error(`Unsupported release staging target: ${target}`);
+  }
+  return path.join(baseDir, 'staging', target);
+}
+
+function acquireStageLock(stageDir) {
+  const parent = path.dirname(stageDir);
+  fs.mkdirSync(parent, { recursive: true });
+  const lockPath = path.join(parent, `.${path.basename(stageDir)}.lock`);
+  const owner = `${process.pid}:${Date.now()}\n`;
+  let descriptor;
+  try {
+    descriptor = fs.openSync(lockPath, 'wx', 0o600);
+    fs.writeSync(descriptor, owner);
+  } catch (error) {
+    if (descriptor !== undefined) {
+      fs.closeSync(descriptor);
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {}
+    }
+    if (error?.code === 'EEXIST') {
+      throw new Error(`Release staging is locked by another build: ${lockPath}`);
+    }
+    throw error;
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    try {
+      fs.closeSync(descriptor);
+    } finally {
+      try {
+        if (fs.readFileSync(lockPath, 'utf8') === owner) fs.unlinkSync(lockPath);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+    }
+  };
+}
+
+function ensureRealDirectory(directory) {
+  if (fs.existsSync(directory)) {
+    const stats = fs.lstatSync(directory);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) {
+      throw new Error(`Release staging path is not a real directory: ${directory}`);
+    }
+    return;
+  }
+  fs.mkdirSync(directory, { recursive: true });
+}
+
+function npmReleaseInvocation(options = {}) {
+  const { npmUpdateInvocation } = require('./npm-safe-update.cjs');
+  const invocation = npmUpdateInvocation(options);
+  return { command: invocation.command, args: invocation.prefixArgs };
+}
+
+function runNpm(args, env = process.env) {
+  const invocation = npmReleaseInvocation({ env, platform: process.platform, execPath: process.execPath });
+  run(invocation.command, [...invocation.args, ...args], env);
+}
+
+function sha256File(filePath) {
+  const descriptor = fs.openSync(filePath, 'r');
+  const hash = crypto.createHash('sha256');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    while (true) {
+      const read = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (read === 0) break;
+      hash.update(buffer.subarray(0, read));
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return hash.digest('hex');
+}
+
 function run(command, args, env = process.env) {
+  const { usesWindowsCmdShell } = require('./npm-safe-update.cjs');
   const result = spawnSync(command, args, {
     cwd: root,
     env,
     encoding: 'utf8',
+    shell: usesWindowsCmdShell(command),
+    windowsHide: true,
     stdio: 'inherit',
   });
   if (result.error) throw result.error;
@@ -181,26 +268,41 @@ function signingEnvironment(env, os) {
   return scoped;
 }
 
-function gpgEnvironment(env) {
+function minisignEnvironment(env) {
   const scoped = buildEnvironment(env);
-  for (const key of ['GPG_KEY_ID', 'GPG_PASSPHRASE']) {
+  for (const key of ['TAURI_SIGNING_PRIVATE_KEY_PATH', 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD']) {
     if (env[key] !== undefined) scoped[key] = env[key];
   }
   return scoped;
 }
 
-function releaseFiles() {
-  return fs
-    .readdirSync(releaseDir)
-    .filter((name) => !name.startsWith('.') && fs.statSync(path.join(releaseDir, name)).isFile())
-    .map((name) => path.join(releaseDir, name));
+function releaseFiles(directory = releaseDir) {
+  if (!fs.existsSync(directory)) return [];
+  return fs.readdirSync(directory).flatMap((name) => {
+    if (name.startsWith('.')) return [];
+    const filePath = path.join(directory, name);
+    const stats = fs.lstatSync(filePath);
+    if (!stats.isFile()) throw new Error(`Staged release entry is not a regular file: ${name}`);
+    return [filePath];
+  });
 }
 
 function upload(tag, files, environment) {
   for (const filePath of files) {
-    uploadReleaseAsset(tag, filePath, { clobber: true, environment });
+    uploadReleaseAsset(tag, filePath, { environment });
     console.log(`uploaded ${path.basename(filePath)}`);
   }
+}
+
+function stagedTargets() {
+  if (!fs.existsSync(stagingRoot)) return [];
+  return fs.readdirSync(stagingRoot).filter((target) => {
+    if (!Object.values(TARGETS).some((arches) => Object.values(arches).includes(target))) return false;
+    const targetDir = path.join(stagingRoot, target);
+    const stats = fs.lstatSync(targetDir);
+    return stats.isDirectory() && !stats.isSymbolicLink() &&
+      fs.existsSync(path.join(targetDir, '.build-session.json'));
+  });
 }
 
 function uploadExisting() {
@@ -209,36 +311,109 @@ function uploadExisting() {
   }
   const version = validateVersion(packageVersion());
   const tag = `v${version}`;
-  const files = releaseFiles();
-  if (files.length === 0) throw new Error(`No staged release files found in ${releaseDir}`);
-  const sessionPath = path.join(releaseDir, '.build-session.json');
+  const targetArgument = process.argv.indexOf('--target');
+  const requestedTarget = targetArgument >= 0 ? process.argv[targetArgument + 1] : undefined;
+  if (targetArgument >= 0 && !requestedTarget) throw new Error('--target requires a Rust target triple');
+  const target =
+    requestedTarget ||
+    process.env.DEOX_RELEASE_TARGET ||
+    (() => {
+      const available = stagedTargets();
+      if (available.length !== 1) {
+        throw new Error(
+          `Select one staged target with --target; found ${available.length} staged targets`,
+        );
+      }
+      return available[0];
+    })();
+  const stageDir = releaseStageDirectory(target);
+  ensureRealDirectory(releaseDir);
+  ensureRealDirectory(stagingRoot);
+  const releaseLock = acquireStageLock(stageDir);
+  try {
+    ensureRealDirectory(stageDir);
+    const sessionPath = path.join(stageDir, '.build-session.json');
+    let session;
+    try {
+      session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    } catch (error) {
+      throw new Error(
+        `Release build session is missing or invalid: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (typeof session.target !== 'string' || session.target.length === 0) {
+      throw new Error('Release build session has no target');
+    }
+    if (session.target !== target) {
+      throw new Error('Release staging target does not match its build session');
+    }
+    const files = releaseFiles(stageDir);
+    if (files.length === 0) throw new Error(`No staged release files found in ${stageDir}`);
+    const waitForDraft =
+      process.argv.includes('--wait') || process.env.DEOX_RELEASE_DRAFT_MODE === 'wait';
+    const buildEnv = {
+      ...buildEnvironment(process.env),
+      DEOX_RELEASE_TARGET: session.target,
+      DEOX_RELEASE_STAGE_DIR: stageDir,
+      DEOX_RELEASE_COMMIT: session.commit,
+    };
+
+    const uploadEnv = {
+      ...buildEnv,
+      ...(process.env.GH_TOKEN ? { GH_TOKEN: process.env.GH_TOKEN } : {}),
+      ...(process.env.GITHUB_TOKEN ? { GITHUB_TOKEN: process.env.GITHUB_TOKEN } : {}),
+    };
+    run('node', ['scripts/release-session.cjs', 'verify', session.target], buildEnv);
+    runNpm(['run', 'release:verify'], buildEnv);
+    withReleaseMutationLock(tag, session.commit, () => {
+      run(
+        'node',
+        ['scripts/ensure-draft-release.cjs', ...(waitForDraft ? ['--wait'] : [])],
+        uploadEnv,
+      );
+      upload(tag, releaseFiles(stageDir), uploadEnv);
+      runNpm(['run', 'release:verify:remote'], uploadEnv);
+    }, { environment: uploadEnv });
+  } finally {
+    releaseLock();
+  }
+}
+
+function writeLinuxProof(proofPath, target, commit, binaryPaths) {
+  const artifacts = Object.fromEntries(
+    binaryPaths.map((filePath) => [path.basename(filePath), sha256File(filePath)]),
+  );
+  fs.writeFileSync(
+    proofPath,
+    `${JSON.stringify(
+      {
+        schema_version: 1,
+        platform: 'linux',
+        target,
+        commit,
+        artifacts,
+        native: { mechanism: 'none', status: 'not-required' },
+      },
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  );
+}
+
+function readStageSession(stageDir, target) {
   let session;
   try {
-    session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    session = JSON.parse(fs.readFileSync(path.join(stageDir, '.build-session.json'), 'utf8'));
   } catch (error) {
     throw new Error(
       `Release build session is missing or invalid: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  if (typeof session.target !== 'string' || session.target.length === 0) {
-    throw new Error('Release build session has no target');
+  if (session.target !== target || !/^[0-9a-f]{40}$/i.test(String(session.commit || ''))) {
+    throw new Error('Release build session target or commit is invalid');
   }
-  const waitForDraft =
-    process.argv.includes('--wait') || process.env.DEOX_RELEASE_DRAFT_MODE === 'wait';
-  const buildEnv = {
-    ...buildEnvironment(process.env),
-    DEOX_RELEASE_TARGET: session.target,
-  };
-
-  run('node', ['scripts/release-session.cjs', 'verify', session.target], buildEnv);
-  run('npm', ['run', 'release:verify'], buildEnv);
-  run(
-    'node',
-    ['scripts/ensure-draft-release.cjs', ...(waitForDraft ? ['--wait'] : [])],
-    buildEnv,
-  );
-  upload(tag, files, buildEnv);
-  run('npm', ['run', 'release:verify:remote'], buildEnv);
+  return session;
 }
 
 function main() {
@@ -246,9 +421,8 @@ function main() {
     uploadExisting();
     return;
   }
-  // Early gate: reject malformed Cargo versions before deriving asset
-  // names, makensis /DVERSION, or tags from them.
-  validateVersion(packageVersion());
+  // Reject malformed versions before deriving stage, installer, or asset names.
+  const version = validateVersion(packageVersion());
   const os = normalizeOs(process.argv[2] || '');
   const arch = normalizeArch(process.argv[3] || 'host', os);
   const target = TARGETS[os]?.[arch];
@@ -263,126 +437,219 @@ function main() {
   if (uploadRequested && unsigned) {
     throw new Error('Unsigned artifacts may be staged locally but never uploaded');
   }
-  const env = {
-    ...process.env,
-    ...targetBuildEnvironment(os, arch),
-    DEOX_RELEASE_TARGET: target,
-    DEOX_CHECKSUM_NAME: `SHA256SUMS-${os}-${arch}.txt`,
-    ...(unsigned ? { DEOX_ALLOW_UNSIGNED_RELEASE: '1' } : {}),
-  };
-  if (
-    process.env.DEOX_CHECKSUM_NAME &&
-    process.env.DEOX_CHECKSUM_NAME !== env.DEOX_CHECKSUM_NAME
-  ) {
-    // Release path always uses the per-target canonical manifest; a legacy
-    // global SHA256SUMS.txt override is ignored here (warn, do not fail, so
-    // local staging stays usable).
-    console.error(
-      `warn: ignoring DEOX_CHECKSUM_NAME=${process.env.DEOX_CHECKSUM_NAME}; using canonical ${env.DEOX_CHECKSUM_NAME}`,
-    );
+  if (uploadRequested && os === 'darwin') {
+    if (!process.env.APPLE_SIGNING_IDENTITY || process.env.APPLE_SIGNING_IDENTITY === '-') {
+      throw new Error('Public macOS upload requires a Developer ID signing identity');
+    }
+    if (process.env.DEOX_ALLOW_UNNOTARIZED === '1') {
+      throw new Error('Public macOS upload requires accepted notarization proof');
+    }
   }
-  const buildEnv = buildEnvironment(env);
-  const verificationEnv = verificationEnvironment(env, unsigned);
-  const signEnv = signingEnvironment(env, os);
-  const gpgEnv = gpgEnvironment(env);
+  if (uploadRequested && os === 'windows' && process.env.SKIP_WIN_CODESIGN === '1') {
+    throw new Error('Public Windows upload requires verified Authenticode signatures');
+  }
+  if (os === 'darwin' && process.platform !== 'darwin') {
+    throw new Error('macOS signing must run on macOS');
+  }
+  if (os === 'windows' && process.platform !== 'win32') {
+    throw new Error('Windows Authenticode signing must run on Windows');
+  }
 
-  fs.rmSync(releaseDir, { recursive: true, force: true });
-  fs.mkdirSync(releaseDir, { recursive: true });
-  // Quality checks and compilation never inherit signing credentials.
-  run('npm', ['run', 'release:prepare'], buildEnv);
-  run('rustup', ['target', 'add', '--toolchain', '1.98.1', target], buildEnv);
-  run('cargo', ['build', '--release', '--locked', '--target', target], buildEnv);
-  const binaryExtension = os === 'windows' ? '.exe' : '';
-  const targetRoot = process.env.CARGO_TARGET_DIR || path.join(root, 'target');
-  const targetReleaseDir = path.join(targetRoot, target, 'release');
-  const binaryPaths = [
-    path.join(targetReleaseDir, `deoxidizer${binaryExtension}`),
-    path.join(targetReleaseDir, `deox${binaryExtension}`),
-  ];
-  if (os === 'darwin') {
-    if (process.platform !== 'darwin') {
-      throw new Error('macOS signing must run on macOS');
+  const stageDir = releaseStageDirectory(target);
+  ensureRealDirectory(releaseDir);
+  ensureRealDirectory(stagingRoot);
+  const releaseLock = acquireStageLock(stageDir);
+  try {
+    const existing = fs.existsSync(stageDir) ? fs.lstatSync(stageDir) : null;
+    if (existing && (!existing.isDirectory() || existing.isSymbolicLink())) {
+      throw new Error(`Release target staging path is not a real directory: ${stageDir}`);
     }
-    run('bash', ['scripts/macos-codesign.sh', ...binaryPaths], signEnv);
-  }
-  if (os === 'windows') {
-    if (process.platform !== 'win32') {
-      throw new Error('Windows Authenticode signing must run on Windows');
+    fs.rmSync(stageDir, { recursive: true, force: true });
+    fs.mkdirSync(stageDir, { recursive: false });
+
+    const env = {
+      ...process.env,
+      ...targetBuildEnvironment(os, arch),
+      DEOX_RELEASE_TARGET: target,
+      DEOX_RELEASE_STAGE_DIR: stageDir,
+      DEOX_CHECKSUM_NAME: `SHA256SUMS-${os}-${arch}.txt`,
+      ...(unsigned ? { DEOX_ALLOW_UNSIGNED_RELEASE: '1' } : {}),
+    };
+    if (process.env.DEOX_CHECKSUM_NAME && process.env.DEOX_CHECKSUM_NAME !== env.DEOX_CHECKSUM_NAME) {
+      console.error(
+        `warn: ignoring DEOX_CHECKSUM_NAME=${process.env.DEOX_CHECKSUM_NAME}; using canonical ${env.DEOX_CHECKSUM_NAME}`,
+      );
     }
-    for (const binaryPath of binaryPaths) {
+    const buildEnv = buildEnvironment(env);
+    const signEnv = signingEnvironment(env, os);
+    const minisignEnv = minisignEnvironment(env);
+
+    // Quality checks and compilation never inherit signing credentials.
+    runNpm(['run', 'release:prepare'], buildEnv);
+    run('rustup', ['target', 'add', '--toolchain', '1.98.1', target], buildEnv);
+    run('cargo', ['build', '--release', '--locked', '--target', target], buildEnv);
+    const session = readStageSession(stageDir, target);
+    const proofPath = path.join(stageDir, '.native-proof.json');
+    const committedBuildEnv = { ...buildEnv, DEOX_RELEASE_COMMIT: session.commit };
+    run('node', ['scripts/release-session.cjs', 'verify', target], committedBuildEnv);
+
+    const binaryExtension = os === 'windows' ? '.exe' : '';
+    const targetRoot = process.env.CARGO_TARGET_DIR || path.join(root, 'target');
+    const targetReleaseDir = path.join(targetRoot, target, 'release');
+    const binaryPaths = [
+      path.join(targetReleaseDir, `deoxidizer${binaryExtension}`),
+      path.join(targetReleaseDir, `deox${binaryExtension}`),
+    ];
+    if (os === 'linux') writeLinuxProof(proofPath, target, session.commit, binaryPaths);
+    if (os === 'darwin') {
       run(
-        'powershell.exe',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts/windows-artifact-sign.ps1', '-FilePath', binaryPath],
+        'bash',
+        [
+          'scripts/macos-codesign.sh',
+          '--proof-file',
+          proofPath,
+          '--target',
+          target,
+          '--commit',
+          session.commit,
+          ...binaryPaths,
+        ],
         signEnv,
       );
     }
-    const version = packageVersion();
-    const installerName = `deoxidizer-v${version}-windows-${arch}-setup.exe`;
-    const buildDir = targetReleaseDir.replaceAll(path.sep, '\\');
-    run(
-      'makensis.exe',
-      [
-        `/DBUILD_DIR=${buildDir}`,
-        '/DOUTPUT_DIR=release',
-        `/DOUTPUT_NAME=${installerName}`,
-        `/DVERSION=${version}`,
-        `/DFILE_VERSION=${windowsFileVersion(version)}`,
-        'installer.nsi',
-      ],
-      buildEnv,
-    );
-    run(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        'scripts/windows-artifact-sign.ps1',
-        '-FilePath',
-        path.join(releaseDir, installerName),
-      ],
-      signEnv,
-    );
-  }
-  run('bash', ['scripts/build-release.sh', '--target', target, '--skip-build'], buildEnv);
-  if (os === 'windows') {
-    const archivePath = path.join(releaseDir, `deoxidizer-v${packageVersion()}-windows-${arch}.zip`);
-    run(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        'scripts/verify-windows-authenticode.ps1',
-        '-TargetReleaseDir',
-        targetReleaseDir,
-        '-Archives',
-        archivePath,
-        '-ExtraFiles',
-        path.join(releaseDir, `deoxidizer-v${packageVersion()}-windows-${arch}-setup.exe`),
-      ],
-      signEnv,
-    );
-  }
-  run('bash', ['scripts/gpg-sign.sh', 'release', ...(unsigned ? ['--allow-unsigned'] : [])], gpgEnv);
-  run('npm', ['run', 'release:verify'], verificationEnv);
 
-  const version = validateVersion(packageVersion());
-  const tag = `v${version}`;
-  const files = releaseFiles();
+    let installerPath;
+    if (os === 'windows') {
+      for (const binaryPath of binaryPaths) {
+        run(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            'scripts/windows-artifact-sign.ps1',
+            '-FilePath',
+            binaryPath,
+          ],
+          signEnv,
+        );
+      }
+      const installerName = `deoxidizer-v${version}-windows-${arch}-setup.exe`;
+      installerPath = path.join(stageDir, installerName);
+      const buildDir = targetReleaseDir.replaceAll(path.sep, '\\');
+      const outputDir = stageDir.replaceAll(path.sep, '\\');
+      run(
+        'makensis.exe',
+        [
+          `/DBUILD_DIR=${buildDir}`,
+          `/DOUTPUT_DIR=${outputDir}`,
+          `/DOUTPUT_NAME=${installerName}`,
+          `/DVERSION=${version}`,
+          `/DFILE_VERSION=${windowsFileVersion(version)}`,
+          'installer.nsi',
+        ],
+        committedBuildEnv,
+      );
+      run(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          'scripts/windows-artifact-sign.ps1',
+          '-FilePath',
+          installerPath,
+        ],
+        signEnv,
+      );
+      // Record proof only after native signature, publisher, and RFC3161
+      // timestamp checks succeed for both binaries and the installer.
+      run(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          'scripts/verify-windows-authenticode.ps1',
+          '-TargetReleaseDir',
+          targetReleaseDir,
+          '-ExtraFiles',
+          installerPath,
+          '-ProofPath',
+          proofPath,
+          '-Target',
+          target,
+          '-Commit',
+          session.commit,
+        ],
+        signEnv,
+      );
+    }
 
-  if (uploadRequested) {
+    run(
+      'bash',
+      [
+        'scripts/build-release.sh',
+        '--target',
+        target,
+        '--skip-build',
+        '--output-dir',
+        stageDir,
+        '--proof-file',
+        proofPath,
+      ],
+      committedBuildEnv,
+    );
+    if (os === 'windows') {
+      run(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          'scripts/verify-windows-authenticode.ps1',
+          '-TargetReleaseDir',
+          targetReleaseDir,
+          '-ExtraFiles',
+          installerPath,
+        ],
+        signEnv,
+      );
+    }
     run(
       'node',
-      ['scripts/ensure-draft-release.cjs', ...(waitForDraft ? ['--wait'] : [])],
-      buildEnv,
+      ['scripts/minisign-sign.cjs', stageDir, ...(unsigned ? ['--allow-unsigned'] : [])],
+      minisignEnv,
     );
-    upload(tag, files, buildEnv);
-    run('npm', ['run', 'release:verify:remote'], buildEnv);
-  } else {
-    console.log('Artifacts staged locally. Re-run with --upload to publish through gh.');
+    run('node', ['scripts/release-session.cjs', 'verify', target], committedBuildEnv);
+    runNpm(['run', 'release:verify'], verificationEnvironment(committedBuildEnv, unsigned));
+
+    const tag = `v${version}`;
+    const files = releaseFiles(stageDir);
+    if (uploadRequested) {
+      const uploadEnv = {
+        ...committedBuildEnv,
+        ...(process.env.GH_TOKEN ? { GH_TOKEN: process.env.GH_TOKEN } : {}),
+        ...(process.env.GITHUB_TOKEN ? { GITHUB_TOKEN: process.env.GITHUB_TOKEN } : {}),
+      };
+      withReleaseMutationLock(tag, session.commit, () => {
+        run(
+          'node',
+          ['scripts/ensure-draft-release.cjs', ...(waitForDraft ? ['--wait'] : [])],
+          uploadEnv,
+        );
+        upload(tag, files, uploadEnv);
+        runNpm(['run', 'release:verify:remote'], uploadEnv);
+      }, { environment: uploadEnv });
+    } else {
+      console.log('Artifacts staged locally. Re-run with --upload to publish through gh.');
+    }
+  } finally {
+    releaseLock();
   }
 }
 
@@ -403,4 +670,8 @@ module.exports = {
   targetBuildEnvironment,
   verificationEnvironment,
   windowsFileVersion,
+  releaseStageDirectory,
+  acquireStageLock,
+  npmReleaseInvocation,
+  minisignEnvironment,
 };

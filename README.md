@@ -23,19 +23,30 @@ Install from a local release build:
 irm https://raw.githubusercontent.com/BurntToasters/deoxidizer/main/install.ps1 | iex
 ```
 
+The one-line commands above follow the mutable `main` branch. For a release
+review, inspect the bootstrap source at the candidate tag before running it:
+
+- Bash: `https://github.com/BurntToasters/deoxidizer/blob/v<version>/install.sh`
+- PowerShell: `https://github.com/BurntToasters/deoxidizer/blob/v<version>/install.ps1`
+
+The tag pins the installer code; each installer still selects the latest
+published release when it runs.
+
 Release installers verify platform-specific SHA256 manifests before
 installation:
 
 - **macOS/Linux** (`install.sh`): authenticates the manifest with the pinned
-  release key (`CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F`) using `gpg`. Only
-  this first install needs `gpg` (`brew install gnupg`, `apt install gnupg`).
-- **Windows** (`install.ps1`): requires valid Authenticode signatures from
-  `BurntToasters` on both binaries; also checks the manifest signature when
-  `gpg.exe` is available.
+  Minisign key (`release-signing-key.pub`, key ID `083B254A48C428E3`). The
+  bootstrap requires the external `minisign` command for this first install.
+- **Windows** (`install.ps1`): requires external `minisign.exe` to authenticate
+  the manifest and valid Authenticode signatures from `BurntToasters` on both
+  binaries.
 - **`deox --update`**: verifies the manifest signature itself against the
-  pinned key. No `gpg` needed.
+  pinned key in-process; it does not need the external Minisign CLI.
 
-Linux binaries are static (musl), so they run on any distribution.
+Linux releases target x86_64 and aarch64 using static musl binaries. This avoids
+glibc version coupling, but the project has not verified every Linux
+distribution; the supported scope is those two target architectures.
 
 ## Quick start
 
@@ -194,21 +205,27 @@ the `.DirIcon` link in a Tauri AppImage bundle, or versioned `.so` links from
 CMake-built crates) are removed as links; the files they point to are never
 touched.
 
+A project root may live on a different filesystem from its parent. On Unix,
+clean planning refuses a mounted `target/` and mounted directories below it.
+Linux uses `openat2` with `RESOLVE_NO_XDEV`, which also refuses same-device
+bind mounts; if the kernel or environment cannot provide that operation, the
+plan fails closed with an unsupported error. Other Unix systems compare device
+IDs, so same-device bind mount detection is Linux-specific. Windows retains
+handle-anchored path validation; this Unix mount-boundary check is not applied
+there.
+
 Full mode removes Tauri installer bundles (`target/release/bundle/`) along
 with everything else and warns before it does; use `--keep-bundles` to keep
 them. Projects with an active Cargo build (a held `.cargo-lock`) are skipped
 and reported as `build in progress`.
 
-`trash` behavior moves directories via the OS Trash / Recycle Bin (Finder
-Trash on macOS, Recycle Bin on Windows, freedesktop Trash on Linux). Trashed
-files still occupy disk until the Trash is emptied. A `trash failed` error does
-not fall back to permanent deletion; rerun with `delete` behavior only for
-deliberate permanent removal, and empty the Trash to reclaim trashed space.
-Delete failures are usually permissions; trash failures are usually permissions
-or a full/unavailable Trash. On macOS, trashing uses `NSFileManager`, so it
-needs no Finder permission prompt (Finder's "Put Back" may not be offered). On
-Windows, items larger than the Recycle Bin's size limit may be deleted
-permanently by Windows; use `--dry-run` first for very large targets.
+`trash` mode is currently implemented on Linux with a private, same-filesystem
+staging directory and verified file identity before moving the artifact to the
+freedesktop Trash. If safe same-filesystem staging is unavailable, it returns
+an error before moving or deleting files. On macOS and Windows, `trash` returns
+a no-mutation error until a native backend can preserve the verified file
+identity. Trash contents continue to occupy disk until emptied. A Trash failure
+never falls back to permanent deletion.
 
 Reported sizes are logical file bytes. Filesystem allocation, compression,
 sparse-file holes, and clone sharing can make reclaimable disk space differ.
@@ -258,9 +275,32 @@ cargo build --release --locked
 
 ## Maintainer release tooling
 
-Release scripts use Node.js, npm, Cargo, GPG, and optionally GitHub CLI.
-Installed binaries remain local-first; only `deox --update` performs runtime
-network access.
+Release scripts use Node.js, npm, Cargo, the Tauri CLI signer, and GitHub CLI.
+macOS Developer ID/notarization and Windows Azure Authenticode signing are
+separate native signing requirements. Installed binaries remain local-first.
+The release lookup endpoint is
+`GET https://api.github.com/repos/BurntToasters/deoxidizer/releases/latest`.
+`--check-update` fetches this metadata and compares versions; it does not
+download an archive, checksum manifest, or signature. `--update` first tries
+to recover a pending local update and can return without network access. If it
+needs to check a release, it requests the same endpoint and, for a newer
+version, downloads the platform archive, checksum manifest, and the manifest's
+`.minisig` sidecar from GitHub release assets. Redirects are checked at every hop and may end at
+`release-assets.githubusercontent.com` or `objects.githubusercontent.com`.
+It verifies the signature and SHA256 before installing. There are no telemetry
+or other runtime network calls.
+
+Provision the release Minisign key outside the checkout. The public key is
+checked in as [`release-signing-key.pub`](release-signing-key.pub), with ID
+`083B254A48C428E3`. `npm run release:sign` invokes `cargo tauri signer sign`
+and emits raw `.minisig` sidecars for the release payloads and checksum
+manifest. Set `TAURI_SIGNING_PRIVATE_KEY_PATH` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` only on the provisioned signing machine;
+the private key must match that public key ID and stay outside the repository.
+Do not substitute a newly generated key without updating the pinned public key
+across the runtime and installers. GPG is not used. The shell and
+PowerShell first-install bootstraps need an installed `minisign` executable;
+the updater and release verifier use the pinned in-process verifier.
 
 ```bash
 npm ci
@@ -270,33 +310,57 @@ npm run update:safe                # dep lockfile updates only, no version sync
 DEOX_RELEASE_CONFIRM=YES npm run r  # hard-reset to origin/main, reinstall, prune gone branches
 DEOX_RELEASE_CONFIRM=YES npm run b  # hard-reset to origin/beta, reinstall
 
-# On each release VM, prefix with DEOX_RELEASE_CONFIRM=YES npm run r first
-# (Windows creates the single draft; Linux/macOS wait for that draft):
-npm run release:windows  # Windows release VM: create draft + upload Windows artifacts
-npm run release:linux    # Linux release VM (x86_64 or arm64 host, musl-tools installed): wait for draft + upload
-npm run release:macos    # macOS release VM: wait for draft + upload
+# Run the matching command on each native OS/architecture release VM. Use a
+# clean detached checkout of the exact candidate tag/commit on all six VMs.
+npm run release:windows:x64    # Windows x86_64: first Windows uploader creates the draft
+npm run release:windows:arm64  # Windows aarch64
+npm run release:linux:x64     # Linux x86_64 with musl-tools; waits for the draft
+npm run release:linux:arm64   # Linux aarch64 with musl-tools; waits for the draft
+npm run release:macos:x64     # macOS x86_64 with Developer ID + notarization; waits
+npm run release:macos:arm64   # macOS aarch64 with Developer ID + notarization; waits
 
 # Optional staged-artifact upload path:
 npm run release:upload
 
 npm run release:verify:draft
-DEOX_RELEASE_CONFIRM=YES npm run release:publish -- --yes  # irreversible; see scripts/publish-release.cjs
+# Publish only after review and final approval; this is an irreversible transition.
+DEOX_RELEASE_CONFIRM=YES npm run release:publish -- --yes
 ```
 
-macOS releases must run on a dedicated macOS release VM with `npm run release:macos`,
-not on a GitHub-hosted macOS runner. Notarization needs a pre-provisioned
-`notarytool` keychain profile (`APPLE_KEYCHAIN_PROFILE`) and a Developer ID
-certificate in the keychain; hosted runners have neither.
+Each command builds one native target and uploads its signed evidence to the
+same GitHub draft. `release:verify:draft` requires exactly 28 assets: six
+archives, six platform checksum manifests, two Windows setup installers, and
+their 14 `.minisig` sidecars. It also verifies the tag commit and release
+identity. The Windows x86_64 command creates the draft; Windows arm64 reuses
+it, and Linux/macOS wait for it. The `release:publish` gate re-verifies the
+remote draft and its signatures before changing its visibility.
+
+macOS targets must run on native macOS release VMs, not GitHub-hosted macOS
+runners. Each VM needs a Developer ID certificate and pre-provisioned
+`APPLE_KEYCHAIN_PROFILE`; notarization must return `Accepted`. Windows targets
+need Azure Artifact Signing credentials and tools. Linux targets are built
+only on a Linux host matching the target architecture and require `musl-gcc`
+(provided by `musl-tools`).
 
 CI (`.github/workflows/ci.yml`) must be a required status check on `main` in
 branch protection. `main` stayed red for weeks while the check was not enforced.
 Dependabot ignores semver-major Cargo updates; major bumps go through
 `npm run update:safe` together with the code changes that they need.
 
-Release publication requires `gh auth login` on each release VM. The Windows
-VM creates the single draft; Linux and macOS commands wait for that draft before
-uploading their signed archives and platform-specific checksum manifests. Draft
-verification must pass for all supported targets before publishing.
+Release publication requires `gh auth login` on each release VM. Do not publish
+until the candidate tag and all six native build proofs are inspectable and
+`npm run release:verify:draft` succeeds with all 28 assets.
+
+### Stable updater rehearsal
+
+Use a disposable machine with the previous stable release installed. Drafts are
+excluded from `/releases/latest`, so the first stable release cannot be
+rehearsed through the public updater before publication. After the approved
+publish, run `deox --check-update` and confirm it reports the candidate; then
+run `deox --update` and verify both `deox --version` and
+`deoxidizer --version`. `--check-update` alone does not exercise artifact,
+signature, checksum, or installation handling. Record the host OS/architecture,
+commands, version output, and any error as the first stable updater evidence.
 
 Release notes live in [`CHANGELOG.md`](CHANGELOG.md) and follow the
 [BCLS](https://github.com/BurntToasters/BCLS) standard.

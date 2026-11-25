@@ -32,7 +32,9 @@ unoptimized debug artifacts, compiler cache blobs, and dependency compilation un
 Deoxidizer scans configured project directories, identifies reclaimable build
 artifacts, breaks down their disk usage (debug vs release, incremental caches,
 compiled dependencies, and cross-compilation triples), and selectively cleans
-them permanently or moves them to the OS Recycle Bin / Finder Trash.
+them permanently or, on Linux, moves them to the freedesktop Trash through
+verified same-filesystem staging. Trash mode currently fails without mutation
+on macOS and Windows until a safe native backend is available.
 
 ### Dual Invoker Parity
 The tool is packaged and installed with **dual command invokers**:
@@ -59,6 +61,13 @@ These rules are non-negotiable. Do not violate them for convenience.
    `.rustc_info.json`. Any other `target/` is warned about as
    `not a Cargo build directory`, is never deleted, and is re-checked at clean
    time (`scanner::is_cargo_target_dir`, `cleaner::validate_target_path`).
+   Project roots may be on separate filesystems from their parents. On Unix,
+   clean planning refuses a mounted `target/` or mounted descendants. Linux
+   uses `openat2(RESOLVE_NO_XDEV)`, which also catches same-device bind mounts;
+   when unavailable or blocked, planning fails closed with an unsupported error.
+   Other Unix systems compare device IDs, so same-device bind detection is
+   Linux-specific. Windows retains handle-anchored path validation; this Unix
+   mount-boundary check does not apply there.
 2. **Never follow symlinks when scanning or deleting.** Traversal must strictly
    use `.follow_links(false)`. Never allow symlink escapes to delete files outside
    the project tree. A symlinked project root, `target/`, or intermediate
@@ -78,20 +87,20 @@ These rules are non-negotiable. Do not violate them for convenience.
    `deoxidizer_lib::cli::run_app()`. All command routing, arguments, and execution
    belong in `src/cli.rs`.
 6. **Never execute raw external shell commands (`rm`, `del`, `rmdir`) in Rust.**
-   Filesystem operations must use `std::fs::remove_dir_all` (for permanent deletion)
-   or the `trash` crate (for OS Trash / Recycle Bin).
-7. **Never perform unverified self-updates.** The self-updater must strictly verify
-   the SHA256 checksum of any downloaded asset against its platform-scoped
+   Permanent filesystem operations use handle-anchored deletion. Linux Trash
+   uses verified same-filesystem staging; macOS and Windows Trash requests fail
+   before mutation until a safe native backend exists.
+7. **Never perform unverified self-updates.** The self-updater must verify the
+   SHA256 checksum of the downloaded asset against its platform-scoped
    `SHA256SUMS-<os>-<arch>.txt` manifest (or legacy global `SHA256SUMS.txt`)
-   and verify the detached manifest signature against a pinned key
-   (`PINNED_KEYS` in `src/updater.rs`, built from checked-in
-   `release-signing-key.asc`) before invoking `self-replace`. Verification is
-   in-process (`src/openpgp.rs`: OpenPGP v4, Ed25519 primary key, SHA-256/512,
-   binary signature type, inside the key's validity window); no external `gpg`
-   is used at runtime. Any parse or verification failure aborts the update.
-   Never widen the accepted profile (other algorithms, SHA-1, text signatures,
-   subkeys) without failure-mode tests first. Key rotation: add the new key to
-   `PINNED_KEYS`, ship a release signed by the old key, then switch signing.
+   and verify the raw `.minisig` manifest signature against the checked-in
+   `release-signing-key.pub` before replacement. `src/minisign.rs` pins the
+   exact Ed25519 public-key serialization and verifies signatures in-process;
+   no external Minisign or GPG process runs in the updater. Any parse or
+   verification failure aborts the update. Do not widen the accepted Minisign
+   profile or enable legacy Ed signatures without failure-mode tests first.
+   Keep the signing private key outside the checkout; key changes must update
+   the runtime, installers, release checker, and documented key ID together.
    `deox --update` replaces the sibling binary atomically: it writes a
    `.deox-sibling-*` temp file in the destination directory, then renames it
    into place. `scripts/verify-release.cjs` runs the same in-process verifier
@@ -102,9 +111,13 @@ These rules are non-negotiable. Do not violate them for convenience.
 9. **Never introduce runtime network calls outside the updater.** Deoxidizer is a
    local-first tool. Do not add telemetry, usage metrics, analytics,
    crash-reporting pings, or remote phone-home features. Installed binaries may
-   use network only when `deox --update` queries the GitHub Releases API over
-   verified HTTPS. Explicitly invoked release scripts under `scripts/` may use
-   `gh` for artifact publication; those scripts never run from normal CLI paths.
+   use network only for `deox --update` and `deox --check-update`, which query
+   `https://api.github.com/repos/BurntToasters/deoxidizer/releases/latest` over
+   verified HTTPS. `--check-update` stops after version comparison;
+   `--update` may download the selected archive, checksum manifest, and
+   `.minisig` sidecar from GitHub's release asset hosts. Explicitly invoked
+   release scripts under `scripts/` may use `gh`; those scripts never run from
+   normal CLI paths.
 10. **Never commit secrets or credentials.** `.env` is gitignored. `.env.example`
     documents all release signing variables without real credentials.
 
@@ -116,7 +129,7 @@ These rules are non-negotiable. Do not violate them for convenience.
 - **Current Version:** `0.1.0`
 - **Target OS Support:**
   - macOS (Apple Silicon `aarch64` and Intel `x86_64`)
-  - Linux (`x86_64` and `aarch64`)
+  - Linux (`x86_64` and `aarch64`, static musl targets; distro coverage is not exhaustive)
   - Windows (`x86_64` and `aarch64`)
 - **Default Installation Paths:**
   - macOS/Linux: `~/.local/bin/deoxidizer` (with `~/.local/bin/deox` symlink)
@@ -133,12 +146,12 @@ deoxidizer/
 ├── .node-version               # Pinned Node.js release-tool version
 ├── package.json                # Node release-tool commands
 ├── package-lock.json           # Locked Node release-tool metadata
-├── .env.example                # Template for GPG, Apple, and Azure signing credentials
+├── .env.example                # Template for Tauri Minisign, Apple, and Azure signing credentials
 ├── .gitignore                  # Git ignore rules (excludes /target, .env, release/, etc.)
 ├── README.md                   # User-facing documentation and usage guide
 ├── CHANGELOG.md                # BCLS-formatted release notes and GitHub body
 ├── AGENTS.md                   # This durable agent context and invariant specification
-├── release-signing-key.asc     # Pinned public key for release manifest verification
+├── release-signing-key.pub     # Pinned Minisign public key for release verification
 ├── deny.toml                   # cargo-deny advisories/licenses/sources policy
 ├── .gitattributes              # Keeps signed test fixtures byte-exact (-text)
 ├── install.sh                  # macOS/Linux installer script (local build or GitHub release)
@@ -161,10 +174,10 @@ deoxidizer/
 │   ├── setup.rs                # Interactive setup wizard via dialoguer + --default
 │   ├── settings.rs             # Settings management: show, config, reset
 │   ├── updater.rs              # GitHub API release checker, SHA256 validator, self-replace
-│   └── openpgp.rs              # In-process Ed25519 OpenPGP detached-signature verifier
+│   └── minisign.rs             # In-process verifier for pinned Minisign signatures
 ├── scripts/
 │   ├── build-release.sh        # Builds release binaries and packages tar.gz / zip
-│   ├── gpg-sign.sh             # Generates target-scoped checksums and GPG signatures
+│   ├── minisign-sign.cjs       # Generates checksums and raw .minisig sidecars via Tauri CLI
 │   ├── branch-sync.cjs         # Explicitly confirmed main/beta Git synchronization
 │   ├── vi.cjs                  # Explicitly confirmed checkout bootstrap
 │   ├── git-prune.cjs           # Explicitly confirmed local-only branch deletion
@@ -186,14 +199,15 @@ deoxidizer/
 │   ├── publish-release.cjs      # Explicit draft-to-published transition
 │   ├── check-license.cjs        # GPL metadata consistency check
 │   ├── check-changelog.cjs      # BCLS release metadata and asset-link check
-│   ├── check-release-key.cjs    # Pinned GPG release key verification
+│   ├── check-release-key.cjs    # Pinned Minisign release key verification
 │   ├── check-toolchain.cjs      # Rust/Node toolchain pin verification
 │   └── check-version.cjs        # Cargo/package version consistency check
 ├── examples/
-│   └── verify_release_manifest.rs # Calls doc-hidden updater::verify_release_manifest (used by scripts/verify-release.cjs)
+│   ├── verify_release_archive.rs # Release-time archive and embedded-proof verifier
+│   ├── verify_release_manifest.rs # In-process Minisign manifest verifier
+│   └── verify_release_signature.rs # In-process Minisign sidecar verifier
 └── tests/
     ├── e2e_test.rs             # E2E: fixture trees + real `deox` binary; transcripts in target/e2e-artifacts/
-    ├── fixtures/openpgp/       # gpg-generated keys/signatures for verifier failure-mode tests
     ├── cleaner_test.rs         # Unit and integration tests for clean modes and path safety
     ├── cli_test.rs             # Dual-binary parity and CLI rejection tests
     ├── config_test.rs          # Serialization, validation, and safe tilde expansion tests
@@ -233,7 +247,7 @@ The configuration file is stored in the user's home directory as JSON:
   - `"rust-only"`: Only scans plain Rust projects (excluding Tauri).
 - `clean_behavior` (`CleanBehavior`):
   - `"delete"` (default): Permanently removes target directories via filesystem deletion.
-  - `"trash"`: Moves target directories to the OS Recycle Bin / Trash using the `trash` crate.
+  - `"trash"`: On Linux, stages the verified target on the same filesystem before using freedesktop Trash. On macOS and Windows, the request returns a no-mutation error until a native identity-safe backend exists.
 - `default_mode` (`DefaultMode`):
   - `"full"` (default): Removes the entire `target/` directory.
   - `"debug-only"`: Removes `debug/` directories while preserving `release/`.
@@ -284,10 +298,14 @@ addition to top-level `debug/` and `release/`.
 as a triple candidate and cleans its `debug/` child when present; do not narrow
 to a known triple list. `incremental-only`/`deps-only` collect matches up to
 depth 3 and intentionally under-clean deeper layouts fail-closed.
-`trash` behavior uses the OS Trash (macOS via `NSFileManager`, Recycle Bin,
-freedesktop Trash); trashed files still occupy disk until emptied, and
-`trash failed` does not fall back to `delete`. Sizes are logical bytes of
-regular files (symlinks count as 0).
+`trash` behavior currently works only on Linux. It stages the verified artifact
+inside a private directory under the project, requires the stage and source to
+share a filesystem, checks the staged file identity, and restores the source
+when the Trash operation fails. A different-filesystem stage fails before
+moving the artifact. macOS and Windows return a no-mutation error because their
+native Trash APIs are not yet bound to the verified file identity. Trash
+failures never fall back to `delete`. Sizes are logical bytes of regular files
+(symlinks count as 0).
 
 ### Project model and clean pipeline
 - One `DiscoveredProject` per `target/` directory. `scanner::scan_dir_report`
@@ -347,9 +365,9 @@ DEOX_CHECKSUM_NAME=
 # (e.g. host); do not set manually.
 DEOX_RELEASE_TARGET=
 
-# GPG Signing
-GPG_KEY_ID=
-GPG_PASSPHRASE=
+# Tauri CLI Minisign signing (must match key ID 083B254A48C428E3; private key stays outside repo)
+TAURI_SIGNING_PRIVATE_KEY_PATH=
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD=
 
 # Windows Azure Artifact Signing (Authenticode)
 AZURE_CLIENT_ID=
@@ -384,8 +402,9 @@ APPLE_KEYCHAIN_PROFILE=
      `WordFunc.nsh`; CI compiles it with `makensis`.
    - PowerShell scripts must stay ASCII-only (PowerShell 5.1 misreads BOM-less
      UTF-8). `install.ps1` runs inside `& { }` so strict mode never leaks into
-     the caller's session, writes PATH as `REG_EXPAND_SZ` via the registry, and
-     requires Authenticode (`gpg.exe` checks are additional when present).
+     the caller's session, writes PATH as `REG_EXPAND_SZ` via the registry,
+     requires external `minisign.exe` for manifest verification, and requires
+     Authenticode on both installed binaries.
 2. **macOS Codesigning:**
    - Run via `scripts/macos-codesign.sh`.
    - Developer ID signing requires `--options runtime --timestamp`.
@@ -397,57 +416,73 @@ APPLE_KEYCHAIN_PROFILE=
      `APPLE_KEYCHAIN_PROFILE` fails unless `DEOX_ALLOW_UNNOTARIZED=1` and
      `DEOX_RELEASE_CONFIRM=YES` (local staging only).
    - Notarization uses preconfigured `APPLE_KEYCHAIN_PROFILE`; passwords never enter process arguments.
-3. **Artifact Integrity & GPG:**
-   - Run via `scripts/gpg-sign.sh release`.
-   - Generates `SHA256SUMS-<os>-<arch>.txt` for target archives and setup assets.
-   - Requires `GPG_KEY_ID` unless `--allow-unsigned` is explicitly used for local staging.
-   - Passphrases enter through stdin, never command-line arguments.
+3. **Artifact Integrity & Minisign:**
+   - Run via `scripts/minisign-sign.cjs` (`npm run release:sign`).
+   - Generates `SHA256SUMS-<os>-<arch>.txt` and raw `.minisig` sidecars for each
+     archive, Windows setup asset, and checksum manifest. The Tauri CLI emits an
+     encoded `.sig` wrapper; this script validates and writes the raw sidecar.
+   - Requires `TAURI_SIGNING_PRIVATE_KEY_PATH` on the provisioned signer; this
+     key must pair with the checked-in key ID. The Tauri CLI reads
+     `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` from the environment. Do not generate
+     a replacement key without updating every public-key pin.
+   - The checked-in `release-signing-key.pub` is pinned as key ID
+     `083B254A48C428E3` by `src/minisign.rs`, `install.sh`, `install.ps1`, and
+     `scripts/check-release-key.cjs`. `deox --update` and release verification
+     use the in-process verifier. First-install shell and PowerShell bootstraps
+     require the external Minisign CLI. GPG is not used.
 4. **Node release orchestration:**
-   - Linux release targets are `*-unknown-linux-musl` (static). `release.cjs`
-     builds them only on a Linux host of the same architecture, with
-     `CC_<triple>=musl-gcc` (package `musl-tools`); cross builds fail early.
-   - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES` because they reset and clean Git state. Passing `--force-always` (`npm run r -- --force-always`) bypasses the confirmation gate and propagates it to child steps; use only on throwaway release VMs. `npm run r` also runs `scripts/git-prune.cjs`, which deletes only local branches whose upstream is `[gone]`; never-pushed branches are kept.
-    - `npm run u -- <version>` runs the safe dependency updaters (`npm-safe-update.cjs`:
-      3-day npm min-release-age, lock-only, high-severity audit; `cargo-safe-update.cjs`:
-      72-hour crates.io publish-age gate, git-dep and foreign-registry blocks, validated
-      temp-lockfile install) and then synchronizes the version across `package.json`,
-      `package-lock.json`, `Cargo.toml`, `Cargo.lock`, and BCLS download metadata.
-      Bare `npm run u` runs the updaters, then propagates the `package.json`
-      version across the other manifests (edit `package.json` first to bump;
-      `package.json` is the version source of truth).
-      `npm run update:safe` runs only the dependency updaters. Never run raw
-      `cargo update` / `npm update` / `npm audit fix` or delete `Cargo.lock`;
-      `npm run check:update-policy` (in `npm run quality`) fails closed on any
-      unguarded mutation path. Review both lockfile diffs before committing.
-    - `npm run release:windows[:arch]` creates the single draft and uploads Windows artifacts.
-       `npm run release:linux[:arch]` and `npm run release:macos[:arch]` wait for that
-       draft and upload their artifacts. Release sessions require a clean Git checkout
-       so artifacts match bound `HEAD`.
-    - `npm run release:upload` remains an explicit staged-artifact upload path after
-       `gh auth login`; publication uses draft releases and remote digest checks.
-       GitHub Actions runs quality checks only; production release builds run manually
-       on dedicated release VMs.
-   - Target builders may upload incrementally to the same draft; remote verification
-      permits only known release asset names and matches each local upload by digest.
-      Final publication re-verifies every remote platform checksum manifest against
-      the pinned signing key and GitHub asset digests.
-  - Draft releases bind `target_commitish` to current Git `HEAD`; existing drafts with
-    a different binding are rejected. Release archive verification lists ZIP entries
-    in Node without requiring an external `unzip` command.
-  - Manual release workflow OS choices use `linux`, `macos`, and `windows`; `macos`
-    maps to the package scripts while Rust target triples use `darwin`.
-  - macOS notarization needs a pre-provisioned `notarytool` keychain profile
-    (`APPLE_KEYCHAIN_PROFILE`) and a Developer ID certificate in the keychain.
-    GitHub-hosted macOS runners have neither, so macOS releases run on a
-    dedicated VM via `npm run release:macos`. `.github/workflows/release.yml`
-    fails early when `os` is `macos` and the runner label starts with `macos-`.
-  - `scripts/verify-release.cjs` verifies every `SHA256SUMS-*.txt` manifest with
-    the same in-process verifier `deox --update` uses, via
-    `cargo run --locked --example verify_release_manifest -- <manifest> <manifest>.asc`
-    (`examples/verify_release_manifest.rs`, calling the doc-hidden
-    `updater::verify_release_manifest`). `scripts/check-release-key.cjs` also
-    requires the pinned fingerprint in `src/updater.rs`.
-  - `CHANGELOG.md` is the BCLS-formatted release body; draft creation fails if it is missing or empty.
+   - Linux release targets are static `*-unknown-linux-musl` builds for x86_64
+     and aarch64. `release.cjs` requires a matching native Linux host and
+     `musl-gcc` (`musl-tools`); do not claim every Linux distribution has been
+     tested.
+   - `npm run r` and `npm run b` require `DEOX_RELEASE_CONFIRM=YES`. They fetch
+     and verify `origin/main` or `origin/beta` before the first reset/clean.
+     `--force-always` bypasses only the confirmation gate. `scripts/vi.cjs`
+     verifies its upstream against the remote before resetting or cleaning.
+     Both scripts invoke npm through Node and `npm_execpath` on Windows without
+     a shell. `npm run r` also runs `scripts/git-prune.cjs`, which deletes only
+     local branches whose upstream is `[gone]`.
+   - `npm run u -- <version>` runs the safe npm and Cargo dependency updaters
+     before syncing versions. npm uses a 3-day release-age gate, lock-only
+     updates, and a high-severity audit; Cargo uses a 72-hour publish-age gate,
+     blocks Git/foreign-registry dependencies, and installs a validated
+     temporary lockfile. Bare `npm run u` propagates the `package.json` version
+     across manifests and the BCLS download table. `npm run update:safe` only
+     updates dependency locks. Never use raw `cargo update`, `npm update`, or
+     `npm audit fix`; `npm run check:update-policy` fails closed on unguarded
+     dependency mutation paths.
+   - The six native release commands are `npm run release:windows:x64`,
+     `npm run release:windows:arm64`, `npm run release:linux:x64`,
+     `npm run release:linux:arm64`, `npm run release:macos:x64`, and
+     `npm run release:macos:arm64`. Run each on its matching native OS and
+     architecture VM from a clean checkout of the same candidate tag/commit.
+     The first Windows upload creates the draft; Windows arm64 reuses it, and
+     Linux/macOS wait for it. Release sessions bind builds to `HEAD`; the remote
+     tag must resolve to that same commit.
+   - `npm run release:verify:draft` requires 28 assets: six archives, six
+     platform checksum manifests, two Windows setup assets, and 14 `.minisig`
+     sidecars. It checks draft identity and remote tag commit. Run
+     `npm run release:verify:remote` to verify signatures, manifests, archive
+     proofs, and GitHub asset digests. `npm run release:publish -- --yes`
+     repeats remote verification before the irreversible draft-to-public
+     transition and requires `DEOX_RELEASE_CONFIRM=YES`.
+   - `npm run release:upload` is the staged-artifact path and requires `gh auth
+     login`. GitHub Actions runs quality checks; production builds run on the
+     six dedicated native VMs. Manual workflow OS choices are `linux`, `macos`,
+     and `windows`; Rust uses `darwin` for macOS target triples.
+   - macOS builds require a Developer ID certificate and accepted notarization
+     using `APPLE_KEYCHAIN_PROFILE`; GitHub-hosted macOS runners do not have the
+     required credentials. Windows builds need Azure Artifact Signing tools
+     and credentials. `.github/workflows/release.yml` rejects hosted macOS
+     runners for production signing.
+   - `scripts/verify-release.cjs` verifies checksum-manifest signatures and
+     payload `.minisig` sidecars with the in-process verifier used by
+     `deox --update`, via the `verify_release_manifest` and
+     `verify_release_signature` examples. It also validates archives through
+     `verify_release_archive`. `scripts/check-release-key.cjs` pins the exact
+     public-key serialization across runtime and installers.
+   - `CHANGELOG.md` is the BCLS-formatted release body; draft creation fails if
+     it is missing or empty.
 
 ---
 
@@ -504,12 +539,12 @@ CI (`.github/workflows/ci.yml`) must be a required status check on `main`
 
 ### Test Coverage Highlights
 - `tests/e2e_test.rs`: Drives the real `deox` binary against fixture trees (Tauri AppImage symlinks, unreadable folders, workspaces, nested paths, build locks, bundles) and writes a transcript per scenario to `target/e2e-artifacts/` (override with `DEOX_E2E_ARTIFACTS`). Permission scenarios skip when run as root; run them as an unprivileged user to exercise them.
-- `src/openpgp.rs` tests: Verifier failure modes (tampered data, unpinned key, SHA-1, text mode, expired, outside validity window, truncated/garbled/multi-packet armor, bad CRC) using fixtures in `tests/fixtures/openpgp/`. Regenerate fixtures with `gpg` (use `--faked-system-time` for dated signatures).
+- `src/minisign.rs` tests: Verify the upstream non-legacy Minisign vector, reject tampering and legacy Ed signatures, reject malformed/extra-line data, and require the exact checked-in pinned key. Node release tests cover normalization of Tauri CLI signatures into raw `.minisig` sidecars.
 - `tests/config_test.rs`: Validates default configuration, atomic round-trip serialization, malformed/future-version rejection, enum parsing, and safe tilde expansion.
 - `tests/scanner_test.rs`: Validates Tauri project detection, renamed/inherited dependencies, shared workspaces, size calculation, symlink exclusion, and `ignored_projects` filtering.
 - `tests/cleaner_test.rs`: Validates deletion in all 4 clean modes, target triples, symlink handling (refuse symlinked roots, remove interior links without following), dry-run safety, and preservation of release builds in `debug-only` mode.
 - `tests/cli_test.rs`: Validates dual-binary version/output parity and invalid-mode rejection.
 - `tests/node/release-tools.test.cjs`: Validates target mapping, checksums, release identity, token scrubbing, and destructive Git confirmation.
-- `tests/node/sync-version.test.cjs`: Validates version parsing, Cargo/npm manifest updates, and BCLS changelog rewrites.
+- `tests/node/sync-version.test.cjs`: Validates version parsing, Cargo/npm manifest updates, all eight canonical tag-and-basename release URLs, and branch preflight against a safe local Git remote fixture before destructive cleanup.
 - `tests/node/cargo-safe-update.test.cjs`: Validates 72h publish-age gating, emergency overrides, temp-lockfile transactions, env pins, and guarded `u`/`update:safe` entry points.
 - `tests/node/check-cargo-update-policy.test.cjs`: Validates the unguarded-mutation scanner across scripts, workflows, and cargo aliases.

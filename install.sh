@@ -13,30 +13,28 @@ set -euo pipefail
 BINARY_NAME="deoxidizer"
 ALIAS_NAME="deox"
 REPO="BurntToasters/deoxidizer"
-RELEASE_KEY_FINGERPRINT="CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F"
+RELEASE_MINISIGN_PUBLIC_KEY=$'untrusted comment: minisign public key: 083B254A48C428E3\nRWTjKMRISiU7CDbPKID/yjE1xQvWSbhYFjDF3xgaJCAqOiO7IPffxndk\n'
 CURL=(curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300)
+DEOX_INSTALL_WORK_DIR=""
+DEOX_INSTALL_PAIR_STAGE=""
+
+cleanup_install_staging() {
+    if [[ -n "$DEOX_INSTALL_PAIR_STAGE" ]]; then
+        rm -rf "$DEOX_INSTALL_PAIR_STAGE"
+    fi
+    if [[ -n "$DEOX_INSTALL_WORK_DIR" ]]; then
+        rm -rf "$DEOX_INSTALL_WORK_DIR"
+    fi
+}
 
 die() {
     echo "Error: $*" >&2
     exit 1
 }
 
-gpg_install_hint() {
-    case "$(uname -s)" in
-        Darwin) echo "  Install it with: brew install gnupg" ;;
-        Linux)
-            if command -v apt-get >/dev/null 2>&1; then
-                echo "  Install it with: sudo apt-get install gnupg"
-            elif command -v dnf >/dev/null 2>&1; then
-                echo "  Install it with: sudo dnf install gnupg2"
-            elif command -v pacman >/dev/null 2>&1; then
-                echo "  Install it with: sudo pacman -S gnupg"
-            else
-                echo "  Install GnuPG with your package manager."
-            fi
-            ;;
-    esac
-    echo "  (Only this first install needs gpg; 'deox --update' verifies releases itself.)"
+minisign_install_hint() {
+    echo "  Install the interoperable Minisign CLI, then run this installer again."
+    echo "  (The installer and 'deox --update' verify with the same pinned public key.)"
 }
 
 download_release() {
@@ -54,9 +52,9 @@ download_release() {
         *) die "unsupported architecture: $arch" ;;
     esac
     command -v curl >/dev/null 2>&1 || die "curl is required."
-    command -v gpg >/dev/null 2>&1 || {
-        echo "Error: gpg is required to authenticate the release." >&2
-        gpg_install_hint >&2
+    command -v minisign >/dev/null 2>&1 || {
+        echo "Error: minisign is required to authenticate the release." >&2
+        minisign_install_hint >&2
         exit 1
     }
 
@@ -80,27 +78,12 @@ download_release() {
         checksum_name="SHA256SUMS.txt"
         "${CURL[@]}" "$base/$checksum_name" -o "$work_dir/$checksum_name"
     fi
-    "${CURL[@]}" "$base/$checksum_name.asc" -o "$work_dir/$checksum_name.asc"
-
-    # Verify the manifest signature with an isolated keyring holding only
-    # the pinned release key.
-    local gnupg_home="$work_dir/gnupg"
-    mkdir -m 700 "$gnupg_home"
-    "${CURL[@]}" "https://raw.githubusercontent.com/$REPO/main/release-signing-key.asc" \
-        -o "$work_dir/release-signing-key.asc"
-    local key_fingerprint
-    key_fingerprint=$(gpg --homedir "$gnupg_home" --batch --show-keys --with-colons "$work_dir/release-signing-key.asc" |
-        awk -F: '$1 == "fpr" { print toupper($10); exit }')
-    [[ "$key_fingerprint" == "$RELEASE_KEY_FINGERPRINT" ]] || die "release signing key fingerprint mismatch."
-    gpg --homedir "$gnupg_home" --batch --yes --dearmor --output "$work_dir/release-keyring.gpg" \
-        "$work_dir/release-signing-key.asc"
-    local status
-    status=$(gpg --homedir "$gnupg_home" --batch --no-options --no-default-keyring \
-        --keyring "$work_dir/release-keyring.gpg" --status-fd 1 \
-        --verify "$work_dir/$checksum_name.asc" "$work_dir/$checksum_name" 2>/dev/null) ||
+    "${CURL[@]}" "$base/$checksum_name.minisig" -o "$work_dir/$checksum_name.minisig"
+    printf '%s' "$RELEASE_MINISIGN_PUBLIC_KEY" > "$work_dir/release-signing-key.pub"
+    minisign -V -m "$work_dir/$checksum_name" \
+        -x "$work_dir/$checksum_name.minisig" \
+        -p "$work_dir/release-signing-key.pub" ||
         die "checksum manifest signature verification failed."
-    grep -q "^\[GNUPG:\] VALIDSIG $RELEASE_KEY_FINGERPRINT " <<<"$status" ||
-        die "checksum manifest is not signed by the pinned release key."
 
     echo "  Verifying SHA256..."
     local checksum_line expected actual
@@ -155,9 +138,11 @@ main() {
 
     local work_dir
     work_dir=$(mktemp -d "${TMPDIR:-/tmp}/deoxidizer-install.XXXXXX")
-    # shellcheck disable=SC2064 # expand now: work_dir is local to main
-    trap "rm -rf '$work_dir'" EXIT
+    DEOX_INSTALL_WORK_DIR="$work_dir"
+    trap cleanup_install_staging EXIT
+    [[ ! -L "$install_dir" ]] || die "install directory is an unexpected symlink: $install_dir"
     mkdir -p "$install_dir"
+    [[ -d "$install_dir" && ! -L "$install_dir" ]] || die "install path is not a real directory: $install_dir"
 
     echo "🔧 deoxidizer installer"
     echo "────────────────────────"
@@ -171,17 +156,30 @@ main() {
 
     local staged="$work_dir/$BINARY_NAME"
     [[ -f "$staged" && ! -L "$staged" ]] || die "staged binary missing or symlinked."
-    for name in "$BINARY_NAME" "$ALIAS_NAME"; do
-        local dest="$install_dir/$name"
-        if [[ -L "$dest" ]]; then
-            [[ "$name" == "$ALIAS_NAME" && "$(readlink "$dest")" == "$install_dir/$BINARY_NAME" ]] ||
-                die "install destination is an unexpected symlink: $dest"
-        fi
-    done
-    install -m 0755 "$staged" "$install_dir/$BINARY_NAME"
-    # `deox` is a symlink to the single installed binary.
-    rm -f "$install_dir/$ALIAS_NAME"
-    ln -s "$install_dir/$BINARY_NAME" "$install_dir/$ALIAS_NAME"
+    local binary_dest="$install_dir/$BINARY_NAME"
+    local alias_dest="$install_dir/$ALIAS_NAME"
+    if [[ -L "$binary_dest" || ( -e "$binary_dest" && ! -f "$binary_dest" ) ]]; then
+        die "install destination is not a regular binary file: $binary_dest"
+    fi
+    if [[ -L "$alias_dest" ]]; then
+        [[ "$(readlink "$alias_dest")" == "$binary_dest" ]] ||
+            die "install destination is an unexpected symlink: $alias_dest"
+    elif [[ -e "$alias_dest" && ! -f "$alias_dest" ]]; then
+        die "install destination is not a regular file: $alias_dest"
+    fi
+
+    # Stage both invokers on the destination filesystem. Install the alias
+    # first while it still resolves to the old main binary, then atomically
+    # rename the new main binary into place. A crash or main-file failure
+    # therefore leaves both invokers on the old bytes; success leaves both
+    # invokers on the new bytes.
+    DEOX_INSTALL_PAIR_STAGE=$(mktemp -d "$install_dir/.deoxidizer-install.XXXXXX")
+    install -m 0755 "$staged" "$DEOX_INSTALL_PAIR_STAGE/$BINARY_NAME"
+    ln -s "$binary_dest" "$DEOX_INSTALL_PAIR_STAGE/$ALIAS_NAME"
+    mv -f "$DEOX_INSTALL_PAIR_STAGE/$ALIAS_NAME" "$alias_dest"
+    mv -f "$DEOX_INSTALL_PAIR_STAGE/$BINARY_NAME" "$binary_dest"
+    rmdir "$DEOX_INSTALL_PAIR_STAGE"
+    DEOX_INSTALL_PAIR_STAGE=""
 
     echo "✓ Installed $BINARY_NAME to $install_dir/$BINARY_NAME"
     echo "✓ Linked $ALIAS_NAME -> $install_dir/$BINARY_NAME"

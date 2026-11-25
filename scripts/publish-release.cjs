@@ -2,9 +2,14 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { assertGitHubCliAuthenticated, githubApi, repository } = require('./github-cli.cjs');
-const { tag, verifyDraft } = require('./verify-release-draft.cjs');
-const { verifyRemote, allReleaseFiles } = require('./verify-release.cjs');
+const {
+  assertGitHubCliAuthenticated,
+  githubApi,
+  repository,
+  withReleaseMutationLock,
+} = require('./github-cli.cjs');
+const { currentCommit, tag } = require('./verify-release-draft.cjs');
+const { verifyRemote, assertRemoteSnapshotUnchanged } = require('./verify-release.cjs');
 const { cargoVersion, isPrerelease } = require('./sync-version.cjs');
 
 const root = path.resolve(__dirname, '..');
@@ -19,11 +24,17 @@ function main() {
     throw new Error('Publishing is irreversible; DEOX_RELEASE_CONFIRM=YES is required in addition to --yes');
   }
   assertGitHubCliAuthenticated();
-  const release = verifyDraft();
-  verifyRemote(allReleaseFiles());
-  githubApi('PATCH', `/repos/${repository()}/releases/${release.id}`, {
-    draft: false,
-    prerelease: isPrerelease(version),
+  const commit = currentCommit();
+  withReleaseMutationLock(tag, commit, () => {
+    const verification = verifyRemote([], { requireComplete: true });
+    assertRemoteSnapshotUnchanged(verification);
+    if (verification.commit !== commit.toLowerCase()) {
+      throw new Error('Verified draft release commit changed before publication');
+    }
+    githubApi('PATCH', `/repos/${repository()}/releases/${verification.release.id}`, {
+      draft: false,
+      prerelease: isPrerelease(version),
+    });
   });
   console.log(`Published ${tag} from draft release`);
 }

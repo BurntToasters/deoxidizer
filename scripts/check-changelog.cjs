@@ -4,18 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
-// Shared [package]-scoped parser from sync-version.cjs; fallback keeps
-// isolated fixture execution (staged without sync-version.cjs) runnable.
-let cargoVersion;
-try {
-  ({ cargoVersion } = require('./sync-version.cjs'));
-} catch {
-  cargoVersion = (cargo) =>
-    cargo.match(/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1] ||
-    (() => {
-      throw new Error('Cargo.toml has no package version');
-    })();
-}
+// Use the same version and canonical URL rules as the version synchronizer.
+const { cargoVersion, releaseAssetNames, validateChangelogReleaseLinks } = require('./sync-version.cjs');
 const manifest = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
 const changelog = fs.readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8');
 // Shared [package]-scoped parser; do not use an inline ^version regex here
@@ -29,16 +19,7 @@ const requiredMarkers = [
   '## ℹ️ Release Info',
   '### This changelog is made using the BCLS standard:',
 ];
-const targets = [
-  `deoxidizer-v${version}-windows-x86_64.zip`,
-  `deoxidizer-v${version}-windows-aarch64.zip`,
-  `deoxidizer-v${version}-windows-x86_64-setup.exe`,
-  `deoxidizer-v${version}-windows-aarch64-setup.exe`,
-  `deoxidizer-v${version}-darwin-x86_64.tar.gz`,
-  `deoxidizer-v${version}-darwin-aarch64.tar.gz`,
-  `deoxidizer-v${version}-linux-x86_64.tar.gz`,
-  `deoxidizer-v${version}-linux-aarch64.tar.gz`,
-];
+const targets = releaseAssetNames(version);
 const errors = [];
 
 for (const marker of requiredMarkers) {
@@ -47,9 +28,7 @@ for (const marker of requiredMarkers) {
 for (const target of targets) {
   if (!changelog.includes(target)) errors.push(`missing download asset: ${target}`);
 }
-if (!changelog.includes(`/releases/download/v${version}/`)) {
-  errors.push(`download links must point to v${version}`);
-}
+errors.push(...validateChangelogReleaseLinks(changelog, version));
 if (/\b(?:TODO|TBD|FIXME)\b/i.test(changelog)) {
   errors.push('changelog contains an unfinished placeholder');
 }

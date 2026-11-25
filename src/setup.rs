@@ -14,7 +14,11 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
     let config_path: PathBuf = match Config::resolve_path(config_override) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("  {} {error}.", "✗".red().bold());
+            eprintln!(
+                "  {} {}.",
+                "✗".red().bold(),
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         }
     };
@@ -39,13 +43,23 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
                     return;
                 }
                 Err(error) => {
-                    eprintln!("Setup cancelled: {error}.");
+                    eprintln!(
+                        "Setup cancelled: {}.",
+                        crate::display::sanitize(&error.to_string())
+                    );
                     std::process::exit(1);
                 }
             }
         }
         if config_path.exists() {
-            backup_existing_config(&config_path);
+            if let Err(error) = backup_existing_config(&config_path) {
+                eprintln!(
+                    "  {} Could not back up existing config: {}. Setup stopped without overwriting it.",
+                    "✗".red().bold(),
+                    crate::display::sanitize(&error.to_string())
+                );
+                std::process::exit(1);
+            }
         }
         let config = Config::default();
         match config.save_to(&config_path) {
@@ -53,13 +67,17 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
                 println!(
                     "  {} Default configuration saved to {}",
                     "✓".green().bold(),
-                    config_path.display()
+                    crate::display::sanitize(&config_path.display().to_string())
                 );
                 println!();
                 print_config_summary(&config);
             }
             Err(e) => {
-                eprintln!("  {} Failed to save config: {e}.", "✗".red().bold());
+                eprintln!(
+                    "  {} Failed to save config: {}.",
+                    "✗".red().bold(),
+                    crate::display::sanitize(&e.to_string())
+                );
                 std::process::exit(1);
             }
         }
@@ -72,8 +90,9 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
         Err(crate::config::ConfigError::Missing(_)) => Config::default(),
         Err(error) => {
             eprintln!(
-                "  {} Existing config is unreadable ({error}); starting from defaults.",
-                "⚠".yellow()
+                "  {} Existing config is unreadable ({}); starting from defaults.",
+                "⚠".yellow(),
+                crate::display::sanitize(&error.to_string())
             );
             Config::default()
         }
@@ -86,10 +105,13 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
         .default(default_dir)
         .interact_text()
         .unwrap_or_else(|error| {
-            eprintln!("Setup cancelled: {error}.");
+            eprintln!(
+                "Setup cancelled: {}.",
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         });
-    if projects_dir.trim().is_empty() {
+    if projects_dir.is_empty() {
         eprintln!(
             "  {} Invalid projects directory: must not be empty.",
             "✗".red().bold()
@@ -103,7 +125,7 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
         eprintln!(
             "  {} Directory does not exist: {}",
             "⚠".yellow(),
-            projects_dir
+            crate::display::sanitize(&projects_dir)
         );
         eprintln!("  Creating it is up to you — config will be saved as-is.");
     }
@@ -124,7 +146,10 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
         })
         .interact()
         .unwrap_or_else(|error| {
-            eprintln!("Setup cancelled: {error}.");
+            eprintln!(
+                "Setup cancelled: {}.",
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         });
 
@@ -149,7 +174,10 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
         })
         .interact()
         .unwrap_or_else(|error| {
-            eprintln!("Setup cancelled: {error}.");
+            eprintln!(
+                "Setup cancelled: {}.",
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         });
 
@@ -177,7 +205,10 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
         })
         .interact()
         .unwrap_or_else(|error| {
-            eprintln!("Setup cancelled: {error}.");
+            eprintln!(
+                "Setup cancelled: {}.",
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         });
 
@@ -195,7 +226,10 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
         .default(current.min_size_mb)
         .interact_text()
         .unwrap_or_else(|error| {
-            eprintln!("Setup cancelled: {error}.");
+            eprintln!(
+                "Setup cancelled: {}.",
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         });
     if min_size_mb.checked_mul(1024 * 1024).is_none() {
@@ -213,7 +247,10 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
         .allow_empty(true)
         .interact_text()
         .unwrap_or_else(|error| {
-            eprintln!("Setup cancelled: {error}.");
+            eprintln!(
+                "Setup cancelled: {}.",
+                crate::display::sanitize(&error.to_string())
+            );
             std::process::exit(1);
         });
     let ignored_projects: Vec<String> = ignored_input
@@ -234,7 +271,14 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
     };
 
     if config_path.exists() {
-        backup_existing_config(&config_path);
+        if let Err(error) = backup_existing_config(&config_path) {
+            eprintln!(
+                "  {} Could not back up existing config: {}. Setup stopped without overwriting it.",
+                "✗".red().bold(),
+                crate::display::sanitize(&error.to_string())
+            );
+            std::process::exit(1);
+        }
     }
     match config.save_to(&config_path) {
         Ok(()) => {
@@ -242,30 +286,41 @@ pub fn run_setup(args: SetupArgs, config_override: Option<&std::path::PathBuf>) 
             println!(
                 "  {} Configuration saved to {}",
                 "✓".green().bold(),
-                config_path.display()
+                crate::display::sanitize(&config_path.display().to_string())
             );
             println!();
             print_config_summary(&config);
         }
         Err(e) => {
-            eprintln!("  {} Failed to save config: {e}.", "✗".red().bold());
+            eprintln!(
+                "  {} Failed to save config: {}.",
+                "✗".red().bold(),
+                crate::display::sanitize(&e.to_string())
+            );
             std::process::exit(1);
         }
     }
 }
 
-/// Best-effort backup of an existing config to `<path>.bak` before overwrite.
-fn backup_existing_config(path: &std::path::Path) {
+/// Atomically create `<path>.bak` without following or overwriting a
+/// pre-existing backup destination. Failure blocks setup from overwriting the
+/// source config.
+fn backup_existing_config(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io;
+    use std::io::copy;
+
     let mut backup_name = path.as_os_str().to_owned();
     backup_name.push(".bak");
     let backup = std::path::PathBuf::from(backup_name);
-    if let Err(error) = std::fs::copy(path, &backup) {
-        eprintln!(
-            "  {} Could not back up existing config to {}: {error}. Continuing.",
-            "⚠".yellow(),
-            backup.display()
-        );
-    }
+    let parent = backup.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut source = std::fs::File::open(path)?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    copy(&mut source, staged.as_file_mut())?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist_noclobber(&backup)
+        .map_err(|error| io::Error::other(error.error))?;
+    Ok(())
 }
 
 fn print_config_summary(config: &Config) {

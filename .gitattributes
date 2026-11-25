@@ -1,2 +1,4 @@
 # Signed test fixtures must stay byte-exact on every platform.
 tests/fixtures/** -text
+# Runtime and bootstrap pins compare the serialized Minisign key byte-for-byte.
+release-signing-key.pub -text

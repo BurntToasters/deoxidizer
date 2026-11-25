@@ -33,10 +33,10 @@ function expectedReleaseAssets() {
   for (const [os, arch, extension] of TARGETS) {
     const archive = `deoxidizer-v${version}-${os}-${arch}.${extension}`;
     const checksum = `SHA256SUMS-${os}-${arch}.txt`;
-    names.push(archive, `${archive}.asc`, checksum, `${checksum}.asc`);
+    names.push(archive, `${archive}.minisig`, checksum, `${checksum}.minisig`);
     if (os === 'windows') {
       const installer = `deoxidizer-v${version}-windows-${arch}-setup.exe`;
-      names.push(installer, `${installer}.asc`);
+      names.push(installer, `${installer}.minisig`);
     }
   }
   return new Set(names);
@@ -50,7 +50,47 @@ function currentCommit() {
   return commit;
 }
 
-function validateDraft(release, assets, expectedCommit) {
+function validCommitSha(sha) {
+  if (!/^[0-9a-f]{40}$/i.test(String(sha || ''))) {
+    throw new Error('Git tag does not resolve to a full commit SHA');
+  }
+  return String(sha).toLowerCase();
+}
+
+function peelTagCommit(refObject, fetchTagObject) {
+  let object = refObject?.object || refObject;
+  if (object?.type !== 'tag') {
+    throw new Error('Git tag ref is not an annotated tag object that resolves to a commit');
+  }
+  const visited = new Set();
+  for (let depth = 0; depth < 16; depth += 1) {
+    const sha = validCommitSha(object.sha);
+    if (visited.has(sha)) throw new Error('Git tag object cycle does not resolve to a commit');
+    visited.add(sha);
+    const tagged = fetchTagObject(sha);
+    object = tagged?.object || tagged;
+    if (object?.type === 'commit') return validCommitSha(object.sha);
+    if (object?.type !== 'tag') throw new Error('Git tag does not resolve to a commit object');
+  }
+  throw new Error('Git tag exceeds the annotated-tag peel depth');
+}
+
+function resolveTagCommit(tagName, environment = process.env) {
+  const ref = githubApiWithRetry(
+    'GET',
+    `/repos/${repository()}/git/ref/tags/${encodeURIComponent(tagName)}`,
+    undefined,
+    { environment },
+  );
+  const object = ref?.object;
+  if (object?.type === 'commit') return validCommitSha(object.sha);
+  if (object?.type !== 'tag') throw new Error(`Git tag ${tagName} has no commit or annotated-tag ref`);
+  return peelTagCommit(object, (sha) =>
+    githubApiWithRetry('GET', `/repos/${repository()}/git/tags/${sha}`, undefined, { environment }),
+  );
+}
+
+function validateDraft(release, assets, expectedCommit, tagCommit) {
   const errors = [];
   if (!release?.draft) errors.push(`${tag} is not a draft release`);
   if (release?.tag_name !== tag) errors.push(`expected tag ${tag}`);
@@ -59,6 +99,9 @@ function validateDraft(release, assets, expectedCommit) {
   }
   if (expectedCommit && release?.target_commitish?.toLowerCase() !== expectedCommit.toLowerCase()) {
     errors.push(`target commit does not match current HEAD ${expectedCommit}`);
+  }
+  if (expectedCommit && tagCommit && tagCommit.toLowerCase() !== expectedCommit.toLowerCase()) {
+    errors.push(`tag commit does not match current HEAD ${expectedCommit}`);
   }
   const expected = expectedReleaseAssets();
   const byName = new Map();
@@ -101,7 +144,9 @@ function listAssets(releaseId) {
 function verifyDraft() {
   const release = findDraft();
   if (!release) throw new Error(`No release found for ${tag}`);
-  const errors = validateDraft(release, listAssets(release.id), currentCommit());
+  const commit = currentCommit();
+  const tagCommit = resolveTagCommit(tag);
+  const errors = validateDraft(release, listAssets(release.id), commit, tagCommit);
   if (errors.length > 0) throw new Error(errors.join('\n'));
   return release;
 }
@@ -117,4 +162,14 @@ if (require.main === module) {
   }
 }
 
-module.exports = { TARGETS, expectedReleaseAssets, validateDraft, verifyDraft, tag, prerelease, currentCommit };
+module.exports = {
+  TARGETS,
+  expectedReleaseAssets,
+  validateDraft,
+  verifyDraft,
+  tag,
+  prerelease,
+  currentCommit,
+  peelTagCommit,
+  resolveTagCommit,
+};

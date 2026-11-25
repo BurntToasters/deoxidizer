@@ -20,9 +20,9 @@ on:
         options: [x86_64, aarch64]
         default: x86_64
       runner:
-        description: Runner label (Linux aarch64 needs an arm64 runner, e.g. ubuntu-24.04-arm)
+        description: Label for a pre-provisioned self-hosted release runner
         required: true
-        default: ubuntu-latest
+        default: release-builder
       upload:
         description: Upload verified artifacts to a draft GitHub release
         required: true
@@ -39,12 +39,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ inputs.os }}
+  group: deoxidizer-release-${{ inputs.os }}-${{ inputs.arch }}
   cancel-in-progress: false
 
 jobs:
   release:
-    runs-on: ${{ inputs.runner }}
+    runs-on: [self-hosted, ${{ inputs.runner }}]
     environment: release
     timeout-minutes: 60
     steps:
@@ -87,8 +87,8 @@ jobs:
       - name: Build and stage release
         shell: bash
         env:
-          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          TAURI_SIGNING_PRIVATE_KEY_PATH: ${{ vars.TAURI_SIGNING_PRIVATE_KEY_PATH }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           AZURE_CLIENT_ID: ${{ inputs.os == 'windows' && secrets.AZURE_CLIENT_ID || '' }}
           AZURE_TENANT_ID: ${{ inputs.os == 'windows' && secrets.AZURE_TENANT_ID || '' }}
           AZURE_SUBSCRIPTION_ID: ${{ inputs.os == 'windows' && secrets.AZURE_SUBSCRIPTION_ID || '' }}
@@ -106,6 +106,9 @@ jobs:
           APPLE_KEYCHAIN_PROFILE: ${{ inputs.os == 'macos' && secrets.APPLE_KEYCHAIN_PROFILE || '' }}
         run: |
           set -euo pipefail
+          test -n "$TAURI_SIGNING_PRIVATE_KEY_PATH"
+          test -f "$TAURI_SIGNING_PRIVATE_KEY_PATH"
+          cargo tauri signer sign --help >/dev/null
           case "${{ inputs.os }}-${{ inputs.arch }}" in
             linux-x86_64) RELEASE_OS=linux; RELEASE_ARCH=x86_64 ;;
             linux-aarch64) RELEASE_OS=linux; RELEASE_ARCH=aarch64 ;;
@@ -116,19 +119,12 @@ jobs:
             *) echo "Unsupported release target: ${{ inputs.os }}-${{ inputs.arch }}" >&2; exit 2 ;;
           esac
           node scripts/release.cjs "$RELEASE_OS" "$RELEASE_ARCH"
-      - name: Authenticate GitHub CLI credential store
-        if: ${{ inputs.upload }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          printf '%s\n' "$GH_TOKEN" | gh auth login --hostname github.com --with-token
-          gh auth status --hostname github.com
       - name: Upload staged release
         if: ${{ inputs.upload }}
         shell: bash
         env:
           DEOX_RELEASE_DRAFT_MODE: ${{ inputs.draft_mode }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ "${{ inputs.draft_mode }}" = "wait" ]; then

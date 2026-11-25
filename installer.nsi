@@ -85,19 +85,33 @@ Section "Install"
   ${If} ${Errors}
     MessageBox MB_OK|MB_ICONINFORMATION "Could not read your user PATH safely (it may be longer than this installer supports). Add $INSTDIR to PATH manually."
   ${Else}
-    StrLen $3 "$0;$INSTDIR;"
-    ${If} $3 >= ${NSIS_MAX_STRLEN}
-      MessageBox MB_OK|MB_ICONINFORMATION "Your user PATH is too long for this installer to edit safely. Add $INSTDIR to PATH manually."
+    StrLen $3 $0
+    IntOp $4 ${NSIS_MAX_STRLEN} - 3
+    ${If} $3 > $4
+      MessageBox MB_OK|MB_ICONINFORMATION "Your user PATH is too long for this installer to read and edit safely. Add $INSTDIR to PATH manually."
     ${Else}
       StrCpy $1 ";$0;"
       ${WordReplace} $1 ";$INSTDIR;" ";" "+" $2
       ${If} $1 == $2
+        StrLen $3 $INSTDIR
         ${If} $0 == ""
-          WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR"
+          StrCpy $5 $3
         ${Else}
-          WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$0"
+          StrLen $4 $0
+          IntOp $5 $3 + $4
+          IntOp $5 $5 + 1
         ${EndIf}
-        SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+        ; The PATH value plus its terminating NUL must fit the NSIS buffer.
+        ${If} $5 >= ${NSIS_MAX_STRLEN}
+          MessageBox MB_OK|MB_ICONINFORMATION "Your user PATH has no room for deoxidizer. Add $INSTDIR to PATH manually."
+        ${Else}
+          ${If} $0 == ""
+            WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR"
+          ${Else}
+            WriteRegExpandStr HKCU "Environment" "Path" "$INSTDIR;$0"
+          ${EndIf}
+          SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+        ${EndIf}
       ${EndIf}
     ${EndIf}
   ${EndIf}
@@ -117,8 +131,8 @@ Section "Uninstall"
   ${IfNot} ${Errors}
   ${AndIf} $0 != ""
     StrLen $3 "$0"
-    IntOp $4 ${NSIS_MAX_STRLEN} - 1
-    ${If} $3 < $4
+    IntOp $4 ${NSIS_MAX_STRLEN} - 3
+    ${If} $3 <= $4
       StrCpy $1 ";$0;"
       ${WordReplace} $1 ";$INSTDIR;" ";" "+" $2
       ${If} $1 != $2

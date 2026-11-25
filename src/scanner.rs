@@ -3,9 +3,11 @@ use crate::project::{DiscoveredProject, ProjectKind, TargetBreakdown};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use toml::Value;
 use walkdir::WalkDir;
@@ -14,7 +16,7 @@ use walkdir::WalkDir;
 const MAX_SKIPPED_SHOWN: usize = 5;
 
 /// Signature line Cargo writes at the start of `CACHEDIR.TAG` in every target dir.
-const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+pub(crate) const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 
 /// Cargo writes `.rustc_info.json` into every target directory it builds.
 const RUSTC_INFO_FILE: &str = ".rustc_info.json";
@@ -49,13 +51,91 @@ pub struct ScanReport {
     pub analysis_failures: usize,
 }
 
+/// Open a regular file without following its final path component. Manifests,
+/// Cargo markers, and lock files use this shared gate so a symlink can never
+/// establish project or target eligibility.
+pub(crate) fn open_regular_file_nofollow(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{open, Mode, OFlags};
+        let fd = open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        File::from(fd)
+    };
+
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // OPEN_REPARSE_POINT opens the link itself instead of its destination.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let file = {
+        let before = fs::symlink_metadata(path)?;
+        if before.file_type().is_symlink() || !before.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a regular file",
+            ));
+        }
+        let file = OpenOptions::new().read(true).open(path)?;
+        let after = file.metadata()?;
+        if !after.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "opened path is not a regular file",
+            ));
+        }
+        file
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "opened path is not a regular file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "opened path is a reparse point",
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "opened path is a symbolic link",
+            ));
+        }
+    }
+    Ok(file)
+}
+
 /// Like [`scan`], but also reports projects that had to be skipped.
 pub fn scan_with_report(config: &Config) -> Result<ScanReport, ScanError> {
     let root = config.projects_path();
     let ScanReport {
         mut projects,
         analysis_failures,
-    } = scan_dir_report(&root, &config.scope)?;
+    } = scan_dir_report_for_ignores(&root, &config.scope, &config.ignored_projects)?;
 
     // Apply config-level min size filter
     if config.min_size_mb > 0 {
@@ -97,6 +177,8 @@ struct TargetGroup {
     owner: PathBuf,
     target: PathBuf,
     members: Vec<(String, ProjectKind)>,
+    ignored_workspace_member: bool,
+    unresolved_workspace_member: bool,
 }
 
 /// Scan a specific directory for projects.
@@ -110,6 +192,14 @@ pub fn scan_dir(root: &Path, scope: &Scope) -> Result<Vec<DiscoveredProject>, Sc
 
 /// Like [`scan_dir`], but also reports projects that had to be skipped.
 pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanError> {
+    scan_dir_report_for_ignores(root, scope, &[])
+}
+
+fn scan_dir_report_for_ignores(
+    root: &Path,
+    scope: &Scope,
+    ignored_projects: &[String],
+) -> Result<ScanReport, ScanError> {
     let root = validate_scan_root(root)?;
     let mut manifest_cache: HashMap<PathBuf, Option<Value>> = HashMap::new();
     let mut unmarked_warned: HashSet<PathBuf> = HashSet::new();
@@ -146,6 +236,7 @@ pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanErr
 
     // Group every package by the target directory it builds into.
     let mut groups: BTreeMap<PathBuf, TargetGroup> = BTreeMap::new();
+    let mut workspaces = Vec::new();
     for path in &candidates {
         let Some(project_dir) = path.parent() else {
             continue;
@@ -161,6 +252,9 @@ pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanErr
         if !has_package && manifest.get("workspace").is_none() {
             continue;
         }
+        if manifest.get("workspace").is_some() {
+            workspaces.push((project_dir.to_path_buf(), manifest.clone()));
+        }
         let Some((owner, target_dir)) = resolve_target_dir(
             project_dir,
             &manifest,
@@ -174,8 +268,9 @@ pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanErr
             Ok(canonical) => canonical,
             Err(error) => {
                 eprintln!(
-                    "Warning: cannot resolve target directory {}: {error}",
-                    crate::display::sanitize(&target_dir.display().to_string())
+                    "Warning: cannot resolve target directory {}: {}",
+                    crate::display::sanitize(&target_dir.display().to_string()),
+                    crate::display::sanitize(&error.to_string())
                 );
                 continue;
             }
@@ -184,6 +279,8 @@ pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanErr
             owner: owner.clone(),
             target: target_dir.clone(),
             members: Vec::new(),
+            ignored_workspace_member: false,
+            unresolved_workspace_member: false,
         });
         if has_package {
             let workspace_manifest =
@@ -195,9 +292,27 @@ pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanErr
         }
     }
 
+    augment_workspace_members(
+        &mut groups,
+        &workspaces,
+        &mut manifest_cache,
+        &mut unmarked_warned,
+        ignored_projects,
+    );
+
     let mut projects = Vec::new();
     let mut analyze_warnings = 0usize;
     for group in groups.into_values() {
+        if group.ignored_workspace_member {
+            continue;
+        }
+        if group.unresolved_workspace_member && !ignored_projects.is_empty() {
+            eprintln!(
+                "Warning: skipping workspace target {} because a declared member could not be resolved while ignored-project protection is configured.",
+                crate::display::sanitize(&group.target.display().to_string())
+            );
+            continue;
+        }
         let kind = if group
             .members
             .iter()
@@ -225,8 +340,9 @@ pub fn scan_dir_report(root: &Path, scope: &Scope) -> Result<ScanReport, ScanErr
             Ok(result) => result,
             Err(error) => {
                 eprintln!(
-                    "Warning: cannot analyze target directory {}: {error}; skipping project {}",
+                    "Warning: cannot analyze target directory {}: {}; skipping project {}",
                     crate::display::sanitize(&group.target.display().to_string()),
+                    crate::display::sanitize(&error.to_string()),
                     crate::display::sanitize(&name),
                 );
                 analyze_warnings += 1;
@@ -312,18 +428,27 @@ fn validate_scan_root(root: &Path) -> Result<PathBuf, ScanError> {
 }
 
 fn read_manifest(path: &Path) -> Option<Value> {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
+    let mut content = String::new();
+    let mut file = match open_regular_file_nofollow(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
             eprintln!(
                 "Warning: cannot read manifest {}: {}",
                 crate::display::sanitize(&path.display().to_string()),
-                error
+                crate::display::sanitize(&error.to_string())
             );
             return None;
         }
     };
+    if let Err(error) = file.read_to_string(&mut content) {
+        eprintln!(
+            "Warning: cannot read manifest {}: {}",
+            crate::display::sanitize(&path.display().to_string()),
+            crate::display::sanitize(&error.to_string())
+        );
+        return None;
+    }
     // `toml::from_str` (document semantics) is required: since toml 1.x,
     // `str::parse::<Value>()` parses a single TOML value, not a document.
     match toml::from_str::<Value>(&content) {
@@ -347,7 +472,7 @@ fn real_directory(path: &Path) -> Option<PathBuf> {
             eprintln!(
                 "Warning: cannot inspect {}: {}",
                 crate::display::sanitize(&path.display().to_string()),
-                error
+                crate::display::sanitize(&error.to_string())
             );
             return None;
         }
@@ -406,6 +531,11 @@ fn resolve_target_dir(
         if ancestor_manifest.get("workspace").is_none() {
             continue;
         }
+        if workspace_membership(project_dir, ancestor, &ancestor_manifest) != Some(true) {
+            // A nearest workspace is an ownership boundary. Do not attribute
+            // an excluded or unresolved package to an outer workspace.
+            return None;
+        }
         return real_build_dir(&ancestor.join("target"), warned)
             .map(|target| (ancestor.to_path_buf(), target));
     }
@@ -435,24 +565,24 @@ fn real_build_dir(path: &Path, warned: &mut HashSet<PathBuf>) -> Option<PathBuf>
 /// This is the fail-closed gate that keeps a folder merely named `target`
 /// (with unrelated contents) from ever being removed.
 pub fn is_cargo_target_dir(path: &Path) -> bool {
-    let is_regular = |candidate: &Path| {
-        fs::symlink_metadata(candidate)
-            .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-            .unwrap_or(false)
+    let target_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
     };
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+        return false;
+    }
     let cachedir = path.join("CACHEDIR.TAG");
-    if is_regular(&cachedir) {
+    if let Ok(file) = open_regular_file_nofollow(&cachedir) {
         let mut prefix = Vec::with_capacity(CACHEDIR_SIGNATURE.len());
-        if let Ok(file) = fs::File::open(&cachedir) {
-            let _ = file
-                .take(CACHEDIR_SIGNATURE.len() as u64)
-                .read_to_end(&mut prefix);
-        }
+        let _ = file
+            .take(CACHEDIR_SIGNATURE.len() as u64)
+            .read_to_end(&mut prefix);
         if prefix.starts_with(CACHEDIR_SIGNATURE) {
             return true;
         }
     }
-    is_regular(&path.join(RUSTC_INFO_FILE))
+    open_regular_file_nofollow(&path.join(RUSTC_INFO_FILE)).is_ok()
 }
 
 /// Nearest manifest at or above `project_dir` declaring `[workspace]`,
@@ -470,10 +600,387 @@ fn find_workspace_manifest(
             continue;
         };
         if manifest.get("workspace").is_some() {
-            return Some(manifest);
+            return (workspace_membership(project_dir, ancestor, &manifest) == Some(true))
+                .then_some(manifest);
         }
     }
     None
+}
+
+/// Return whether `project_dir` is declared as a member of this workspace.
+/// Unsupported or malformed member patterns return `None` so callers fail
+/// closed instead of borrowing an outer workspace target.
+fn workspace_membership(
+    project_dir: &Path,
+    workspace_root: &Path,
+    manifest: &Value,
+) -> Option<bool> {
+    let relative = project_dir.strip_prefix(workspace_root).ok()?;
+    let members = workspace_patterns(manifest, "members")?;
+    let excludes = workspace_patterns(manifest, "exclude")?;
+    let excluded = excludes
+        .iter()
+        .any(|pattern| path_matches_pattern(relative, pattern));
+    if excluded {
+        return Some(false);
+    }
+    if relative.as_os_str().is_empty() {
+        return Some(manifest.get("package").is_some());
+    }
+    Some(
+        members
+            .iter()
+            .any(|pattern| path_matches_pattern(relative, pattern)),
+    )
+}
+
+/// Read Cargo workspace path patterns, rejecting non-string entries and
+/// parent/absolute paths. `members` absent means only the root package is a
+/// member; a virtual workspace must list its members explicitly.
+fn workspace_patterns(manifest: &Value, key: &str) -> Option<Vec<String>> {
+    let Some(value) = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get(key))
+    else {
+        return Some(Vec::new());
+    };
+    let values = value.as_array()?;
+    values
+        .iter()
+        .map(|value| {
+            let pattern = value.as_str()?;
+            let path = Path::new(pattern);
+            if path.is_absolute()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+                || pattern
+                    .chars()
+                    .any(|character| matches!(character, '[' | ']' | '{' | '}' | '\\'))
+            {
+                return None;
+            }
+            Some(pattern.to_string())
+        })
+        .collect()
+}
+
+fn path_matches_pattern(path: &Path, pattern: &str) -> bool {
+    let path_components: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    let pattern_components: Vec<String> = Path::new(pattern)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    path_components.len() == pattern_components.len()
+        && path_components
+            .iter()
+            .zip(pattern_components.iter())
+            .all(|(name, pattern)| wildcard_component_matches(pattern, name))
+}
+
+/// Match Cargo's common `*` and `?` component patterns. Character classes,
+/// braces, and escapes are rejected by member enumeration below; this helper
+/// returns false for those forms so they cannot accidentally broaden scope.
+fn wildcard_component_matches(pattern: &str, value: &str) -> bool {
+    if pattern
+        .chars()
+        .any(|character| matches!(character, '[' | ']' | '{' | '}' | '\\'))
+    {
+        return false;
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let mut matches = vec![false; value.len() + 1];
+    matches[0] = true;
+    for item in pattern {
+        let mut next = vec![false; value.len() + 1];
+        match item {
+            '*' => {
+                let mut prefix = false;
+                for index in 0..=value.len() {
+                    prefix |= matches[index];
+                    next[index] = prefix;
+                }
+            }
+            '?' => {
+                for index in 0..value.len() {
+                    next[index + 1] |= matches[index];
+                }
+            }
+            literal => {
+                for index in 0..value.len() {
+                    if value[index] == literal {
+                        next[index + 1] |= matches[index];
+                    }
+                }
+            }
+        }
+        matches = next;
+    }
+    matches[value.len()]
+}
+
+/// Expand declared workspace members, including hidden directories skipped by
+/// the general scanner. Any unreadable, symlinked, malformed, or unsupported
+/// member makes the result indeterminate so ignored-project protection can
+/// fail closed for the shared target.
+fn resolve_workspace_members(
+    workspace_root: &Path,
+    workspace_manifest: &Value,
+    cache: &mut HashMap<PathBuf, Option<Value>>,
+) -> Result<Vec<(PathBuf, Value)>, String> {
+    let member_patterns = workspace_patterns(workspace_manifest, "members")
+        .ok_or_else(|| "workspace members contain an unsupported path pattern".to_string())?;
+    let exclude_patterns = workspace_patterns(workspace_manifest, "exclude")
+        .ok_or_else(|| "workspace excludes contain an unsupported path pattern".to_string())?;
+    let mut members = Vec::new();
+    for pattern in member_patterns {
+        let found = expand_workspace_pattern(workspace_root, &pattern, true)?;
+        if found.is_empty() {
+            return Err(format!(
+                "workspace member pattern {pattern:?} matched no directories"
+            ));
+        }
+        members.extend(found);
+    }
+    let mut excluded = HashSet::new();
+    for pattern in exclude_patterns {
+        excluded.extend(expand_workspace_pattern(workspace_root, &pattern, false)?);
+    }
+    members.sort();
+    members.dedup();
+
+    let mut resolved = Vec::new();
+    for member_dir in members {
+        if excluded.contains(&member_dir) {
+            continue;
+        }
+        let manifest_path = member_dir.join("Cargo.toml");
+        let manifest = cached_manifest(&manifest_path, cache).ok_or_else(|| {
+            format!(
+                "cannot resolve declared workspace member manifest {}",
+                member_dir.display()
+            )
+        })?;
+        if manifest.get("package").is_none() {
+            return Err(format!(
+                "declared workspace member {} has no package table",
+                member_dir.display()
+            ));
+        }
+        resolved.push((member_dir, manifest));
+    }
+    Ok(resolved)
+}
+
+/// Expand one component-wise workspace path pattern without following links.
+/// Missing excludes are harmless; missing members are reported to the caller.
+fn expand_workspace_pattern(
+    workspace_root: &Path,
+    pattern: &str,
+    required: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let path = Path::new(pattern);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!(
+            "workspace path pattern {pattern:?} escapes its root"
+        ));
+    }
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    let mut paths = vec![workspace_root.to_path_buf()];
+    for component in components {
+        if component
+            .chars()
+            .any(|character| matches!(character, '[' | ']' | '{' | '}' | '\\'))
+        {
+            return Err(format!("workspace path pattern {pattern:?} is unsupported"));
+        }
+        let mut next = Vec::new();
+        for parent in &paths {
+            if component.contains('*') || component.contains('?') {
+                let entries = fs::read_dir(parent).map_err(|error| {
+                    format!(
+                        "cannot read workspace member directory {}: {error}",
+                        parent.display()
+                    )
+                })?;
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        format!(
+                            "cannot inspect workspace member in {}: {error}",
+                            parent.display()
+                        )
+                    })?;
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else {
+                        return Err(format!(
+                            "workspace member directory {} contains a non-UTF-8 entry",
+                            parent.display()
+                        ));
+                    };
+                    if !wildcard_component_matches(&component, name) {
+                        continue;
+                    }
+                    let file_type = entry.file_type().map_err(|error| {
+                        format!(
+                            "cannot inspect workspace member {}: {error}",
+                            entry.path().display()
+                        )
+                    })?;
+                    if file_type.is_symlink() {
+                        return Err(format!(
+                            "workspace member path {} is a symlink",
+                            entry.path().display()
+                        ));
+                    }
+                    if file_type.is_dir() {
+                        next.push(entry.path());
+                    }
+                }
+            } else {
+                let candidate = parent.join(&component);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "workspace member path {} is a symlink",
+                            candidate.display()
+                        ))
+                    }
+                    Ok(metadata) if metadata.is_dir() => next.push(candidate),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound && !required => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot inspect workspace member path {}: {error}",
+                            candidate.display()
+                        ))
+                    }
+                }
+            }
+        }
+        paths = next;
+        if paths.is_empty() {
+            break;
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn ignored_name(name: &str, ignored_projects: &[String]) -> bool {
+    ignored_projects
+        .iter()
+        .any(|ignored| ignored.trim().eq_ignore_ascii_case(name.trim()))
+}
+
+/// Include workspace members that the normal walk intentionally skips, such
+/// as hidden packages. Also carry workspace ignore protection across a member
+/// that has an old local target, since cleaning the shared target would still
+/// discard that member's shared build outputs.
+fn augment_workspace_members(
+    groups: &mut BTreeMap<PathBuf, TargetGroup>,
+    workspaces: &[(PathBuf, Value)],
+    manifest_cache: &mut HashMap<PathBuf, Option<Value>>,
+    warned: &mut HashSet<PathBuf>,
+    ignored_projects: &[String],
+) {
+    for (workspace_root, workspace_manifest) in workspaces {
+        let Some(workspace_target) = real_build_dir(&workspace_root.join("target"), warned) else {
+            continue;
+        };
+        let workspace_key = match dunce::canonicalize(&workspace_target) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!(
+                    "Warning: cannot resolve workspace target {}: {}",
+                    crate::display::sanitize(&workspace_target.display().to_string()),
+                    crate::display::sanitize(&error.to_string())
+                );
+                continue;
+            }
+        };
+        if !groups.contains_key(&workspace_key) {
+            continue;
+        }
+        let resolved =
+            match resolve_workspace_members(workspace_root, workspace_manifest, manifest_cache) {
+                Ok(members) => members,
+                Err(error) => {
+                    if !ignored_projects.is_empty() {
+                        if let Some(group) = groups.get_mut(&workspace_key) {
+                            group.unresolved_workspace_member = true;
+                        }
+                    }
+                    eprintln!(
+                        "Warning: cannot certify workspace members for {}: {}",
+                        crate::display::sanitize(&workspace_root.display().to_string()),
+                        crate::display::sanitize(&error)
+                    );
+                    continue;
+                }
+            };
+        for (member_dir, member_manifest) in resolved {
+            let name = extract_project_name(&member_manifest, &member_dir);
+            let kind = detect_project_kind(&member_manifest, Some(workspace_manifest));
+            if ignored_name(&name, ignored_projects) {
+                if let Some(group) = groups.get_mut(&workspace_key) {
+                    group.ignored_workspace_member = true;
+                }
+            }
+
+            let member_target = real_build_dir(&member_dir.join("target"), warned)
+                .unwrap_or_else(|| workspace_target.clone());
+            let target_key = match dunce::canonicalize(&member_target) {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!(
+                        "Warning: cannot resolve member target {}: {}",
+                        crate::display::sanitize(&member_target.display().to_string()),
+                        crate::display::sanitize(&error.to_string())
+                    );
+                    continue;
+                }
+            };
+            let target_group = groups.entry(target_key).or_insert_with(|| TargetGroup {
+                owner: if member_target == workspace_target {
+                    workspace_root.clone()
+                } else {
+                    member_dir.clone()
+                },
+                target: member_target,
+                members: Vec::new(),
+                ignored_workspace_member: false,
+                unresolved_workspace_member: false,
+            });
+            target_group.members.push((name, kind));
+        }
+    }
 }
 
 /// Revalidate that a cleaner-supplied root is the Cargo project or workspace
@@ -728,8 +1235,8 @@ fn is_artifact_dir(entry: &walkdir::DirEntry) -> bool {
         return false;
     }
     let path = entry.path();
-    path.join("CACHEDIR.TAG").exists()
+    is_cargo_target_dir(path)
         || path
             .parent()
-            .is_some_and(|parent| parent.join("Cargo.toml").exists())
+            .is_some_and(|parent| open_regular_file_nofollow(&parent.join("Cargo.toml")).is_ok())
 }

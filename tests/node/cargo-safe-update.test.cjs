@@ -8,7 +8,7 @@ const { spawnSync } = require("node:child_process");
 const os = require("node:os");
 const path = require("node:path");
 const process = require("node:process");
-const { CARGO_SAFE_UPDATE_POLICY_VERSION, CARGO_SAFE_UPDATE_VERSION, MIN_PUBLISH_AGE_MS, acquireUpdateLock, crateIndexPath, filterRegistryIndex, findWorkspaceRoot, locateWorkspaceRoot, installValidatedLock, isPublishAgeAllowed, parseArguments, parsePublishTime, prepareCandidate, restoreRealLock, validateCandidate } = require("../../scripts/cargo-safe-update.cjs");
+const { CARGO_SAFE_UPDATE_POLICY_VERSION, CARGO_SAFE_UPDATE_VERSION, MIN_PUBLISH_AGE_MS, acquireUpdateLock, crateIndexPath, filterRegistryIndex, findWorkspaceRoot, locateWorkspaceRoot, installValidatedLock, isOutdatedLockedMetadataError, isPublishAgeAllowed, parseArguments, parseCargoLockPackages, parsePublishTime, prepareCandidate, restoreRealLock, validateCandidate } = require("../../scripts/cargo-safe-update.cjs");
 const { MINIMUM_NPM_VERSION, parseVersion, isVersionAtLeast, isSupportedNodeVersion, pinnedRustChannel, hasPinnedRustToolchain, npmUpdateArguments, npmAuditPlan, npmInvocation, npmUpdateInvocation, restoreSnapshot, usesWindowsCmdShell } = require("../../scripts/npm-safe-update.cjs");
 
 // Skip real Cargo integration tests if SKIP_CARGO_INTEGRATION=1
@@ -1527,6 +1527,63 @@ test("44. deceptive registry baseline cannot preserve a too-young release", () =
     now,
   );
   assert.equal(filtered, "");
+});
+
+test("47. stale lock baseline preserves exact package source identity", () => {
+  const packages = parseCargoLockPackages(`version = 4
+
+[[package]]
+name = "fixture"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.219"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "private-crate"
+version = "2.0.0"
+source = "registry+https://packages.example/index"
+`);
+
+  assert.deepEqual(packages, [
+    { name: "fixture", version: "0.1.0", source: null },
+    {
+      name: "serde",
+      version: "1.0.219",
+      source: "registry+https://github.com/rust-lang/crates.io-index",
+    },
+    {
+      name: "private-crate",
+      version: "2.0.0",
+      source: "registry+https://packages.example/index",
+    },
+  ]);
+});
+
+test("48. only the specific locked-manifest mismatch permits lock baseline fallback", () => {
+  assert.equal(
+    isOutdatedLockedMetadataError(
+      new Error("error: the lock file Cargo.lock needs to be updated but --locked was passed"),
+    ),
+    true,
+  );
+  assert.equal(
+    isOutdatedLockedMetadataError(
+      new Error(
+        "error: cannot update the lock file Cargo.lock because --locked was passed to prevent this",
+      ),
+    ),
+    true,
+  );
+  assert.equal(
+    isOutdatedLockedMetadataError(
+      new Error("failed to load source for dependency clap: DNS lookup failed"),
+    ),
+    false,
+  );
+  assert.throws(() => parseCargoLockPackages("version = 4\n"), /no package entries/);
 });
 
 test("45. update environment versions fail closed at exact boundaries", () => {

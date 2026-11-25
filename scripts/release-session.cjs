@@ -6,10 +6,34 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
-const releaseDir = path.join(root, 'release');
-const qualityPath = path.join(releaseDir, '.release-quality.json');
-const sessionPath = path.join(releaseDir, '.build-session.json');
+const releaseRoot = path.join(root, 'release');
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function releaseDirectory() {
+  const configured = process.env.DEOX_RELEASE_STAGE_DIR;
+  if (!configured) return releaseRoot;
+  const stage = path.resolve(configured);
+  const stagingRoot = path.join(releaseRoot, 'staging');
+  const relative = path.relative(stagingRoot, stage);
+  if (
+    !relative ||
+    relative === '..' ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative) ||
+    relative.includes(path.sep)
+  ) {
+    throw new Error('DEOX_RELEASE_STAGE_DIR must name one target directory under release/staging');
+  }
+  return stage;
+}
+
+function qualityPath() {
+  return path.join(releaseDirectory(), '.release-quality.json');
+}
+
+function sessionPath() {
+  return path.join(releaseDirectory(), '.build-session.json');
+}
 
 function command(name, args) {
   return execFileSync(name, args, {
@@ -64,7 +88,7 @@ function recordQualityGate(target) {
     ...currentIdentity(target),
     completedAt: Date.now(),
   };
-  writeJson(qualityPath, proof);
+  writeJson(qualityPath(), proof);
   return proof;
 }
 
@@ -99,7 +123,7 @@ function validateFresh(record, label, now = Date.now()) {
 
 function startSession(target) {
   const expected = currentIdentity(target);
-  const proof = readJson(qualityPath, 'Release quality gate');
+  const proof = readJson(qualityPath(), 'Release quality gate');
   validateFresh(proof, 'Release quality gate');
   validateIdentity(proof, expected, 'Release quality gate');
   const session = {
@@ -107,13 +131,13 @@ function startSession(target) {
     qualityCompletedAt: proof.completedAt,
     startedAt: Date.now(),
   };
-  writeJson(sessionPath, session);
+  writeJson(sessionPath(), session);
   return session;
 }
 
 function verifySession(target) {
   const expected = currentIdentity(target);
-  const session = readJson(sessionPath, 'Release build session');
+  const session = readJson(sessionPath(), 'Release build session');
   validateFresh(session, 'Release build session');
   validateIdentity(session, expected, 'Release build session');
   if (!Number.isFinite(session.qualityCompletedAt)) {
@@ -155,6 +179,9 @@ if (require.main === module) {
 module.exports = {
   MAX_AGE_MS,
   currentIdentity,
+  releaseDirectory,
+  readBuildSession: () => readJson(sessionPath(), 'Release build session'),
+  verifySession,
   validateFresh,
   validateIdentity,
 };

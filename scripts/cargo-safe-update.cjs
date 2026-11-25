@@ -218,6 +218,60 @@ function selectedPackages(metadata) {
   return packages.filter((pkg) => selected.has(pkg.id));
 }
 
+function parseCargoLockPackages(contents) {
+  if (typeof contents !== "string") {
+    throw new Error("Cargo.lock baseline must be text");
+  }
+  const sections = [...contents.matchAll(/^\[\[package\]\]\s*$/gmu)];
+  if (sections.length === 0) {
+    throw new Error("Cargo.lock baseline has no package entries");
+  }
+
+  return sections.map((section, index) => {
+    const start = section.index + section[0].length;
+    const end = sections[index + 1]?.index ?? contents.length;
+    const packageSection = contents.slice(start, end);
+    const fields = new Map();
+    for (const line of packageSection.split(/\r?\n/u)) {
+      if (/^dependencies\s*=/u.test(line)) break;
+      const field = /^(name|version|source)\s*=\s*("(?:[^"\\]|\\.)*")\s*$/u.exec(line);
+      if (!field) continue;
+      if (fields.has(field[1])) {
+        throw new Error(`Cargo.lock package repeats ${field[1]} field`);
+      }
+      try {
+        fields.set(field[1], JSON.parse(field[2]));
+      } catch (error) {
+        throw new Error(`Cargo.lock package has invalid ${field[1]} string`, {
+          cause: error,
+        });
+      }
+    }
+    const name = fields.get("name");
+    const version = fields.get("version");
+    const source = fields.has("source") ? fields.get("source") : null;
+    if (typeof name !== "string" || !name || typeof version !== "string" || !version) {
+      throw new Error("Cargo.lock package is missing its name or version");
+    }
+    if (source !== null && (typeof source !== "string" || !source)) {
+      throw new Error("Cargo.lock package has an invalid source");
+    }
+    return { name, version, source };
+  });
+}
+
+function isOutdatedLockedMetadataError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    /error: (?:the )?lock file\b[^\r\n]*needs to be updated but --locked was passed\b/i.test(
+      message,
+    ) ||
+    /error: cannot update the lock file\b[^\r\n]*--locked was passed\b/i.test(
+      message,
+    )
+  );
+}
+
 function packageKey(pkg) {
   return `${pkg.name}\u0000${pkg.version}\u0000${pkg.source ?? ""}`;
 }
@@ -859,10 +913,17 @@ async function main() {
       existed: existsSync(destinationLock),
       bytes: existsSync(destinationLock) ? readFileSync(destinationLock) : null,
     };
-    const baselineMetadata = originalLock.existed
-      ? cargoMetadata(parsed.cargoArgs, cwd, cargoEnv)
-      : null;
-    const baseline = baselineMetadata ? selectedPackages(baselineMetadata) : [];
+    let baselineMetadata = null;
+    let baseline = [];
+    if (originalLock.existed) {
+      try {
+        baselineMetadata = cargoMetadata(parsed.cargoArgs, cwd, cargoEnv);
+        baseline = selectedPackages(baselineMetadata);
+      } catch (error) {
+        if (!isOutdatedLockedMetadataError(error)) throw error;
+        baseline = parseCargoLockPackages(originalLock.bytes.toString("utf8"));
+      }
+    }
 
     const candidate = prepareCandidate({
       cargoArgs: parsed.cargoArgs,
@@ -975,4 +1036,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { CARGO_SAFE_UPDATE_POLICY_VERSION, CARGO_SAFE_UPDATE_VERSION, MIN_PUBLISH_AGE_MS, parseArguments, parsePublishTime, isPublishAgeAllowed, crateIndexPath, manifestPath, selectedPackages, cargoSupportsTemporaryLockfile, locateWorkspaceRoot, findWorkspaceRoot, prepareCandidate, filterRegistryIndex, validateCandidate, acquireUpdateLock, installValidatedLock, restoreRealLock };
+module.exports = { CARGO_SAFE_UPDATE_POLICY_VERSION, CARGO_SAFE_UPDATE_VERSION, MIN_PUBLISH_AGE_MS, parseArguments, parsePublishTime, isPublishAgeAllowed, crateIndexPath, manifestPath, selectedPackages, parseCargoLockPackages, isOutdatedLockedMetadataError, cargoSupportsTemporaryLockfile, locateWorkspaceRoot, findWorkspaceRoot, prepareCandidate, filterRegistryIndex, validateCandidate, acquireUpdateLock, installValidatedLock, restoreRealLock };

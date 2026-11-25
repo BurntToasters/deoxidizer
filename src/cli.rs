@@ -314,11 +314,12 @@ fn scan_or_exit(config: &Config, config_override: Option<&PathBuf>) -> Vec<Disco
         Ok(projects) => projects,
         Err(error) => {
             eprintln!(
-                "Scan failed for '{}' (config {}): {error}.",
+                "Scan failed for '{}' (config {}): {}.",
                 crate::display::sanitize(&config.projects_dir),
                 crate::display::sanitize(
                     &effective_config_path(config_override).display().to_string()
-                )
+                ),
+                crate::display::sanitize(&error.to_string())
             );
             std::process::exit(1);
         }
@@ -394,11 +395,12 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
         Ok(report) => report,
         Err(error) => {
             eprintln!(
-                "Scan failed for '{}' (config {}): {error}.",
+                "Scan failed for '{}' (config {}): {}.",
                 crate::display::sanitize(&config.projects_dir),
                 crate::display::sanitize(
                     &effective_config_path(config_override).display().to_string()
-                )
+                ),
+                display::sanitize(&error.to_string())
             );
             std::process::exit(1);
         }
@@ -423,9 +425,10 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
             Err(error) => {
                 errors += 1;
                 eprintln!(
-                    "Cannot measure {} ({}): {error}. Skipping it.",
+                    "Cannot measure {} ({}): {}. Skipping it.",
                     display::sanitize(&project.name),
-                    display::display_path(&project.path)
+                    display::display_path(&project.path),
+                    display::sanitize(&error.to_string())
                 );
                 failures.push(serde_json::json!({
                     "name": project.name,
@@ -459,7 +462,10 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
         {
             Ok(chosen) => chosen,
             Err(error) => {
-                eprintln!("Selection failed: {error}.");
+                eprintln!(
+                    "Selection failed: {}.",
+                    display::sanitize(&error.to_string())
+                );
                 std::process::exit(1);
             }
         };
@@ -503,29 +509,65 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
     }
 
     if args.dry_run {
+        let mut dry_bytes = 0u64;
+        let mut dry_errors = errors;
+        let mut entries = failures;
+        let mut would_clean = 0usize;
+        for (project, _) in &candidates {
+            let result =
+                cleaner::clean_project_with(project, &mode, &config.clean_behavior, &options);
+            let (label, bytes, message) = match &result {
+                CleanResult::Cleaned { bytes_freed } => {
+                    dry_bytes = dry_bytes.saturating_add(*bytes_freed);
+                    would_clean += 1;
+                    ("would-clean", *bytes_freed, None)
+                }
+                CleanResult::Skipped { reason } => ("skipped", 0, Some(reason.clone())),
+                CleanResult::Partial {
+                    bytes_freed,
+                    message,
+                } => {
+                    dry_bytes = dry_bytes.saturating_add(*bytes_freed);
+                    dry_errors += 1;
+                    ("partial", *bytes_freed, Some(message.clone()))
+                }
+                CleanResult::Error { message } => {
+                    dry_errors += 1;
+                    ("error", 0, Some(message.clone()))
+                }
+            };
+            if human {
+                match &result {
+                    CleanResult::Cleaned { bytes_freed } => println!(
+                        "  {} Would clean {} ({}) — {}",
+                        "[DRY RUN]".yellow().bold(),
+                        display::sanitize(&project.name),
+                        display::display_path(&project.path),
+                        format_size(*bytes_freed, BINARY).green()
+                    ),
+                    _ => display::print_clean_result(project, &result),
+                }
+            } else {
+                entries.push(serde_json::json!({
+                    "name": project.name,
+                    "path": project.path.to_string_lossy(),
+                    "result": label,
+                    "bytes": bytes,
+                    "message": message,
+                }));
+            }
+        }
         if human {
             println!(
                 "  {} Would free {} across {}.",
                 "[DRY RUN]".yellow().bold(),
-                format_size(total_estimate, BINARY).green().bold(),
-                project_count(candidates.len()),
+                format_size(dry_bytes, BINARY).green().bold(),
+                project_count(would_clean),
             );
         } else {
-            let mut entries: Vec<serde_json::Value> = candidates
-                .iter()
-                .map(|(p, bytes)| {
-                    serde_json::json!({
-                        "name": p.name,
-                        "path": p.path.to_string_lossy(),
-                        "result": "would-clean",
-                        "bytes": bytes,
-                    })
-                })
-                .collect();
-            entries.extend(failures);
-            print_clean_json(&mode, &config.clean_behavior, true, total_estimate, entries);
+            print_clean_json(&mode, &config.clean_behavior, true, dry_bytes, entries);
         }
-        exit_if_errors(errors, human);
+        exit_if_errors(dry_errors, human);
         return;
     }
 
@@ -555,7 +597,10 @@ fn run_clean(args: CleanArgs, config_override: Option<&PathBuf>) {
                 return;
             }
             Err(error) => {
-                eprintln!("Confirmation failed: {error}. Use --yes to clean without a prompt.");
+                eprintln!(
+                    "Confirmation failed: {}. Use --yes to clean without a prompt.",
+                    display::sanitize(&error.to_string())
+                );
                 std::process::exit(1);
             }
         }
@@ -677,8 +722,9 @@ fn run_inspect(args: InspectArgs) {
         }
         Err(error) => {
             eprintln!(
-                "Cannot resolve {}: {error}",
-                crate::display::sanitize(&args.project.display().to_string())
+                "Cannot resolve {}: {}",
+                crate::display::sanitize(&args.project.display().to_string()),
+                crate::display::sanitize(&error.to_string())
             );
             std::process::exit(1);
         }
@@ -699,8 +745,9 @@ fn run_inspect(args: InspectArgs) {
         Ok(projects) => projects,
         Err(error) => {
             eprintln!(
-                "Scan failed for '{}': {error}.",
-                crate::display::sanitize(&base.display().to_string())
+                "Scan failed for '{}': {}.",
+                crate::display::sanitize(&base.display().to_string()),
+                crate::display::sanitize(&error.to_string())
             );
             std::process::exit(1);
         }
@@ -751,7 +798,7 @@ fn retain_older_than(projects: &mut Vec<DiscoveredProject>, days: u32) {
 /// config already loaded, so emptiness/overflow must come from the flags.
 fn apply_scan_overrides(config: &mut Config, path: Option<&String>, min_size: Option<u64>) {
     if let Some(path) = path {
-        if path.trim().is_empty() {
+        if path.is_empty() {
             eprintln!("Invalid --path: must not be empty.");
             std::process::exit(2);
         }
@@ -776,7 +823,10 @@ fn project_count(count: usize) -> String {
 }
 
 fn exit_with_config_error(error: ConfigError) -> ! {
-    eprintln!("Configuration error: {error}");
+    eprintln!(
+        "Configuration error: {}",
+        crate::display::sanitize(&error.to_string())
+    );
     std::process::exit(1);
 }
 

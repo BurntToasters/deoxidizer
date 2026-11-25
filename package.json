@@ -42,7 +42,7 @@
     "release:verify:draft": "node scripts/verify-release-draft.cjs",
     "release:upload": "node scripts/release.cjs --upload-only",
     "release:publish": "node scripts/publish-release.cjs",
-    "release:sign": "bash scripts/gpg-sign.sh release",
+    "release:sign": "node scripts/minisign-sign.cjs",
     "test:release": "node --test tests/node/release-tools.test.cjs tests/node/sync-version.test.cjs tests/node/cargo-safe-update.test.cjs tests/node/check-cargo-update-policy.test.cjs"
   }
 }

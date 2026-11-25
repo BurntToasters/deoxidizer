@@ -9,6 +9,17 @@ const packageLockPath = path.join(root, 'package-lock.json');
 const cargoPath = path.join(root, 'Cargo.toml');
 const cargoLockPath = path.join(root, 'Cargo.lock');
 const changelogPath = path.join(root, 'CHANGELOG.md');
+const RELEASE_REPOSITORY = 'https://github.com/BurntToasters/deoxidizer';
+const RELEASE_ASSET_SUFFIXES = [
+  'windows-x86_64.zip',
+  'windows-aarch64.zip',
+  'darwin-x86_64.tar.gz',
+  'darwin-aarch64.tar.gz',
+  'linux-x86_64.tar.gz',
+  'linux-aarch64.tar.gz',
+  'windows-x86_64-setup.exe',
+  'windows-aarch64-setup.exe',
+];
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -76,8 +87,51 @@ function updatePackageLock(lockfile, version) {
   return `${JSON.stringify(lock, null, 2)}\n`;
 }
 
+function releaseAssetNames(version) {
+  return RELEASE_ASSET_SUFFIXES.map((suffix) => `deoxidizer-v${version}-${suffix}`);
+}
+
+function changelogTableBounds(changelog) {
+  const tableStart = changelog.indexOf('# ⬇️ Downloads');
+  const tableEnd = changelog.indexOf('\n> [!IMPORTANT]', tableStart);
+  if (tableStart < 0 || tableEnd <= tableStart) return null;
+  return { tableStart, tableEnd };
+}
+
+function validateChangelogReleaseLinks(changelog, version) {
+  const bounds = changelogTableBounds(changelog);
+  if (!bounds) {
+    return [
+      "CHANGELOG.md download table markers not found (expected '# ⬇️ Downloads' followed by '\\n> [!IMPORTANT]')",
+    ];
+  }
+
+  const table = changelog.slice(bounds.tableStart, bounds.tableEnd);
+  const actualUrls = Array.from(
+    table.matchAll(/\]\((https:\/\/github\.com\/BurntToasters\/deoxidizer\/releases\/download\/[^)\s]+)\)/g),
+    (match) => match[1],
+  );
+  const base = `${RELEASE_REPOSITORY}/releases/download/v${version}`;
+  const expectedUrls = releaseAssetNames(version).map((asset) => `${base}/${asset}`);
+  const errors = [];
+
+  for (const expectedUrl of expectedUrls) {
+    const count = actualUrls.filter((url) => url === expectedUrl).length;
+    if (count === 0) errors.push(`missing canonical release URL: ${expectedUrl}`);
+    if (count > 1) errors.push(`canonical release URL must appear exactly once (${count} found): ${expectedUrl}`);
+  }
+  for (const actualUrl of actualUrls) {
+    if (!expectedUrls.includes(actualUrl)) {
+      errors.push(`non-canonical release URL (tag and basename must match v${version}): ${actualUrl}`);
+    }
+  }
+  if (actualUrls.length !== expectedUrls.length) {
+    errors.push(`download table must contain exactly ${expectedUrls.length} canonical release URLs; found ${actualUrls.length}`);
+  }
+  return errors;
+}
+
 function updateChangelog(changelog, fromVersion, toVersion) {
-  if (fromVersion === toVersion) return changelog;
   const oldHeading = `## Changes in \`v${fromVersion}:\``;
   const newHeading = `## Changes in \`v${toVersion}:\``;
   if (!changelog.includes(oldHeading)) {
@@ -88,21 +142,33 @@ function updateChangelog(changelog, fromVersion, toVersion) {
     );
   }
 
-  const tableStart = changelog.indexOf('# ⬇️ Downloads');
-  const tableEnd = changelog.indexOf('\n> [!IMPORTANT]', tableStart);
-  if (tableStart < 0 || tableEnd <= tableStart) {
+  const currentLinkErrors = validateChangelogReleaseLinks(changelog, fromVersion);
+  if (currentLinkErrors.length > 0) {
     throw new Error(
-      "CHANGELOG.md download table markers not found (expected '# ⬇️ Downloads' " +
-        `followed by '\\n> [!IMPORTANT]'). CHANGELOG head: ${JSON.stringify(changelog.slice(0, 200))}`,
+      `CHANGELOG.md release links are not canonical for v${fromVersion}: ${currentLinkErrors.join('; ')}`,
     );
   }
-  const table = changelog.slice(tableStart, tableEnd).replace(
-    /\/releases\/download\/v[^/]+\//g,
-    `/releases/download/v${toVersion}/`,
-  );
-  return `${changelog.slice(0, tableStart)}${table}${changelog
+  if (fromVersion === toVersion) return changelog;
+
+  const { tableStart, tableEnd } = changelogTableBounds(changelog);
+  const oldBase = `${RELEASE_REPOSITORY}/releases/download/v${fromVersion}`;
+  const newBase = `${RELEASE_REPOSITORY}/releases/download/v${toVersion}`;
+  let table = changelog.slice(tableStart, tableEnd);
+  for (const oldAsset of releaseAssetNames(fromVersion)) {
+    const newAsset = oldAsset.replace(`v${fromVersion}-`, `v${toVersion}-`);
+    table = table.replace(`${oldBase}/${oldAsset}`, `${newBase}/${newAsset}`);
+  }
+
+  const updated = `${changelog.slice(0, tableStart)}${table}${changelog
     .slice(tableEnd)
     .replace(oldHeading, newHeading)}`;
+  const updatedLinkErrors = validateChangelogReleaseLinks(updated, toVersion);
+  if (updatedLinkErrors.length > 0) {
+    throw new Error(
+      `CHANGELOG.md release links could not be updated to v${toVersion}: ${updatedLinkErrors.join('; ')}`,
+    );
+  }
+  return updated;
 }
 
 function syncVersion(versionArgument, rootOverride) {
@@ -157,10 +223,12 @@ if (require.main === module) {
 module.exports = {
   cargoVersion,
   isPrerelease,
+  releaseAssetNames,
   syncVersion,
   updateCargoLock,
   updateCargoToml,
   updateChangelog,
   updatePackageLock,
+  validateChangelogReleaseLinks,
   validateVersion,
 };

@@ -9,10 +9,10 @@
     Usage:
       irm https://raw.githubusercontent.com/BurntToasters/deoxidizer/main/install.ps1 | iex
 
-    Authenticity: both binaries must carry a valid Authenticode signature
-    from the expected publisher, and the archive must match its entry in
-    the release SHA256 manifest. When gpg.exe is available, the manifest's
-    detached signature is also verified against the pinned release key.
+    Authenticity: the raw Minisign signature over the SHA256 manifest is
+    verified with the pinned public key, both binaries must carry a valid
+    Authenticode signature from the expected publisher, and the archive must
+    match its entry in the release manifest.
 #>
 [CmdletBinding()]
 param(
@@ -26,7 +26,7 @@ param(
     $ErrorActionPreference = 'Stop'
 
     $Repo = 'BurntToasters/deoxidizer'
-    $ReleaseKeyFingerprint = 'CAEB45D4747E73FA11A9CBF7619A06F3F2FBC20F'
+    $ReleaseMinisignPublicKey = "untrusted comment: minisign public key: 083B254A48C428E3`nRWTjKMRISiU7CDbPKID/yjE1xQvWSbhYFjDF3xgaJCAqOiO7IPffxndk`n"
     # Must equal the Authenticode certificate's simple name (the
     # AZURE_ARTIFACT_SIGNING_PUBLISHER value used when signing releases).
     $ExpectedWindowsPublisher = 'BurntToasters'
@@ -57,28 +57,14 @@ param(
 
     function Test-ManifestSignature {
         param([string]$ChecksumPath, [string]$Tag, [string]$ChecksumName)
-        $gpg = Get-Command gpg.exe -ErrorAction SilentlyContinue
-        if (-not $gpg) {
-            Write-Host '  gpg.exe not found; relying on Authenticode + SHA256 verification.'
-            return
-        }
-        $keyPath = Join-Path $stagingRoot 'release-signing-key.asc'
-        $keyringPath = Join-Path $stagingRoot 'release-keyring.gpg'
-        $gnupgHome = Join-Path $stagingRoot 'gnupg'
-        New-Item -ItemType Directory -Path $gnupgHome -Force | Out-Null
-        $signaturePath = "$ChecksumPath.asc"
-        Invoke-DownloadWithRetry -Uri "https://raw.githubusercontent.com/$Repo/main/release-signing-key.asc" -OutFile $keyPath
-        $fingerprint = (& $gpg.Source --homedir $gnupgHome --batch --show-keys --with-colons $keyPath |
-            Where-Object { $_ -like 'fpr:*' } |
-            Select-Object -First 1).Split(':')[9].ToUpperInvariant()
-        if ($fingerprint -ne $ReleaseKeyFingerprint) { throw 'release signing key fingerprint mismatch' }
-        & $gpg.Source --homedir $gnupgHome --batch --yes --dearmor --output $keyringPath $keyPath
-        if ($LASTEXITCODE -ne 0) { throw 'cannot load release signing key' }
-        Invoke-DownloadWithRetry -Uri "https://github.com/$Repo/releases/download/$Tag/$ChecksumName.asc" -OutFile $signaturePath
-        $status = & $gpg.Source --homedir $gnupgHome --batch --no-options --no-default-keyring --keyring $keyringPath --status-fd 1 --verify $signaturePath $ChecksumPath 2> $null
-        if ($LASTEXITCODE -ne 0 -or -not ($status -match "^\[GNUPG:\] VALIDSIG $ReleaseKeyFingerprint ")) {
-            throw 'checksum manifest signature verification failed'
-        }
+        $minisign = Get-Command minisign.exe -ErrorAction SilentlyContinue
+        if (-not $minisign) { throw 'minisign.exe is required to authenticate the release' }
+        $keyPath = Join-Path $stagingRoot 'release-signing-key.pub'
+        $signaturePath = "$ChecksumPath.minisig"
+        [IO.File]::WriteAllText($keyPath, $ReleaseMinisignPublicKey, [Text.UTF8Encoding]::new($false))
+        Invoke-DownloadWithRetry -Uri "https://github.com/$Repo/releases/download/$Tag/$ChecksumName.minisig" -OutFile $signaturePath
+        & $minisign.Source -V -m $ChecksumPath -x $signaturePath -p $keyPath
+        if ($LASTEXITCODE -ne 0) { throw 'checksum manifest signature verification failed' }
         Write-Host '  Checksum manifest signature verified.'
     }
 
@@ -111,7 +97,225 @@ public static extern IntPtr SendMessageTimeout(
         Write-Host 'Added to user PATH (new terminals will have deoxidizer available)' -ForegroundColor Green
     }
 
+    function Get-RealFileState {
+        param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Label)
+        try {
+            $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        } catch {
+            if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
+                return $false
+            }
+            throw
+        }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Label is a reparse point: $Path"
+        }
+        if ($item.PSIsContainer) {
+            throw "$Label is a directory: $Path"
+        }
+        return $true
+    }
+
+    function Get-FileDigest {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+    }
+
+    function Write-AtomicRecoveryState {
+        param([Parameter(Mandatory = $true)][string]$RecoveryDir, [Parameter(Mandatory = $true)]$State)
+        $statePath = Join-Path $RecoveryDir 'state.json'
+        $tempPath = Join-Path $RecoveryDir ('state.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($State | ConvertTo-Json -Compress))
+        $stream = [IO.File]::Open($tempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        } finally {
+            $stream.Dispose()
+        }
+        if ([IO.File]::Exists($statePath)) {
+            [IO.File]::Replace($tempPath, $statePath, $null)
+        } else {
+            [IO.File]::Move($tempPath, $statePath)
+        }
+    }
+
+    function Recover-InstallTransaction {
+        $recoveryPath = Join-Path $InstallDir '.deoxidizer-install-recovery'
+        try {
+            $recovery = Get-Item -LiteralPath $recoveryPath -Force -ErrorAction Stop
+        } catch {
+            if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
+                return
+            }
+            throw
+        }
+        if (($recovery.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $recovery.PSIsContainer) {
+            throw "Install recovery path is not a real directory: $recoveryPath"
+        }
+        $statePath = Join-Path $recoveryPath 'state.json'
+        if (-not (Get-RealFileState -Path $statePath -Label 'Install recovery state')) {
+            throw 'Install recovery state is missing; refusing to alter installed binaries'
+        }
+        $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        if ($state.schema_version -ne 1 -or $state.phase -notin @('prepared', 'committed')) {
+            throw 'Install recovery state is malformed; refusing to alter installed binaries'
+        }
+        if ($state.phase -eq 'committed') {
+            Remove-Item -LiteralPath $recoveryPath -Recurse -Force
+            return
+        }
+
+        foreach ($binary in @('deoxidizer.exe', 'deox.exe')) {
+            $hadOriginal = if ($binary -eq 'deoxidizer.exe') { [bool]$state.hadDeoxidizer } else { [bool]$state.hadDeox }
+            $expectedNewHash = if ($binary -eq 'deoxidizer.exe') { [string]$state.newDeoxidizerHash } else { [string]$state.newDeoxHash }
+            $expectedOldHash = if ($binary -eq 'deoxidizer.exe') { [string]$state.oldDeoxidizerHash } else { [string]$state.oldDeoxHash }
+            if ($expectedNewHash -notmatch '^[A-Fa-f0-9]{64}$' -or ($hadOriginal -and $expectedOldHash -notmatch '^[A-Fa-f0-9]{64}$')) {
+                throw "Install recovery hashes are malformed: $binary"
+            }
+            $destination = Join-Path $InstallDir $binary
+            $destinationExists = Get-RealFileState -Path $destination -Label 'Install destination'
+            if ($hadOriginal) {
+                $backup = Join-Path $recoveryPath ($binary + '.backup')
+                if (-not (Get-RealFileState -Path $backup -Label 'Install recovery backup')) {
+                    throw "Install recovery backup is missing: $binary"
+                }
+                if ((Get-FileDigest -Path $backup) -ne $expectedOldHash) {
+                    throw "Install recovery backup hash mismatch: $binary"
+                }
+                if ($destinationExists) {
+                    $currentHash = Get-FileDigest -Path $destination
+                    if ($currentHash -eq $expectedOldHash) { continue }
+                    if ($currentHash -ne $expectedNewHash) {
+                        throw "Install destination changed during recovery: $binary"
+                    }
+                }
+                $restore = Join-Path $InstallDir ('.deoxidizer-restore-' + [Guid]::NewGuid().ToString('N'))
+                [IO.File]::Copy($backup, $restore, $false)
+                if ($destinationExists) {
+                    [IO.File]::Replace($restore, $destination, $null)
+                } else {
+                    [IO.File]::Move($restore, $destination)
+                }
+            } elseif ($destinationExists) {
+                if ((Get-FileDigest -Path $destination) -ne $expectedNewHash) {
+                    throw "Unexpected file appeared at install destination during recovery: $binary"
+                }
+                [IO.File]::Delete($destination)
+            }
+        }
+        Remove-Item -LiteralPath $recoveryPath -Recurse -Force
+    }
+
+    function Install-BinaryPair {
+        param([Parameter(Mandatory = $true)][string]$StagingRoot)
+        $binaryNames = @('deoxidizer.exe', 'deox.exe')
+        $destinations = @{}
+        $hadOriginal = @{}
+        $oldHashes = @{}
+        $newHashes = @{}
+        foreach ($binary in $binaryNames) {
+            $staged = Join-Path $StagingRoot $binary
+            if (-not (Get-RealFileState -Path $staged -Label 'Staged binary')) {
+                throw "Staged binary missing: $binary"
+            }
+            $destination = Join-Path $InstallDir $binary
+            $destinations[$binary] = $destination
+            $hadOriginal[$binary] = Get-RealFileState -Path $destination -Label 'Install destination'
+            if ($hadOriginal[$binary]) {
+                $destinationItem = Get-Item -LiteralPath $destination -Force -ErrorAction Stop
+                if (($destinationItem.Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+                    throw "Install destination is read-only: $binary"
+                }
+                $oldHashes[$binary] = Get-FileDigest -Path $destination
+            } else {
+                $oldHashes[$binary] = ''
+            }
+        }
+
+        $recoveryPath = Join-Path $InstallDir '.deoxidizer-install-recovery'
+        if (Test-Path -LiteralPath $recoveryPath) {
+            throw 'An install recovery transaction is already present'
+        }
+        $workPath = Join-Path $InstallDir ('.deoxidizer-install-stage-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $workPath | Out-Null
+        try {
+            foreach ($binary in $binaryNames) {
+                Copy-Item -LiteralPath (Join-Path $StagingRoot $binary) -Destination (Join-Path $workPath ($binary + '.new'))
+                $newHashes[$binary] = Get-FileDigest -Path (Join-Path $workPath ($binary + '.new'))
+                if ($hadOriginal[$binary]) {
+                    Copy-Item -LiteralPath $destinations[$binary] -Destination (Join-Path $workPath ($binary + '.backup'))
+                    if ((Get-FileDigest -Path (Join-Path $workPath ($binary + '.backup'))) -ne $oldHashes[$binary]) {
+                        throw "Install destination changed while staging: $binary"
+                    }
+                }
+            }
+            $state = [ordered]@{
+                schema_version = 1
+                phase = 'prepared'
+                hadDeoxidizer = [bool]$hadOriginal['deoxidizer.exe']
+                hadDeox = [bool]$hadOriginal['deox.exe']
+                oldDeoxidizerHash = [string]$oldHashes['deoxidizer.exe']
+                oldDeoxHash = [string]$oldHashes['deox.exe']
+                newDeoxidizerHash = [string]$newHashes['deoxidizer.exe']
+                newDeoxHash = [string]$newHashes['deox.exe']
+            }
+            Write-AtomicRecoveryState -RecoveryDir $workPath -State $state
+            [IO.Directory]::Move($workPath, $recoveryPath)
+        } catch {
+            if (Test-Path -LiteralPath $workPath) {
+                Remove-Item -LiteralPath $workPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            throw
+        }
+
+        try {
+            foreach ($binary in $binaryNames) {
+                $newFile = Join-Path $recoveryPath ($binary + '.new')
+                $destination = $destinations[$binary]
+                $nowExists = Get-RealFileState -Path $destination -Label 'Install destination'
+                if ($nowExists -ne $hadOriginal[$binary]) {
+                    throw "Install destination changed during transaction: $binary"
+                }
+                if ($nowExists -and (Get-FileDigest -Path $destination) -ne $oldHashes[$binary]) {
+                    throw "Install destination content changed during transaction: $binary"
+                }
+                if ($hadOriginal[$binary]) {
+                    [IO.File]::Replace($newFile, $destination, $null)
+                } else {
+                    [IO.File]::Move($newFile, $destination)
+                }
+            }
+            $state['phase'] = 'committed'
+            Write-AtomicRecoveryState -RecoveryDir $recoveryPath -State $state
+        } catch {
+            $installError = $_
+            try {
+                Recover-InstallTransaction
+            } catch {
+                throw "Binary pair install failed and rollback is pending: $installError; $($_.Exception.Message)"
+            }
+            throw $installError
+        }
+        Remove-Item -LiteralPath $recoveryPath -Recurse -Force
+    }
+
     try {
+        try {
+            $installDirectory = Get-Item -LiteralPath $InstallDir -Force -ErrorAction Stop
+        } catch {
+            if ($_.CategoryInfo.Category -ne [System.Management.Automation.ErrorCategory]::ObjectNotFound) { throw }
+            $installDirectory = $null
+        }
+        if (-not $installDirectory) {
+            New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+            $installDirectory = Get-Item -LiteralPath $InstallDir -Force -ErrorAction Stop
+        }
+        if (($installDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $installDirectory.PSIsContainer) {
+            throw "Install directory is not a real directory: $InstallDir"
+        }
+        Recover-InstallTransaction
+
         if ($FromSource) {
             $repoRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
             $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot 'target' }
@@ -179,16 +383,9 @@ public static extern IntPtr SendMessageTimeout(
             Copy-Item (Join-Path $stagingExtract 'deox.exe') (Join-Path $stagingRoot 'deox.exe') -Force
         }
 
-        if (-not (Test-Path $InstallDir)) {
-            New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-        }
         foreach ($binary in @('deoxidizer.exe', 'deox.exe')) {
             $staged = Join-Path $stagingRoot $binary
-            if (-not (Test-Path $staged)) { throw "Staged binary missing: $binary" }
             $stagedItem = Get-Item -LiteralPath $staged
-            if (($stagedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Staged binary is a reparse point: $binary"
-            }
             if (-not $FromSource) {
                 $signature = Get-AuthenticodeSignature -LiteralPath $staged
                 if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
@@ -203,15 +400,8 @@ public static extern IntPtr SendMessageTimeout(
                     throw "Unexpected Authenticode publisher for ${binary}: $publisher"
                 }
             }
-            $destination = Join-Path $InstallDir $binary
-            if (Test-Path -LiteralPath $destination) {
-                $destinationItem = Get-Item -LiteralPath $destination -Force
-                if (($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    throw "Install destination is a reparse point: $binary"
-                }
-            }
-            Move-Item -LiteralPath $staged -Destination $destination -Force
         }
+        Install-BinaryPair -StagingRoot $stagingRoot
     } finally {
         if (Test-Path $stagingRoot) {
             Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -2,7 +2,7 @@
 // signature with the same in-process verifier that `deox --update` uses.
 // Invoked by scripts/verify-release.cjs; not a user-facing tool.
 //
-// Usage: cargo run --locked --example verify_release_manifest -- <manifest> <manifest>.asc
+// Usage: cargo run --locked --example verify_release_manifest -- <manifest> <manifest>.minisig
 
 use std::process::ExitCode;
 

@@ -16,8 +16,15 @@ const {
   buildEnvironment,
   verificationEnvironment,
   windowsFileVersion,
+  releaseStageDirectory,
+  npmReleaseInvocation,
+  acquireStageLock,
 } = require('../../scripts/release.cjs');
-const { githubCliEnvironment } = require('../../scripts/github-cli.cjs');
+const {
+  githubCliEnvironment,
+  releaseMutationLockRef,
+  validateExistingReleaseAsset,
+} = require('../../scripts/github-cli.cjs');
 const {
   archiveEntries,
   verifyZipIntegrity,
@@ -25,6 +32,12 @@ const {
   verifyChecksum,
   validateRemoteAssetNames,
   validateRemoteManifestEntries,
+  validateRemoteAssetDigests,
+  validateRemoteSignaturePairs,
+  validateNativeProof,
+  signaturePath,
+  makeReleaseSnapshot,
+  assertSameReleaseSnapshot,
 } = require('../../scripts/verify-release.cjs');
 const { validateFresh, validateIdentity } = require('../../scripts/release-session.cjs');
 const { requireConfirmation, parseArgs } = require('../../scripts/branch-sync.cjs');
@@ -32,15 +45,394 @@ const { requireConfirmation: requireViConfirmation } = require('../../scripts/vi
 const {
   requireConfirmation: requirePruneConfirmation,
 } = require('../../scripts/git-prune.cjs');
-const { expectedFingerprint } = require('../../scripts/check-release-key.cjs');
+const { parsePublicKey, validateKeyPins } = require('../../scripts/check-release-key.cjs');
+const {
+  decodeTauriSignature,
+  signerInvocation,
+  minisignEnvironment,
+} = require('../../scripts/minisign-sign.cjs');
 const { isPrerelease } = require('../../scripts/sync-version.cjs');
 const {
   expectedReleaseAssets,
   validateDraft,
+  peelTagCommit,
   tag,
   prerelease,
 } = require('../../scripts/verify-release-draft.cjs');
 const { releaseNotes } = require('../../scripts/ensure-draft-release.cjs');
+
+// Failure modes covered before implementation:
+// - parallel targets clear or reuse another target's staging/session files;
+// - unsigned, ad-hoc, unnotarized, or untimestamped native stages pass upload;
+// - proof metadata is stale or its binary/installer digests do not match bytes;
+// - Windows npm .cmd assumptions break direct Node release invocation;
+// - a missing/false remote digest or missing detached signature bypasses binding;
+// - annotated or divergent tag refs differ from the candidate commit;
+// - a remote release ID or asset snapshot changes between verification/publish.
+
+test('all six targets receive isolated staging directories', () => {
+  const directories = Object.entries(TARGETS).flatMap(([osName, arches]) =>
+    Object.values(arches).map((target) => releaseStageDirectory(target, '/release-root')),
+  );
+  assert.equal(directories.length, 6);
+  assert.equal(new Set(directories).size, 6);
+  assert.ok(directories.every((directory) => directory.startsWith('/release-root/staging/')));
+});
+
+test('same-target builders serialize through an exclusive staging lock', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-release-lock-test-'));
+  const stage = path.join(directory, 'staging', TARGETS.linux.x86_64);
+  const first = acquireStageLock(stage);
+  try {
+    assert.throws(() => acquireStageLock(stage), /locked|another build/i);
+  } finally {
+    first();
+  }
+  const second = acquireStageLock(stage);
+  second();
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('an existing remote asset is reusable only when its immutable bytes match', () => {
+  const expected = {
+    name: 'artifact.tar.gz',
+    size: 17,
+    digest: `sha256:${'a'.repeat(64)}`,
+  };
+  assert.equal(validateExistingReleaseAsset(expected, expected), true);
+  assert.throws(
+    () =>
+      validateExistingReleaseAsset(expected, {
+        ...expected,
+        digest: `sha256:${'b'.repeat(64)}`,
+      }),
+    /immutable|differs|mismatch/i,
+  );
+});
+
+test('Windows release npm invocation uses the active Node executable and npm CLI', () => {
+  const execPath = 'C:\\Program Files\\nodejs\\node.exe';
+  const npmExecPath = 'C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js';
+  assert.deepEqual(
+    npmReleaseInvocation({
+      env: { npm_execpath: npmExecPath },
+      platform: 'win32',
+      execPath,
+    }),
+    { command: execPath, args: [npmExecPath] },
+  );
+});
+
+test('release GitHub token is available only to explicitly authenticated gh calls', () => {
+  const environment = { GH_TOKEN: 'secret', GITHUB_TOKEN: 'secret', PATH: '/bin' };
+  const scrubbed = githubCliEnvironment(environment);
+  assert.equal(scrubbed.GH_TOKEN, undefined);
+  assert.equal(scrubbed.GITHUB_TOKEN, undefined);
+  const upload = githubCliEnvironment(environment, { allowEnvironmentToken: true });
+  assert.equal(upload.GH_TOKEN, 'secret');
+  assert.equal(upload.GITHUB_TOKEN, 'secret');
+});
+
+test('release mutation lock ref is deterministic and version scoped', () => {
+  assert.equal(releaseMutationLockRef('v1.2.3'), 'refs/heads/deoxidizer-release-lock-v1.2.3');
+  assert.throws(() => releaseMutationLockRef('../other'), /tag|release/i);
+});
+
+test('native proof binds platform evidence to staged bytes and release identity', () => {
+  const commit = 'a'.repeat(40);
+  const binaries = { deoxidizer: 'b'.repeat(64), deox: 'c'.repeat(64) };
+  const mac = {
+    schema_version: 1,
+    target: 'aarch64-apple-darwin',
+    commit,
+    platform: 'darwin',
+    artifacts: binaries,
+    native: {
+      mechanism: 'codesign',
+      signature_verified: true,
+      timestamp_verified: true,
+      team_id: 'TEAM123',
+      notarization: {
+        status: 'Accepted',
+        submissions: [
+          { asset: 'deoxidizer', submission_id: 'notary-id-one' },
+          { asset: 'deox', submission_id: 'notary-id-two' },
+        ],
+      },
+    },
+  };
+  assert.doesNotThrow(() =>
+    validateNativeProof(mac, {
+      target: mac.target,
+      commit,
+      platform: 'darwin',
+      binaries,
+    }),
+  );
+  assert.throws(
+    () =>
+      validateNativeProof(
+        { ...mac, native: { ...mac.native, timestamp_verified: false } },
+        { target: mac.target, commit, platform: 'darwin', binaries },
+      ),
+    /timestamp/i,
+  );
+  assert.throws(
+    () =>
+      validateNativeProof(
+        { ...mac, native: { ...mac.native, notarization: { status: 'skipped', submissions: [] } } },
+        { target: mac.target, commit, platform: 'darwin', binaries },
+      ),
+    /notar/i,
+  );
+  assert.throws(
+    () =>
+      validateNativeProof(mac, {
+        target: mac.target,
+        commit: 'd'.repeat(40),
+        platform: 'darwin',
+        binaries,
+      }),
+    /commit/i,
+  );
+  assert.throws(
+    () =>
+      validateNativeProof(mac, {
+        target: mac.target,
+        commit,
+        platform: 'darwin',
+        binaries: { ...binaries, deoxidizer: '0'.repeat(64) },
+      }),
+    /digest|hash|artifact/i,
+  );
+});
+
+test('Windows native proof requires timestamped Authenticode and binds installer bytes', () => {
+  const installerName = `deoxidizer-v${packageManifest.version}-windows-x86_64-setup.exe`;
+  const installerDigest = 'd'.repeat(64);
+  const proof = {
+    schema_version: 1,
+    target: 'x86_64-pc-windows-msvc',
+    commit: 'a'.repeat(40),
+    platform: 'windows',
+    artifacts: { deoxidizer: 'b'.repeat(64), deox: 'c'.repeat(64) },
+    installer: { name: installerName, sha256: installerDigest },
+    native: {
+      mechanism: 'authenticode',
+      signature_verified: true,
+      timestamp_verified: true,
+      publisher: 'Deoxidizer Publisher',
+      subject: 'CN=Deoxidizer Publisher',
+    },
+  };
+  const expected = {
+    target: proof.target,
+    commit: proof.commit,
+    platform: 'windows',
+    binaries: proof.artifacts,
+    associatedAssets: new Map([[installerName, installerDigest]]),
+  };
+  assert.doesNotThrow(() => validateNativeProof(proof, expected));
+  assert.throws(
+    () => validateNativeProof({ ...proof, native: { ...proof.native, timestamp_verified: false } }, expected),
+    /timestamp/i,
+  );
+  assert.throws(
+    () =>
+      validateNativeProof(proof, {
+        ...expected,
+        associatedAssets: new Map([[installerName, '0'.repeat(64)]]),
+      }),
+    /installer|digest|hash/i,
+  );
+});
+
+test('Linux proof is explicit and still binds both binary digests', () => {
+  const proof = {
+    schema_version: 1,
+    target: 'x86_64-unknown-linux-musl',
+    commit: 'a'.repeat(40),
+    platform: 'linux',
+    artifacts: { deoxidizer: 'b'.repeat(64), deox: 'c'.repeat(64) },
+    native: { mechanism: 'none', status: 'not-required' },
+  };
+  assert.doesNotThrow(() =>
+    validateNativeProof(proof, {
+      target: proof.target,
+      commit: proof.commit,
+      platform: 'linux',
+      binaries: proof.artifacts,
+    }),
+  );
+});
+
+test('remote verification requires streamed hashes and a signature for every asset', () => {
+  const digest = 'a'.repeat(64);
+  const assets = [
+    { id: 1, name: 'archive.tar.gz', size: 3, digest: `sha256:${digest}` },
+    { id: 2, name: 'archive.tar.gz.minisig', size: 2 },
+  ];
+  const downloaded = new Map([
+    ['archive.tar.gz', `sha256:${digest}`],
+    ['archive.tar.gz.minisig', `sha256:${'b'.repeat(64)}`],
+  ]);
+  assert.deepEqual(validateRemoteAssetDigests(assets, downloaded), []);
+  assert.match(
+    validateRemoteAssetDigests(assets, new Map([['archive.tar.gz', `sha256:${digest}`]])).join('\n'),
+    /streamed.*hash|download/i,
+  );
+  assert.match(
+    validateRemoteAssetDigests(
+      [{ ...assets[0], digest: 'sha1:bad' }, assets[1]],
+      downloaded,
+    ).join('\n'),
+    /invalid.*digest|sha256/i,
+  );
+  assert.deepEqual(validateRemoteSignaturePairs(assets), []);
+  assert.match(validateRemoteSignaturePairs([assets[0]]).join('\n'), /signature/i);
+});
+
+test('release signatures use one centralized filename rule', () => {
+  assert.equal(signaturePath('/tmp/artifact'), '/tmp/artifact.minisig');
+});
+
+test('Tauri signer wrapper decodes to raw Minisign bytes and secrets stay in environment', () => {
+  const raw = Buffer.from(
+    'untrusted comment: signature from tauri secret key\n' +
+      'RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\n' +
+      'trusted comment: timestamp:1556193335\tfile:test\n' +
+      'y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg==\n',
+  );
+  assert.deepEqual(decodeTauriSignature(Buffer.from(raw).toString('base64')), raw);
+  assert.throws(() => decodeTauriSignature('%%%not base64%%%'), /base64|signature/i);
+  assert.throws(() => decodeTauriSignature(Buffer.from('not a Minisign signature').toString('base64')), /signature|format/i);
+  const invocation = signerInvocation('/tmp/artifact');
+  assert.equal(invocation.command, 'cargo');
+  assert.deepEqual(invocation.args, ['tauri', 'signer', 'sign', '/tmp/artifact']);
+  assert.ok(!invocation.args.some((argument) => /password|secret|private.key/i.test(argument)));
+  const environment = minisignEnvironment({
+    TAURI_SIGNING_PRIVATE_KEY_PATH: '/provisioned/key',
+    TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 'secret',
+    PATH: '/bin',
+  });
+  assert.equal(environment.TAURI_SIGNING_PRIVATE_KEY_PATH, '/provisioned/key');
+  assert.equal(environment.TAURI_SIGNING_PRIVATE_KEY_PASSWORD, 'secret');
+  assert.equal(environment.PATH, '/bin');
+});
+
+test('Minisign key parser requires a canonical two-line public key with matching key ID', () => {
+  const body = Buffer.alloc(42);
+  body.write('Ed', 0, 'ascii');
+  Buffer.from('0123456789abcdef', 'hex').copy(body, 2);
+  Buffer.alloc(32, 7).copy(body, 10);
+  const id = Buffer.from(body.subarray(2, 10)).reverse().toString('hex').toUpperCase();
+  const publicKey = `untrusted comment: minisign public key: ${id}\n${body.toString('base64')}\n`;
+  assert.equal(parsePublicKey(publicKey).keyId, id);
+  assert.throws(
+    () => parsePublicKey(publicKey.replace(id, 'F'.repeat(16))),
+    /key ID|canonical|public key/i,
+  );
+  assert.throws(() => parsePublicKey(`${publicKey}extra\n`), /two lines|canonical/i);
+});
+
+test('release archive checks use the production updater extractor and require proof', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '../../scripts/verify-release.cjs'),
+    'utf8',
+  );
+  assert.match(source, /verify_release_archive/);
+  assert.match(source, /--json/);
+  assert.match(source, /--require-proof/);
+});
+
+test('publication uses a complete remote proof and rechecks its snapshot', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '../../scripts/publish-release.cjs'),
+    'utf8',
+  );
+  assert.match(source, /verifyRemote\(\[\],\s*\{\s*requireComplete:\s*true\s*\}\)/);
+  assert.match(source, /requireComplete:\s*true/);
+  assert.match(source, /assertRemoteSnapshotUnchanged\(/);
+  assert.match(source, /verification\.release\.id/);
+  assert.match(source, /withReleaseMutationLock\(/);
+});
+
+test('remote release verifier checks actual tag, streamed bytes, every signature, and archive proof', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '../../scripts/verify-release.cjs'),
+    'utf8',
+  );
+  assert.match(source, /resolveTagCommit\(tag\)/);
+  assert.match(source, /downloadGitHubAsset\(/);
+  assert.match(source, /verifyReleaseSignature/);
+  assert.match(source, /validateNativeProof\(/);
+  assert.match(source, /assertRemoteSnapshotUnchanged/);
+});
+
+test('annotated tag refs peel to and must match the candidate commit', () => {
+  const commit = 'a'.repeat(40);
+  const tagObject = 'b'.repeat(40);
+  const calls = [];
+  assert.equal(
+    peelTagCommit({ type: 'tag', sha: tagObject }, (sha) => {
+      calls.push(sha);
+      return { type: 'commit', sha: commit };
+    }),
+    commit,
+  );
+  assert.deepEqual(calls, [tagObject]);
+  assert.throws(
+    () => peelTagCommit({ type: 'commit', sha: 'c'.repeat(40) }, () => null),
+    /tag.*commit/i,
+  );
+  assert.throws(
+    () => peelTagCommit({ type: 'tag', sha: tagObject }, () => ({ type: 'tree', sha: commit })),
+    /tag.*commit/i,
+  );
+});
+
+test('draft validation rejects a real tag ref that differs from candidate HEAD', () => {
+  const expected = [...expectedReleaseAssets()];
+  const assets = expected.map((name) => ({ name, size: 1 }));
+  const release = { draft: true, prerelease, tag_name: tag, target_commitish: 'a'.repeat(40) };
+  assert.deepEqual(validateDraft(release, assets, 'a'.repeat(40), 'a'.repeat(40)), []);
+  assert.match(
+    validateDraft(release, assets, 'a'.repeat(40), 'b'.repeat(40)).join('\n'),
+    /tag.*commit/i,
+  );
+  const ensureSource = fs.readFileSync(
+    path.join(__dirname, '../../scripts/ensure-draft-release.cjs'),
+    'utf8',
+  );
+  const waitBody = ensureSource.split('async function waitForDraft()')[1]?.split('\nasync function main')[0] || '';
+  assert.match(waitBody, /resolveTagCommit\(tag\)/);
+});
+
+test('release snapshot detects ID, asset, and tag-commit changes before publication', () => {
+  const commit = 'a'.repeat(40);
+  const assets = [
+    { id: 10, name: 'artifact.tar.gz', size: 4, digest: `sha256:${'b'.repeat(64)}` },
+  ];
+  const release = { id: 5, tag_name: tag, target_commitish: commit, draft: true, prerelease };
+  const snapshot = makeReleaseSnapshot(release, assets, commit);
+  assert.doesNotThrow(() => assertSameReleaseSnapshot(snapshot, snapshot));
+  assert.throws(
+    () => assertSameReleaseSnapshot(snapshot, { ...snapshot, releaseId: 6 }),
+    /snapshot|release ID/i,
+  );
+  assert.throws(
+    () =>
+      assertSameReleaseSnapshot(snapshot, {
+        ...snapshot,
+        assets: [{ ...snapshot.assets[0], digest: `sha256:${'c'.repeat(64)}` }],
+      }),
+    /snapshot|asset/i,
+  );
+  assert.throws(
+    () => assertSameReleaseSnapshot(snapshot, { ...snapshot, tagCommit: 'd'.repeat(40) }),
+    /snapshot|tag/i,
+  );
+});
 
 function storedZip(names) {
   const localParts = [];
@@ -88,6 +480,16 @@ test('normalizes release aliases to supported target triples', () => {
 });
 
 test('release scripts match the manual VM draft ownership protocol', () => {
+  assert.equal(expectedReleaseAssets().size, 28);
+  assert.ok([...expectedReleaseAssets()].some((name) => name.endsWith('.minisig')));
+  assert.ok([...expectedReleaseAssets()].every((name) => !name.endsWith('.asc')));
+  assert.match(packageManifest.scripts['release:sign'], /scripts\/minisign-sign\.cjs/);
+  const releaseSource = fs.readFileSync(
+    path.join(__dirname, '../../scripts/release.cjs'),
+    'utf8',
+  );
+  assert.match(releaseSource, /scripts\/minisign-sign\.cjs/);
+  assert.doesNotMatch(releaseSource, /gpg-sign|GPG_KEY_ID|GPG_PASSPHRASE/);
   assert.match(packageManifest.scripts['release:windows'], /--upload/);
   assert.doesNotMatch(packageManifest.scripts['release:windows'], /--wait/);
   for (const scriptName of [
@@ -101,6 +503,22 @@ test('release scripts match the manual VM draft ownership protocol', () => {
     assert.match(packageManifest.scripts[scriptName], /--upload/);
     assert.match(packageManifest.scripts[scriptName], /--wait/);
   }
+});
+
+test('hosted release workflow requires provisioned self-hosted builders and upload-only token scope', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '../../.github/workflows/release.yml'),
+    'utf8',
+  );
+  assert.match(workflow, /runs-on:\s*\[self-hosted,\s*\$\{\{\s*inputs\.runner\s*\}\}\]/);
+  assert.doesNotMatch(workflow, /GPG_KEY_ID|GPG_PASSPHRASE/);
+  assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY_PATH/);
+  assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY_PASSWORD/);
+  assert.match(workflow, /test -f "\$TAURI_SIGNING_PRIVATE_KEY_PATH"/);
+  assert.match(workflow, /cargo tauri signer sign --help/);
+  assert.doesNotMatch(workflow, /gh auth login/);
+  assert.equal((workflow.match(/^\s+GH_TOKEN:/gm) || []).length, 1);
+  assert.match(workflow, /Upload staged release[\s\S]*?GH_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN\s*\}\}/);
 });
 
 test('rejects host architecture for a different operating system', () => {
@@ -182,12 +600,14 @@ test('scrubs GitHub token environment variables', () => {
 
 test('release build and upload environment excludes signing credentials', () => {
   const environment = buildEnvironment({
-    GPG_PASSPHRASE: 'secret',
+    TAURI_SIGNING_PRIVATE_KEY_PATH: '/private/key',
+    TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 'secret',
     AZURE_CLIENT_SECRET: 'secret',
     APPLE_PASSWORD: 'secret',
     PATH: '/bin',
   });
-  assert.equal(environment.GPG_PASSPHRASE, undefined);
+  assert.equal(environment.TAURI_SIGNING_PRIVATE_KEY_PATH, undefined);
+  assert.equal(environment.TAURI_SIGNING_PRIVATE_KEY_PASSWORD, undefined);
   assert.equal(environment.AZURE_CLIENT_SECRET, undefined);
   assert.equal(environment.APPLE_PASSWORD, undefined);
   assert.equal(environment.PATH, '/bin');
@@ -196,14 +616,14 @@ test('release build and upload environment excludes signing credentials', () => 
 test('unsigned opt-in reaches only local verification', () => {
   const environment = {
     DEOX_ALLOW_UNSIGNED_RELEASE: '1',
-    GPG_PASSPHRASE: 'secret',
+    TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 'secret',
     PATH: '/bin',
   };
   const build = buildEnvironment(environment);
   const verification = verificationEnvironment(environment, true);
   assert.equal(build.DEOX_ALLOW_UNSIGNED_RELEASE, undefined);
   assert.equal(verification.DEOX_ALLOW_UNSIGNED_RELEASE, '1');
-  assert.equal(verification.GPG_PASSPHRASE, undefined);
+  assert.equal(verification.TAURI_SIGNING_PRIVATE_KEY_PASSWORD, undefined);
   assert.equal(verification.PATH, '/bin');
 });
 
@@ -330,7 +750,6 @@ function stageScript(scriptName, files) {
     const target = path.join(directory, relative);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, content);
-    if (relative === 'bin/gpg') fs.chmodSync(target, 0o755);
   }
   return directory;
 }
@@ -382,6 +801,10 @@ test('check-changelog rejects a fixture missing BCLS markers', () => {
     'Cargo.toml': '[package]\nname = "deoxidizer"\nversion = "0.1.0"\n',
     'CHANGELOG.md': '# empty changelog\n',
   });
+  fs.copyFileSync(
+    path.join(__dirname, '../../scripts/sync-version.cjs'),
+    path.join(directory, 'scripts/sync-version.cjs'),
+  );
   const result = runStagedScript(directory, 'check-changelog.cjs');
   assert.notEqual(result.status, 0);
   assert.match(result.stdout + result.stderr, /missing changelog marker/);
@@ -460,57 +883,38 @@ test('check-toolchain main accepts a consistent fixture, rejects pin drift', () 
   }
 });
 
-test('check-release-key main rejects a fixture missing the pinned fingerprint', () => {
-  const gpgStub = `#!/bin/sh\necho "fpr:::::::::${expectedFingerprint}:"\n`;
-  const goodFiles = {
-    'release-signing-key.asc': 'fixture key\n',
-    'install.sh': `KEY="${expectedFingerprint}"\n`,
-    'install.ps1': `KEY="${expectedFingerprint}"\n`,
-    'src/updater.rs': `const KEY: &str = "${expectedFingerprint}";\n`,
-    'bin/gpg': gpgStub,
+test('release key check enforces the canonical public key in runtime and installers', () => {
+  const body = Buffer.alloc(42);
+  body.write('Ed', 0, 'ascii');
+  Buffer.from('0123456789abcdef', 'hex').copy(body, 2);
+  Buffer.alloc(32, 7).copy(body, 10);
+  const id = Buffer.from(body.subarray(2, 10)).reverse().toString('hex').toUpperCase();
+  const publicKey = `untrusted comment: minisign public key: ${id}\n${body.toString('base64')}\n`;
+  const encodedKey = JSON.stringify(publicKey);
+  const files = {
+    'src/minisign.rs': `include_str!("../release-signing-key.pub");\nconst COMMENT = "untrusted comment: minisign public key: ${id}";\nconst BODY = "${body.toString('base64')}";\n`,
+    'install.sh': `PINNED_RELEASE_KEY='${encodedKey}'\n`,
+    'install.ps1': `$PinnedReleaseKey = '${encodedKey}'\n`,
   };
-  const goodDir = stageScript('check-release-key.cjs', goodFiles);
-  const stagedGood = require(path.join(goodDir, 'scripts/check-release-key.cjs'));
-  const previousPath = process.env.PATH;
-  process.env.PATH = `${path.join(goodDir, 'bin')}${path.delimiter}${previousPath}`;
-  try {
-    assert.doesNotThrow(() => stagedGood.main());
-  } finally {
-    process.env.PATH = previousPath;
-    fs.rmSync(goodDir, { recursive: true, force: true });
-  }
-
-  const badDir = stageScript('check-release-key.cjs', {
-    ...goodFiles,
-    'install.sh': 'echo no key pinned here\n',
-  });
-  try {
-    const stagedBad = require(path.join(badDir, 'scripts/check-release-key.cjs'));
-    process.env.PATH = `${path.join(badDir, 'bin')}${path.delimiter}${previousPath}`;
-    try {
-      assert.throws(() => stagedBad.main(), /does not pin/);
-    } finally {
-      process.env.PATH = previousPath;
-    }
-  } finally {
-    fs.rmSync(badDir, { recursive: true, force: true });
-  }
-
-  const badUpdaterDir = stageScript('check-release-key.cjs', {
-    ...goodFiles,
-    'src/updater.rs': 'const KEY: &str = "none";\n',
-  });
-  try {
-    const stagedBadUpdater = require(path.join(badUpdaterDir, 'scripts/check-release-key.cjs'));
-    process.env.PATH = `${path.join(badUpdaterDir, 'bin')}${path.delimiter}${previousPath}`;
-    try {
-      assert.throws(() => stagedBadUpdater.main(), /src\/updater\.rs does not pin/);
-    } finally {
-      process.env.PATH = previousPath;
-    }
-  } finally {
-    fs.rmSync(badUpdaterDir, { recursive: true, force: true });
-  }
+  assert.doesNotThrow(() => validateKeyPins(publicKey, files));
+  const repoRoot = path.resolve(__dirname, '../..');
+  const checkedInKey = fs.readFileSync(path.join(repoRoot, 'release-signing-key.pub'), 'utf8');
+  assert.equal(parsePublicKey(checkedInKey).keyId, '083B254A48C428E3');
+  const checkedInPins = Object.fromEntries(
+    ['src/minisign.rs', 'install.sh', 'install.ps1'].map((relative) => [
+      relative,
+      fs.readFileSync(path.join(repoRoot, relative), 'utf8'),
+    ]),
+  );
+  assert.doesNotThrow(() => validateKeyPins(checkedInKey, checkedInPins));
+  assert.throws(
+    () => validateKeyPins(publicKey, { ...files, 'install.sh': 'no pinned key\n' }),
+    /install\.sh.*pin/i,
+  );
+  assert.throws(
+    () => validateKeyPins(publicKey, { ...files, 'src/minisign.rs': 'no include\n' }),
+    /src\/minisign\.rs.*pin/i,
+  );
 });
 
 test('vi and git-prune refuse without explicit confirmation', () => {
@@ -551,8 +955,8 @@ test('shared prerelease predicate matches only suffixed beta-style versions', ()
 });
 
 test('release env scoping keeps only OS signing keys', () => {
-  // signingEnvironment/gpgEnvironment are intentionally unexported, so load a
-  // staged copy with the same appended export instead of editing scripts/.
+  // signingEnvironment/minisignEnvironment are intentionally unexported, so
+  // load a staged copy with the same appended export instead of editing scripts/.
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-env-test-'));
   const scriptDir = path.join(directory, 'scripts');
   fs.mkdirSync(scriptDir, { recursive: true });
@@ -565,7 +969,7 @@ test('release env scoping keeps only OS signing keys', () => {
   const stagedPath = path.join(scriptDir, 'release.cjs');
   fs.appendFileSync(
     stagedPath,
-    '\nmodule.exports.signingEnvironment = signingEnvironment;\nmodule.exports.gpgEnvironment = gpgEnvironment;\n',
+    '\nmodule.exports.signingEnvironment = signingEnvironment;\nmodule.exports.minisignEnvironment = minisignEnvironment;\n',
   );
   let staged;
   try {
@@ -577,8 +981,8 @@ test('release env scoping keeps only OS signing keys', () => {
   try {
     const env = {
       PATH: '/bin',
-      GPG_KEY_ID: 'key',
-      GPG_PASSPHRASE: 'pass',
+      TAURI_SIGNING_PRIVATE_KEY_PATH: '/key',
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 'pass',
       AZURE_CLIENT_SECRET: 'secret',
       APPLE_PASSWORD: 'apple',
       APPLE_ID: 'id',
@@ -586,25 +990,25 @@ test('release env scoping keeps only OS signing keys', () => {
     const darwin = staged.signingEnvironment(env, 'darwin');
     assert.equal(darwin.APPLE_ID, 'id');
     assert.equal(darwin.AZURE_CLIENT_SECRET, undefined);
-    assert.equal(darwin.GPG_PASSPHRASE, undefined);
+    assert.equal(darwin.TAURI_SIGNING_PRIVATE_KEY_PASSWORD, undefined);
     assert.equal(darwin.PATH, '/bin');
 
     const windows = staged.signingEnvironment(env, 'windows');
     assert.equal(windows.AZURE_CLIENT_SECRET, 'secret');
     assert.equal(windows.APPLE_PASSWORD, undefined);
-    assert.equal(windows.GPG_KEY_ID, undefined);
+    assert.equal(windows.TAURI_SIGNING_PRIVATE_KEY_PATH, undefined);
 
     const linux = staged.signingEnvironment(env, 'linux');
     assert.equal(linux.AZURE_CLIENT_SECRET, undefined);
     assert.equal(linux.APPLE_ID, undefined);
-    assert.equal(linux.GPG_PASSPHRASE, undefined);
+    assert.equal(linux.TAURI_SIGNING_PRIVATE_KEY_PASSWORD, undefined);
 
-    const gpg = staged.gpgEnvironment(env);
-    assert.equal(gpg.GPG_KEY_ID, 'key');
-    assert.equal(gpg.GPG_PASSPHRASE, 'pass');
-    assert.equal(gpg.AZURE_CLIENT_SECRET, undefined);
-    assert.equal(gpg.APPLE_PASSWORD, undefined);
-    assert.equal(gpg.PATH, '/bin');
+    const minisign = staged.minisignEnvironment(env);
+    assert.equal(minisign.TAURI_SIGNING_PRIVATE_KEY_PATH, '/key');
+    assert.equal(minisign.TAURI_SIGNING_PRIVATE_KEY_PASSWORD, 'pass');
+    assert.equal(minisign.AZURE_CLIENT_SECRET, undefined);
+    assert.equal(minisign.APPLE_PASSWORD, undefined);
+    assert.equal(minisign.PATH, '/bin');
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
