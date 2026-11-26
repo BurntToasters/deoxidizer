@@ -19,8 +19,10 @@ const version = cargoVersion(manifest);
 const tag = `v${version}`;
 const prerelease = isPrerelease(version);
 const waitMode = process.argv.includes('--wait');
+const jsonMode = process.argv.includes('--json');
+const recheckIndex = process.argv.indexOf('--recheck-id');
 function envTimeoutMs(name, fallback) {
-  const value = Number(process.env[name] ?? fallback);
+  const value = Number(process.env[`DEOX_${name}`] ?? process.env[name] ?? fallback);
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 const waitTimeoutMs = envTimeoutMs('RELEASE_DRAFT_WAIT_TIMEOUT_MS', 30 * 60 * 1000);
@@ -86,6 +88,31 @@ function checkBinding(release) {
   return release;
 }
 
+function recheckDraft(releaseId) {
+  if (!/^\d+$/.test(String(releaseId || '')) || Number(releaseId) <= 0) {
+    throw new Error('--recheck-id requires a positive release ID');
+  }
+  const commit = currentCommit().toLowerCase();
+  const candidateCommit = process.env.DEOX_RELEASE_COMMIT;
+  if (candidateCommit && candidateCommit.toLowerCase() !== commit) {
+    throw new Error(`Candidate commit ${candidateCommit} does not match current HEAD ${commit}`);
+  }
+  const release = findRelease();
+  if (!release) throw new Error(`Draft release ${tag} disappeared before upload`);
+  if (String(release.id) !== String(releaseId)) {
+    throw new Error(`Draft release ${tag} changed ID before upload`);
+  }
+  if (!release.draft) throw new Error(`Release ${tag} is already published`);
+  if (release.target_commitish?.toLowerCase() !== commit) {
+    throw new Error(`Release ${tag} target commit does not match candidate HEAD ${commit}`);
+  }
+  const tagCommit = resolveTagCommit(tag);
+  if (tagCommit.toLowerCase() !== commit) {
+    throw new Error(`Git tag ${tag} resolves to ${tagCommit}, not candidate HEAD ${commit}`);
+  }
+  return release;
+}
+
 async function ensureDraft() {
   const existing = findRelease();
   if (existing) {
@@ -143,8 +170,23 @@ async function waitForDraft() {
 }
 
 async function main() {
+  if (waitMode && recheckIndex >= 0) {
+    throw new Error('--wait and --recheck-id cannot be used together');
+  }
+  if (recheckIndex >= 0 && !process.argv[recheckIndex + 1]) {
+    throw new Error('--recheck-id requires a release ID');
+  }
   assertGitHubCliAuthenticated();
+  if (recheckIndex >= 0) {
+    const release = recheckDraft(process.argv[recheckIndex + 1]);
+    console.log(`Draft ${tag} rechecked (${release.id}) in ${repository()}`);
+    return;
+  }
   const release = waitMode ? await waitForDraft() : await ensureDraft();
+  if (jsonMode && waitMode) {
+    console.log(JSON.stringify({ id: release.id }));
+    return;
+  }
   console.log(
     `Draft ${tag} ready (${release.id}, ${release.assets?.length || 0} assets) in ${repository()}`,
   );
@@ -157,4 +199,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { tag, version, prerelease, releaseNotes };
+module.exports = { tag, version, prerelease, releaseNotes, recheckDraft };

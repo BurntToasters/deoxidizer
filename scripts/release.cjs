@@ -213,6 +213,58 @@ function run(command, args, env = process.env) {
   }
 }
 
+function runCaptured(command, args, env = process.env) {
+  const { usesWindowsCmdShell } = require('./npm-safe-update.cjs');
+  const result = spawnSync(command, args, {
+    cwd: root,
+    env,
+    encoding: 'utf8',
+    shell: usesWindowsCmdShell(command),
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const detail = [result.stderr, result.stdout].filter(Boolean).join('\n').trim();
+    throw new Error(
+      `${command} ${args.join(' ')} failed with status ${result.status}${detail ? `:\n${detail}` : ''}`,
+    );
+  }
+  return String(result.stdout || '').trim();
+}
+
+function withDraftUploadLock(tag, commit, { waitForDraft = false, environment = process.env }, upload) {
+  if (typeof upload !== 'function') throw new Error('Draft upload requires an upload operation');
+  const ensureArgs = ['scripts/ensure-draft-release.cjs'];
+  let waitedReleaseId;
+  if (waitForDraft) {
+    const output = runCaptured(process.execPath, [...ensureArgs, '--wait', '--json'], environment);
+    let waited;
+    try {
+      waited = JSON.parse(output);
+    } catch {
+      throw new Error('Draft waiter returned invalid JSON');
+    }
+    if (!Number.isInteger(waited?.id) || waited.id <= 0) {
+      throw new Error('Draft waiter returned an invalid release ID');
+    }
+    waitedReleaseId = waited.id;
+  }
+
+  return withReleaseMutationLock(
+    tag,
+    commit,
+    () => {
+      const args = waitForDraft
+        ? [...ensureArgs, '--recheck-id', String(waitedReleaseId)]
+        : ensureArgs;
+      run(process.execPath, args, environment);
+      return upload();
+    },
+    { environment },
+  );
+}
+
 function buildEnvironment(env) {
   const sanitized = { ...env };
   for (const key of SIGNING_ENV_KEYS) delete sanitized[key];
@@ -365,15 +417,10 @@ function uploadExisting() {
     };
     run('node', ['scripts/release-session.cjs', 'verify', session.target], buildEnv);
     runNpm(['run', 'release:verify'], buildEnv);
-    withReleaseMutationLock(tag, session.commit, () => {
-      run(
-        'node',
-        ['scripts/ensure-draft-release.cjs', ...(waitForDraft ? ['--wait'] : [])],
-        uploadEnv,
-      );
+    withDraftUploadLock(tag, session.commit, { waitForDraft, environment: uploadEnv }, () => {
       upload(tag, releaseFiles(stageDir), uploadEnv);
       runNpm(['run', 'release:verify:remote'], uploadEnv);
-    }, { environment: uploadEnv });
+    });
   } finally {
     releaseLock();
   }
@@ -636,15 +683,10 @@ function main() {
         ...(process.env.GH_TOKEN ? { GH_TOKEN: process.env.GH_TOKEN } : {}),
         ...(process.env.GITHUB_TOKEN ? { GITHUB_TOKEN: process.env.GITHUB_TOKEN } : {}),
       };
-      withReleaseMutationLock(tag, session.commit, () => {
-        run(
-          'node',
-          ['scripts/ensure-draft-release.cjs', ...(waitForDraft ? ['--wait'] : [])],
-          uploadEnv,
-        );
+      withDraftUploadLock(tag, session.commit, { waitForDraft, environment: uploadEnv }, () => {
         upload(tag, files, uploadEnv);
         runNpm(['run', 'release:verify:remote'], uploadEnv);
-      }, { environment: uploadEnv });
+      });
     } else {
       console.log('Artifacts staged locally. Re-run with --upload to publish through gh.');
     }
@@ -672,6 +714,7 @@ module.exports = {
   windowsFileVersion,
   releaseStageDirectory,
   acquireStageLock,
+  withDraftUploadLock,
   npmReleaseInvocation,
   minisignEnvironment,
 };

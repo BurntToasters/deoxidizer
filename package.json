@@ -26,7 +26,7 @@
     "check:release-key": "node scripts/check-release-key.cjs",
     "check:update-policy": "node scripts/check-cargo-update-policy.cjs",
     "quality:rust": "cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked",
-    "quality:node": "node --test tests/node/release-tools.test.cjs tests/node/sync-version.test.cjs tests/node/cargo-safe-update.test.cjs tests/node/check-cargo-update-policy.test.cjs",
+    "quality:node": "node --test tests/node/release-tools.test.cjs tests/node/sync-version.test.cjs tests/node/cargo-safe-update.test.cjs tests/node/check-cargo-update-policy.test.cjs tests/node/signed-update-rehearsal.test.cjs",
     "release:prepare": "npm run quality && node scripts/release-session.cjs quality && node scripts/release-session.cjs start",
     "release:linux": "node scripts/release.cjs linux x86_64 --upload --wait",
     "release:linux:x64": "node scripts/release.cjs linux x86_64 --upload --wait",

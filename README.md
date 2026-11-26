@@ -224,8 +224,16 @@ staging directory and verified file identity before moving the artifact to the
 freedesktop Trash. If safe same-filesystem staging is unavailable, it returns
 an error before moving or deleting files. On macOS and Windows, `trash` returns
 a no-mutation error until a native backend can preserve the verified file
-identity. Trash contents continue to occupy disk until emptied. A Trash failure
-never falls back to permanent deletion.
+identity. Permanent `delete` cleanup remains available on every supported OS.
+Trash contents continue to occupy disk until emptied. A Trash failure never
+falls back to permanent deletion.
+
+Future backend candidates for macOS are `FileManager.trashItem` with a
+`fileReferenceURL`; for Windows, `IFileOperation` with
+`FOFX_RECYCLEONDELETE` and its per-item placement callback. These are research
+leads only. Any implementation must prove identity across races, restore the
+original item after a failed move, and fail closed without mutation whenever
+identity, callback, or restore proof is unavailable.
 
 Reported sizes are logical file bytes. Filesystem allocation, compression,
 sparse-file holes, and clone sharing can make reclaimable disk space differ.
@@ -302,65 +310,125 @@ across the runtime and installers. GPG is not used. The shell and
 PowerShell first-install bootstraps need an installed `minisign` executable;
 the updater and release verifier use the pinned in-process verifier.
 
-```bash
-npm ci
+### Stable v0.1.0 release runbook
 
-npm run u -- 0.1.1                 # e.g. next version: safe dep updates (72h/3d age-gated) + sync version across manifests and changelog
-npm run update:safe                # dep lockfile updates only, no version sync
-DEOX_RELEASE_CONFIRM=YES npm run r  # hard-reset to origin/main, reinstall, prune gone branches
-DEOX_RELEASE_CONFIRM=YES npm run b  # hard-reset to origin/beta, reinstall
+1. Freeze a clean candidate checkout at the exact commit intended for `v0.1.0`.
+   Run the local gates and require branch-protected CI to pass on this same
+   commit:
 
-# Run the matching command on each native OS/architecture release VM. Use a
-# clean detached checkout of the exact candidate tag/commit on all six VMs.
-npm run release:windows:x64    # Windows x86_64: first Windows uploader creates the draft
-npm run release:windows:arm64  # Windows aarch64
-npm run release:linux:x64     # Linux x86_64 with musl-tools; waits for the draft
-npm run release:linux:arm64   # Linux aarch64 with musl-tools; waits for the draft
-npm run release:macos:x64     # macOS x86_64 with Developer ID + notarization; waits
-npm run release:macos:arm64   # macOS aarch64 with Developer ID + notarization; waits
+   ```bash
+   npm ci
+   npm run quality
+   cargo deny check advisories bans licenses sources
+   ```
 
-# Optional staged-artifact upload path:
-npm run release:upload
+2. Preflight the provisioned signing key before release builds. Keep the
+   scratch payload outside the checkout. `signFile` invokes `cargo tauri
+   signer sign`, converts Tauri's wrapper to a raw `.minisig`, and verifies it
+   with the pinned in-process verifier used by `deox --update`:
 
-npm run release:verify:draft
-# Publish only after review and final approval; this is an irreversible transition.
-DEOX_RELEASE_CONFIRM=YES npm run release:publish -- --yes
-```
+   ```bash
+   scratch="$(mktemp)"
+   trap 'rm -f "$scratch" "$scratch.minisig"' EXIT
+   printf 'deoxidizer v0.1.0 signing preflight\n' > "$scratch"
+   node -e 'const s=require("./scripts/minisign-sign.cjs");
+   s.signFile(process.argv[1],s.minisignEnvironment(process.env));' "$scratch"
+   ```
 
-Each command builds one native target and uploads its signed evidence to the
-same GitHub draft. `release:verify:draft` requires exactly 28 assets: six
-archives, six platform checksum manifests, two Windows setup installers, and
-their 14 `.minisig` sidecars. It also verifies the tag commit and release
-identity. The Windows x86_64 command creates the draft; Windows arm64 reuses
-it, and Linux/macOS wait for it. The `release:publish` gate re-verifies the
-remote draft and its signatures before changing its visibility.
+   The provisioned key must match key ID `083B254A48C428E3`; keep its private
+   file outside the checkout and never put passwords in command arguments.
 
-macOS targets must run on native macOS release VMs, not GitHub-hosted macOS
-runners. Each VM needs a Developer ID certificate and pre-provisioned
-`APPLE_KEYCHAIN_PROFILE`; notarization must return `Accepted`. Windows targets
-need Azure Artifact Signing credentials and tools. Linux targets are built
-only on a Linux host matching the target architecture and require `musl-gcc`
-(provided by `musl-tools`).
+3. Before any upload, check the actual GitHub `v0.1.0` tag and release for a
+   collision. Stop if either already exists or points elsewhere. Create and
+   push an annotated `v0.1.0` tag at the candidate commit, then resolve the
+   remote tag and require its peeled commit SHA to equal `git rev-parse HEAD`.
+   GitHub `target_commitish` alone does not bind a tag. All six clean native
+   build checkouts must use that exact commit.
+
+4. Stage all six signed builds locally, with no `--upload`, on matching native
+   OS/architecture VMs. Wait until the release-tool fixture checks in
+   `npm run quality` and local verification of all six stages pass before
+   uploading any asset:
+
+   ```bash
+   node scripts/release.cjs windows x86_64
+   node scripts/release.cjs windows aarch64
+   node scripts/release.cjs linux x86_64
+   node scripts/release.cjs linux aarch64
+   node scripts/release.cjs darwin x86_64
+   node scripts/release.cjs darwin aarch64
+   ```
+
+   Each command stages one target under `release/staging/<rust-target>` and
+   runs its local verifier. To repeat local verification for an isolated stage,
+   set `DEOX_RELEASE_STAGE_DIR` to `release/staging/<rust-target>` and run
+   `npm run release:verify`. macOS requires Developer ID and accepted
+   notarization; Windows requires verified Azure Authenticode; Linux requires
+   a matching native host and `musl-gcc`.
+
+   Before uploading, run the offline signed candidate rehearsal on native
+   Windows x86_64 for a complete pass; it verifies the staged archive, pinned
+   signature, native proof, both invokers, recovery, tamper rejection, and
+   interrupted replacement. Retain its transcript. On every native
+   OS/architecture VM, install/extract the exact staged candidate (not the
+   public latest-release bootstrap) into a disposable prefix, verify
+   `deoxidizer --version` and `deox --version`, and capture `clean --dry-run`
+   plus a confirmed cleanup against a disposable marked Cargo fixture and
+   isolated config. Linux must prove Trash placement; macOS and Windows must
+   prove Trash refuses before mutation; permanent deletion must work on all
+   three OSes. On Windows, use a clean account with a short user PATH to install
+   the staged NSIS setup, verify the user PATH and both invokers, uninstall it,
+   and verify its app files and PATH entry are removed. Keep transcripts,
+   before/after fixture hashes, and Windows PATH and uninstall evidence under
+   `target/e2e-artifacts/`. Do not upload until all these checks pass.
+
+   ```bash
+   node scripts/rehearse-signed-update.cjs --stage-dir release/staging/x86_64-pc-windows-msvc --binary-dir target/x86_64-pc-windows-msvc/release --output target/e2e-artifacts/signed-update-rehearsal-windows-x64.json
+   ```
+
+5. Upload serially from each target's native VM with `gh auth login`. The
+   Windows x86_64 upload creates the draft; do not overlap uploaders:
+
+   ```bash
+   npm run release:upload -- --target x86_64-pc-windows-msvc
+   npm run release:upload -- --target aarch64-pc-windows-msvc --wait
+   npm run release:upload -- --target x86_64-unknown-linux-musl --wait
+   npm run release:upload -- --target aarch64-unknown-linux-musl --wait
+   npm run release:upload -- --target x86_64-apple-darwin --wait
+   npm run release:upload -- --target aarch64-apple-darwin --wait
+   ```
+
+6. After all uploads, require
+   `npm run release:verify:draft -- --integrity` to pass. The draft must contain
+   exactly 28 assets: six archives, six platform checksum manifests, two
+   Windows setup installers, and 14 `.minisig` sidecars. Verify the remote tag
+   resolves to the candidate SHA and inspect all six native proofs. The release
+   owner must explicitly approve before the irreversible publish step:
+
+   ```bash
+   DEOX_RELEASE_CONFIRM=YES npm run release:publish -- --yes
+   ```
+
+7. After publishing v0.1.0, perform a fresh public discovery check only with
+   `deox --check-update`; record the host and output. At the next stable release,
+   after that candidate is public, use a disposable installation of v0.1.0 to
+   run the first real GitHub upgrade:
+
+   ```bash
+   deox --check-update
+   deox --update
+   deox --version
+   deoxidizer --version
+   ```
+
+   Record the host OS/architecture, command output, and before/after versions
+   under `target/e2e-artifacts/`. This public upgrade is separate from the
+   offline signed candidate rehearsal above.
 
 CI (`.github/workflows/ci.yml`) must be a required status check on `main` in
-branch protection. `main` stayed red for weeks while the check was not enforced.
+branch protection and must pass on the exact stable candidate commit.
 Dependabot ignores semver-major Cargo updates; major bumps go through
 `npm run update:safe` together with the code changes that they need.
-
-Release publication requires `gh auth login` on each release VM. Do not publish
-until the candidate tag and all six native build proofs are inspectable and
-`npm run release:verify:draft` succeeds with all 28 assets.
-
-### Stable updater rehearsal
-
-Use a disposable machine with the previous stable release installed. Drafts are
-excluded from `/releases/latest`, so the first stable release cannot be
-rehearsed through the public updater before publication. After the approved
-publish, run `deox --check-update` and confirm it reports the candidate; then
-run `deox --update` and verify both `deox --version` and
-`deoxidizer --version`. `--check-update` alone does not exercise artifact,
-signature, checksum, or installation handling. Record the host OS/architecture,
-commands, version output, and any error as the first stable updater evidence.
 
 Release notes live in [`CHANGELOG.md`](CHANGELOG.md) and follow the
 [BCLS](https://github.com/BurntToasters/BCLS) standard.

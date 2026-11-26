@@ -304,8 +304,17 @@ share a filesystem, checks the staged file identity, and restores the source
 when the Trash operation fails. A different-filesystem stage fails before
 moving the artifact. macOS and Windows return a no-mutation error because their
 native Trash APIs are not yet bound to the verified file identity. Trash
-failures never fall back to `delete`. Sizes are logical bytes of regular files
-(symlinks count as 0).
+failures never fall back to `delete`; permanent deletion remains available on
+all supported OSes. Sizes are logical bytes of regular files (symlinks count
+as 0).
+
+Future macOS research candidate: `FileManager.trashItem` with a
+`fileReferenceURL`. Future Windows candidates: `IFileOperation` with
+`FOFX_RECYCLEONDELETE` and its per-item placement callback. These are not
+release prototypes or permission to change the current no-mutation behavior.
+Any backend must prove identity despite path races, restore the original item
+after every failed move, and fail closed without mutation when identity,
+callback, or restoration cannot be proven.
 
 ### Project model and clean pipeline
 - One `DiscoveredProject` per `target/` directory. `scanner::scan_dir_report`
@@ -456,10 +465,11 @@ APPLE_KEYCHAIN_PROFILE=
      `npm run release:linux:arm64`, `npm run release:macos:x64`, and
      `npm run release:macos:arm64`. Run each on its matching native OS and
      architecture VM from a clean checkout of the same candidate tag/commit.
-     The first Windows upload creates the draft; Windows arm64 reuses it, and
-     Linux/macOS wait for it. Release sessions bind builds to `HEAD`; the remote
-     tag must resolve to that same commit.
-   - `npm run release:verify:draft` requires 28 assets: six archives, six
+     These are the one-step build/upload path. For stable v0.1.0, use the
+     stage-first, serial-upload sequence below. The first Windows x86_64 upload
+     creates the draft; subsequent uploads reuse it. Release sessions bind
+     builds to `HEAD`; the remote tag must resolve to that same commit.
+   - `npm run release:verify:draft -- --integrity` requires 28 assets: six archives, six
      platform checksum manifests, two Windows setup assets, and 14 `.minisig`
      sidecars. It checks draft identity and remote tag commit. Run
      `npm run release:verify:remote` to verify signatures, manifests, archive
@@ -483,6 +493,113 @@ APPLE_KEYCHAIN_PROFILE=
      public-key serialization across runtime and installers.
    - `CHANGELOG.md` is the BCLS-formatted release body; draft creation fails if
      it is missing or empty.
+
+### Stable v0.1.0 first-release runbook
+
+1. Freeze a clean candidate commit for `v0.1.0`. Require all these gates on the
+   exact SHA before signing or building:
+
+   ```bash
+   npm ci
+   npm run quality
+   cargo deny check advisories bans licenses sources
+   ```
+
+   `.github/workflows/ci.yml` must be a required check and green on that exact
+   commit.
+
+2. Before release builds, run the signing-key preflight on a scratch payload
+   outside the checkout; it exercises Tauri signing and then the repository-
+   pinned in-process verifier:
+
+   ```bash
+   scratch="$(mktemp)"
+   trap 'rm -f "$scratch" "$scratch.minisig"' EXIT
+   printf 'deoxidizer v0.1.0 signing preflight\n' > "$scratch"
+   node -e 'const s=require("./scripts/minisign-sign.cjs");
+   s.signFile(process.argv[1],s.minisignEnvironment(process.env));' "$scratch"
+   ```
+
+   Require key ID `083B254A48C428E3`; private-key material stays outside the
+   checkout and passwords never enter command arguments.
+
+3. Before any upload, check the actual remote `v0.1.0` tag and release for a
+   collision. Stop if either exists or points elsewhere. Create and push an
+   annotated tag at the frozen candidate SHA, resolve the actual remote tag,
+   and require its peeled commit to equal `git rev-parse HEAD`. Do not infer tag
+   binding from GitHub `target_commitish`.
+
+4. On matching native OS/architecture VMs, stage all six signed targets without
+   `--upload`:
+
+   ```bash
+   node scripts/release.cjs windows x86_64
+   node scripts/release.cjs windows aarch64
+   node scripts/release.cjs linux x86_64
+   node scripts/release.cjs linux aarch64
+   node scripts/release.cjs darwin x86_64
+   node scripts/release.cjs darwin aarch64
+   ```
+
+   Wait for the fixture checks in `npm run quality` and local verification of
+   all six stages before the first upload. Each target lives under
+   `release/staging/<rust-target>`; rerun its verifier by setting
+   `DEOX_RELEASE_STAGE_DIR` to that path and running `npm run release:verify`.
+   Use native Developer ID/notarization on macOS, verified Azure Authenticode
+   on Windows, and matching Linux VMs with `musl-gcc`.
+
+   Before any upload, run the offline signed candidate rehearsal on native
+   Windows x86_64 for a complete pass; retain its transcript. On every native
+   OS/architecture VM, install/extract the exact staged candidate (not the
+   public latest-release bootstrap) into a disposable prefix, verify both
+   invokers, and capture `deox clean --dry-run` plus a confirmed
+   cleanup against a disposable marked Cargo fixture and isolated config.
+   Prove Linux Trash placement, macOS/Windows Trash refusal before mutation,
+   and permanent delete on all supported OSes. On a clean Windows account
+   with a short user PATH, install the staged NSIS setup and verify the user
+   PATH and both invokers;
+   uninstall it and verify its app files and PATH entry are removed. Store
+   transcripts, fixture hashes, and Windows PATH/uninstall evidence under
+   `target/e2e-artifacts/`. Do not upload until all evidence is complete.
+
+   ```bash
+   node scripts/rehearse-signed-update.cjs --stage-dir release/staging/x86_64-pc-windows-msvc --binary-dir target/x86_64-pc-windows-msvc/release --output target/e2e-artifacts/signed-update-rehearsal-windows-x64.json
+   ```
+
+5. Upload one target at a time from its native VM after `gh auth login`.
+   Windows x86_64 creates the draft; use this order and do not overlap uploaders:
+
+   ```bash
+   npm run release:upload -- --target x86_64-pc-windows-msvc
+   npm run release:upload -- --target aarch64-pc-windows-msvc --wait
+   npm run release:upload -- --target x86_64-unknown-linux-musl --wait
+   npm run release:upload -- --target aarch64-unknown-linux-musl --wait
+   npm run release:upload -- --target x86_64-apple-darwin --wait
+   npm run release:upload -- --target aarch64-apple-darwin --wait
+   ```
+
+6. After all uploads, require
+   `npm run release:verify:draft -- --integrity` to pass: exactly 28 assets
+   (six archives, six platform checksum manifests, two Windows installers, and
+   14 `.minisig` sidecars), correct remote tag commit, signatures, and all six
+   native proofs. The release owner must explicitly approve before
+   `DEOX_RELEASE_CONFIRM=YES npm run release:publish -- --yes`.
+
+7. After publishing v0.1.0, perform a fresh public discovery check only with
+   `deox --check-update`; record the host and output. At the next stable
+   release, after that candidate is public, use a disposable v0.1.0 installation
+   for the first real GitHub upgrade:
+
+   ```bash
+   deox --check-update
+   deox --update
+   deox --version
+   deoxidizer --version
+   ```
+
+   Record the OS/architecture, output, and before/after versions under
+   `target/e2e-artifacts/`. This public updater proof is separate from the
+   offline signed candidate rehearsal in step 4.
 
 ---
 

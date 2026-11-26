@@ -19,6 +19,7 @@ const {
   releaseStageDirectory,
   npmReleaseInvocation,
   acquireStageLock,
+  withDraftUploadLock,
 } = require('../../scripts/release.cjs');
 const {
   githubCliEnvironment,
@@ -60,6 +61,129 @@ const {
   prerelease,
 } = require('../../scripts/verify-release-draft.cjs');
 const { releaseNotes } = require('../../scripts/ensure-draft-release.cjs');
+
+function fakeGitHub({ release = null, assets = [], tagCommit, mutateOnLock } = {}) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'deoxidizer-fake-github-'));
+  const bin = path.join(directory, 'bin');
+  fs.mkdirSync(bin);
+  const statePath = path.join(directory, 'state.json');
+  const current = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: path.resolve(__dirname, '../..'),
+    encoding: 'utf8',
+  }).trim();
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify({
+      release,
+      assets,
+      tagCommit: tagCommit || current,
+      lock: null,
+      mutateOnLock: mutateOnLock || null,
+      events: [],
+    }),
+  );
+  const fakeGhPath = path.join(bin, 'gh');
+  fs.writeFileSync(
+    fakeGhPath,
+    `#!/usr/bin/env node
+'use strict';
+const fs = require('node:fs');
+const statePath = process.env.DEOX_FAKE_GH_STATE;
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const args = process.argv.slice(2);
+function save() { fs.writeFileSync(statePath, JSON.stringify(state)); }
+function respond(value) { process.stdout.write(JSON.stringify(value)); }
+if (args[0] === 'auth') process.exit(0);
+if (args[0] !== 'api') { process.stderr.write('unexpected fake gh command: ' + args.join(' ') + '\\n'); process.exit(2); }
+const method = args[args.indexOf('--method') + 1] || 'GET';
+const endpoint = args.find((arg) => arg.startsWith('/repos/'));
+const input = args.includes('--input') ? JSON.parse(fs.readFileSync(0, 'utf8')) : {};
+state.events.push({ method, endpoint, lock: state.lock });
+save();
+if (method === 'POST' && endpoint.endsWith('/git/refs')) {
+  state.lock = input.sha;
+  if (state.mutateOnLock) {
+    if (state.mutateOnLock === 'absent') state.release = null;
+    else if (state.release && state.mutateOnLock === 'id') state.release.id += 1;
+    else if (state.release && state.mutateOnLock === 'published') state.release.draft = false;
+    else if (state.release && state.mutateOnLock === 'target') state.release.target_commitish = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    else if (state.mutateOnLock === 'tag') state.tagCommit = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    state.mutateOnLock = null;
+  }
+  save(); respond({ ref: input.ref, object: { sha: input.sha } }); process.exit(0);
+}
+if (method === 'POST' && endpoint.endsWith('/releases')) {
+  state.release = { ...input, id: 73, assets: state.assets };
+  save(); respond(state.release); process.exit(0);
+}
+if (method === 'PATCH' && /\\/releases\\/\\d+$/.test(endpoint)) {
+  state.release = { ...state.release, ...input };
+  save(); respond(state.release); process.exit(0);
+}
+if (method === 'GET' && endpoint.endsWith('/releases?per_page=100&page=1')) {
+  respond(state.release ? [state.release] : []); process.exit(0);
+}
+if (method === 'GET' && /\\/releases\\/tags\\//.test(endpoint)) {
+  respond(state.release || {}); process.exit(0);
+}
+if (method === 'GET' && /\\/releases\\/\\d+\\/assets\\?/.test(endpoint)) {
+  respond(state.assets); process.exit(0);
+}
+if (method === 'GET' && /\\/releases\\/\\d+$/.test(endpoint)) {
+  respond(state.release || {}); process.exit(0);
+}
+if (method === 'GET' && /\\/git\\/ref\\/tags\\//.test(endpoint)) {
+  respond({ object: { type: 'commit', sha: state.tagCommit } }); process.exit(0);
+}
+if (method === 'GET' && /\\/git\\/ref\\/heads\\/deoxidizer-release-lock-/.test(endpoint)) {
+  respond({ object: { sha: state.lock } }); process.exit(0);
+}
+if (method === 'DELETE' && /\\/git\\/heads\\/deoxidizer-release-lock-/.test(endpoint)) {
+  state.lock = null; save(); respond({}); process.exit(0);
+}
+process.stderr.write('unhandled fake GitHub API request: ' + method + ' ' + endpoint + '\\n');
+process.exit(2);
+`,
+    { mode: 0o700 },
+  );
+  const environment = { ...process.env };
+  delete environment.GH_TOKEN;
+  delete environment.GITHUB_TOKEN;
+  environment.PATH = `${bin}${path.delimiter}${process.env.PATH || ''}`;
+  environment.DEOX_FAKE_GH_STATE = statePath;
+  environment.DEOX_RELEASE_DRAFT_WAIT_TIMEOUT_MS = '80';
+  environment.DEOX_RELEASE_DRAFT_WAIT_POLL_MS = '2';
+  environment.DEOX_RELEASE_COMMIT = current;
+  environment.GH_REPO_OWNER = 'BurntToasters';
+  environment.GH_REPO_NAME = 'deoxidizer';
+  return {
+    directory,
+    environment,
+    state() {
+      return JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    },
+    record(event) {
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      state.events.push(event);
+      fs.writeFileSync(statePath, JSON.stringify(state));
+    },
+    cleanup() {
+      fs.rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+function fakeDraft(commit, extra = {}) {
+  return {
+    id: 71,
+    tag_name: tag,
+    draft: true,
+    prerelease,
+    target_commitish: commit,
+    assets: [],
+    ...extra,
+  };
+}
 
 // Failure modes covered before implementation:
 // - parallel targets clear or reuse another target's staging/session files;
@@ -136,6 +260,180 @@ test('release GitHub token is available only to explicitly authenticated gh call
 test('release mutation lock ref is deterministic and version scoped', () => {
   assert.equal(releaseMutationLockRef('v1.2.3'), 'refs/heads/deoxidizer-release-lock-v1.2.3');
   assert.throws(() => releaseMutationLockRef('../other'), /tag|release/i);
+});
+
+test('waiter polls without the shared lock, then rechecks the same draft under lock', () => {
+  const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const fake = fakeGitHub({ release: fakeDraft(commit) });
+  let uploaded = false;
+  try {
+    withDraftUploadLock(
+      tag,
+      commit,
+      { waitForDraft: true, environment: fake.environment },
+      () => {
+        assert.equal(fake.state().lock, commit);
+        uploaded = true;
+        fake.record({ kind: 'upload' });
+      },
+    );
+    assert.equal(uploaded, true);
+    const events = fake.state().events;
+    const firstList = events.findIndex(
+      (event) => event.method === 'GET' && event.endpoint.includes('/releases?'),
+    );
+    const lock = events.findIndex(
+      (event) => event.method === 'POST' && event.endpoint.endsWith('/git/refs'),
+    );
+    const lockedList = events.findIndex(
+      (event, index) =>
+        index > lock && event.method === 'GET' && event.endpoint.includes('/releases?'),
+    );
+    const lockedTag = events.findIndex(
+      (event, index) => index > lock && event.method === 'GET' && event.endpoint.includes('/git/ref/tags/'),
+    );
+    const upload = events.findIndex((event) => event.kind === 'upload');
+    assert.ok(firstList >= 0 && firstList < lock, 'wait polling must happen before lock acquisition');
+    assert.ok(lock < lockedList && lockedList < lockedTag && lockedTag < upload);
+    assert.equal(
+      events.some((event) => event.method === 'POST' && event.endpoint.endsWith('/releases')),
+      false,
+      'waiters must never create a release',
+    );
+    assert.equal(
+      events.some((event) => event.method === 'PATCH' && /\/releases\/\d+$/.test(event.endpoint)),
+      false,
+      'the locked waiter recheck must not mutate release metadata',
+    );
+  } finally {
+    fake.cleanup();
+  }
+});
+
+test('a creator creates the draft only after acquiring the shared lock', () => {
+  const fake = fakeGitHub();
+  const commit = fake.environment.DEOX_RELEASE_COMMIT;
+  try {
+    withDraftUploadLock(
+      tag,
+      commit,
+      { waitForDraft: false, environment: fake.environment },
+      () => {
+        assert.equal(fake.state().lock, commit);
+        fake.record({ kind: 'upload' });
+      },
+    );
+    const events = fake.state().events;
+    const lock = events.findIndex(
+      (event) => event.method === 'POST' && event.endpoint.endsWith('/git/refs'),
+    );
+    const create = events.findIndex(
+      (event) => event.method === 'POST' && event.endpoint.endsWith('/releases'),
+    );
+    const upload = events.findIndex((event) => event.kind === 'upload');
+    assert.ok(lock >= 0 && lock < create && create < upload);
+    assert.equal(fake.state().release?.id, 73);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+test('waiters reject an absent, replaced, published, or rebound draft after locking', () => {
+  const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  for (const mutation of ['absent', 'id', 'published', 'target', 'tag']) {
+    const fake = fakeGitHub({ release: fakeDraft(commit), mutateOnLock: mutation });
+    let uploaded = false;
+    try {
+      assert.throws(
+        () =>
+          withDraftUploadLock(
+            tag,
+            commit,
+            { waitForDraft: true, environment: fake.environment },
+            () => {
+              uploaded = true;
+              fake.record({ kind: 'upload' });
+            },
+          ),
+        /draft|release|commit|tag/i,
+        mutation,
+      );
+      assert.equal(uploaded, false, `${mutation} draft must fail before upload`);
+      assert.equal(fake.state().lock, null, `${mutation} lock must be released`);
+      assert.equal(
+        fake.state().events.some(
+          (event) => event.method === 'POST' && event.endpoint.endsWith('/releases'),
+        ),
+        false,
+        `${mutation} waiter must not create a replacement draft`,
+      );
+    } finally {
+      fake.cleanup();
+    }
+  }
+});
+
+test('waiter times out without creating a release when no creator has made one', () => {
+  const fake = fakeGitHub();
+  const commit = fake.environment.DEOX_RELEASE_COMMIT;
+  try {
+    assert.throws(
+      () =>
+        withDraftUploadLock(
+          tag,
+          commit,
+          { waitForDraft: true, environment: fake.environment },
+          () => assert.fail('upload must not run'),
+        ),
+      /timed out/i,
+    );
+    assert.equal(fake.state().lock, null);
+    assert.equal(
+      fake.state().events.some(
+        (event) => event.method === 'POST' && event.endpoint.endsWith('/releases'),
+      ),
+      false,
+    );
+    assert.equal(
+      fake.state().events.some(
+        (event) => event.method === 'POST' && event.endpoint.endsWith('/git/refs'),
+      ),
+      false,
+    );
+  } finally {
+    fake.cleanup();
+  }
+});
+
+test('draft integrity mode verifies remote proof read-only and preserves default draft checks', () => {
+  const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const assets = [...expectedReleaseAssets()].map((name) => ({ name, size: 1 }));
+  const fake = fakeGitHub({ release: fakeDraft(commit), assets });
+  const script = path.join(__dirname, '../../scripts/verify-release-draft.cjs');
+  try {
+    const defaults = spawnSync(process.execPath, [script], {
+      encoding: 'utf8',
+      env: fake.environment,
+    });
+    assert.equal(defaults.status, 0, defaults.stderr);
+    assert.match(defaults.stdout, /draft .* is complete/i);
+
+    const integrity = spawnSync(process.execPath, [script, '--integrity'], {
+      encoding: 'utf8',
+      env: fake.environment,
+    });
+    assert.notEqual(integrity.status, 0);
+    assert.match(integrity.stderr, /no valid ID/i);
+    const apiEvents = fake.state().events.filter((event) => event.method);
+    assert.ok(apiEvents.length > 0);
+    assert.equal(
+      apiEvents.some((event) => event.method !== 'GET'),
+      false,
+      'integrity verification must not mutate or publish the release',
+    );
+  } finally {
+    fake.cleanup();
+  }
 });
 
 test('native proof binds platform evidence to staged bytes and release identity', () => {

@@ -935,6 +935,12 @@ function assertRemoteSnapshotUnchanged(verification) {
 }
 
 function main() {
+  if (process.argv.includes('--remote-complete')) {
+    const verification = verifyRemote([], { requireComplete: true });
+    assertRemoteSnapshotUnchanged(verification);
+    console.log(`Release ${tag} passed complete remote integrity verification`);
+    return;
+  }
   const localFiles = verifyLocal();
   if (process.argv.includes('--remote')) {
     const verification = verifyRemote(allReleaseFiles());

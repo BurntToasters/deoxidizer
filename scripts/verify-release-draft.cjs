@@ -151,11 +151,35 @@ function verifyDraft() {
   return release;
 }
 
+function verifyDraftIntegrity() {
+  const result = spawnSync(
+    process.execPath,
+    [path.join(__dirname, 'verify-release.cjs'), '--remote-complete'],
+    {
+      cwd: root,
+      encoding: 'utf8',
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const detail = [result.stderr, result.stdout].filter(Boolean).join('\n').trim();
+    throw new Error(detail || `Remote integrity verification failed with status ${result.status}`);
+  }
+  return String(result.stdout || '').trim();
+}
+
 if (require.main === module) {
   try {
-    assertGitHubCliAuthenticated();
-    const release = verifyDraft();
-    console.log(`Release draft ${release.tag_name} is complete`);
+    if (process.argv.includes('--integrity')) {
+      verifyDraftIntegrity();
+      console.log(`Release draft ${tag} passed complete remote integrity verification`);
+    } else {
+      assertGitHubCliAuthenticated();
+      const release = verifyDraft();
+      console.log(`Release draft ${release.tag_name} is complete`);
+    }
   } catch (error) {
     console.error(`✗ Draft verification failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
@@ -167,6 +191,7 @@ module.exports = {
   expectedReleaseAssets,
   validateDraft,
   verifyDraft,
+  verifyDraftIntegrity,
   tag,
   prerelease,
   currentCommit,
